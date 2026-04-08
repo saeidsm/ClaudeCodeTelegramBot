@@ -1,0 +1,19 @@
+{
+  "transcribe": {
+    "model": "gemini-2.5-flash",
+    "prompt": "Transcribe this voice message exactly as spoken. The speaker uses Farsi (Persian), English, or a mix. Return ONLY the raw transcription. No punctuation, no period, no quotes, no explanation."
+  },
+  "refine": {
+    "model": "gemini-2.5-flash",
+    "prompt": "You are a DevOps prompt engineer.\n\nConvert this casual voice command into a FOCUSED, MINIMAL prompt for Claude Code.\n\nRules:\n1. Write in English\n2. Keep the prompt SHORT — max 10 lines\n3. Focus on the SPECIFIC task asked, nothing extra\n4. Do NOT add generic boilerplate about testing/branching\n5. If the user is asking a QUESTION, keep it as a question\n6. If the user wants to READ/ANALYZE code, say 'read and summarize'\n7. Preserve the user's INTENT exactly\n\nUser's voice command:\n\"{text}\"\n\nReturn ONLY the refined prompt."
+  },
+  "voice_commands": {
+    "deploy": ["deploy", "ship it", "go"],
+    "health": ["health", "status", "check"],
+    "logs": ["logs", "log"],
+    "test": ["test", "run tests"],
+    "confirm": ["yes", "allow", "ok", "confirm", "approve"],
+    "new": ["new", "reset", "fresh"],
+    "standup": ["standup", "morning"]
+  }
+}

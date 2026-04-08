@@ -1,0 +1,53 @@
+#!/bin/bash
+# Example deploy script
+# Copy to deploy-to-prod.sh and customize for your infrastructure
+#
+# Usage: ./deploy-to-prod.sh <project> <branch>
+# Called by the bot when user confirms a deploy action
+#
+# Arguments:
+#   $1 = project name (e.g., "my-web-app")
+#   $2 = branch name (e.g., "main", "dev", "claude/fix-auth")
+
+set -e
+
+PROJECT="$1"
+BRANCH="$2"
+PROD_SERVER="${PROD_SERVER_IP:-your-server}"
+PROD_USER="${PROD_SERVER_USER:-root}"
+
+if [ -z "$PROJECT" ] || [ -z "$BRANCH" ]; then
+    echo "Usage: $0 <project> <branch>"
+    exit 1
+fi
+
+echo "🚀 Deploying $PROJECT@$BRANCH to $PROD_SERVER"
+echo ""
+
+# Example: SSH to production and pull the branch
+# ssh "$PROD_USER@$PROD_SERVER" << EOF
+#     cd /opt/$PROJECT
+#     git fetch origin
+#     git checkout $BRANCH
+#     git pull origin $BRANCH
+#
+#     # Restart the service
+#     docker compose down
+#     docker compose up -d --build
+#
+#     # Or for systemd:
+#     # systemctl restart $PROJECT
+#
+#     echo "Deploy complete. Checking health..."
+#     sleep 5
+#     curl -s http://localhost:8000/health || echo "Health check failed!"
+# EOF
+
+echo "⚠️ This is an example script. Edit scripts/deploy-to-prod.sh for your setup."
+echo ""
+echo "Typical deploy steps:"
+echo "  1. SSH to production server"
+echo "  2. git pull the branch"
+echo "  3. Rebuild (docker compose, npm build, etc.)"
+echo "  4. Restart services"
+echo "  5. Health check"

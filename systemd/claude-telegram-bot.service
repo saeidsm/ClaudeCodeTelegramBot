@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/your-bot/bot.py
+WorkingDirectory=/opt/your-bot
+Restart=always
+RestartSec=5
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/opt/your-bot/.env
+
+[Install]
+WantedBy=multi-user.target

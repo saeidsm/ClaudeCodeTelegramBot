@@ -1,0 +1,39 @@
+#!/bin/bash
+# Example log collection script
+# Copy to collect-logs.sh and customize for your infrastructure
+#
+# Usage: ./collect-logs.sh
+# Called by the bot when user taps 📋 Logs
+
+echo "=== Recent Logs ==="
+echo ""
+
+# Bot logs
+BOT_LOG="${BOT_LOGS_DIR:-./logs}/telegram-bot.log"
+if [ -f "$BOT_LOG" ]; then
+    echo "── Bot Log (last 20 lines) ──"
+    tail -20 "$BOT_LOG"
+    echo ""
+fi
+
+# Docker logs (if applicable)
+# echo "── Docker: my-app (last 20 lines) ──"
+# docker logs --tail 20 my-app 2>&1
+# echo ""
+
+# Systemd journal
+# echo "── Systemd: my-service (last 20 lines) ──"
+# journalctl -u my-service --no-pager -n 20
+# echo ""
+
+# Nginx/Apache access log
+# echo "── Nginx Access (last 10) ──"
+# tail -10 /var/log/nginx/access.log
+# echo ""
+
+# Application error log
+# echo "── App Errors (last 10) ──"
+# tail -10 /var/log/myapp/error.log
+# echo ""
+
+echo "=== Done ==="

@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+*.log
+uploads/
+logs/
+repos/
+reports/
+configs/usage_tracker.json
+configs/projects.json
+*.bak
+*.bak2
+.venv/

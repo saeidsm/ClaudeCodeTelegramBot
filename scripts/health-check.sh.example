@@ -1,0 +1,40 @@
+#!/bin/bash
+# Example health check script
+# Copy to health-check.sh and customize for your infrastructure
+#
+# Usage: ./health-check.sh
+# Called by the bot when user taps 📊 Health
+
+echo "=== System Health ==="
+echo ""
+
+# CPU & Memory
+echo "── CPU & Memory ──"
+uptime
+echo ""
+free -h | head -2
+echo ""
+
+# Disk
+echo "── Disk ──"
+df -h / | tail -1
+echo ""
+
+# Docker (if applicable)
+if command -v docker &> /dev/null; then
+    echo "── Docker ──"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || echo "Docker not running"
+    echo ""
+fi
+
+# Optional: Check a web endpoint
+# echo "── Web ──"
+# curl -s -o /dev/null -w "HTTP %{http_code} in %{time_total}s" http://localhost:8000/health
+# echo ""
+
+# Optional: Check a remote production server
+# echo "── Production ──"
+# ssh user@prod-server "uptime && docker ps --format '{{.Names}}: {{.Status}}'"
+# echo ""
+
+echo "=== Done ==="
