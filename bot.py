@@ -609,7 +609,7 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
             *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "HOME": os.path.expanduser("~"),
                  "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=600)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
         r = out.decode("utf-8", errors="replace")
         e = err.decode("utf-8", errors="replace") if err else ""
 
@@ -622,7 +622,7 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
                 *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "HOME": os.path.expanduser("~"),
                      "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
-            out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=600)
+            out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=3600)
             r = out2.decode("utf-8", errors="replace")
             e = err2.decode("utf-8", errors="replace") if err2 else ""
             proc = proc2
@@ -645,7 +645,7 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
     except asyncio.TimeoutError:
         try: proc.kill()
         except: pass
-        return "⏰ Timeout (10 min)."
+        return "⏰ Timeout (60 min)."
     except Exception as e:
         return f"❌ {e}"
 
