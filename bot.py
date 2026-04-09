@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 """
-Claude Code Telegram Bot v4
+Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
-
-A Telegram bot that bridges Claude Code CLI with Telegram for DevOps workflows.
-Supports multi-session management, voice commands (Farsi/English), file attachments,
-multi-provider fallback, and production deployment controls.
-
-https://github.com/saeidsm/ClaudeCodeTelegramBot
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -37,38 +31,31 @@ try:
 except ImportError:
     GEMINI_OK = False
 
-# ── Config (all paths configurable via env vars) ──
-BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+# ── Config ──
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS = [int(x) for x in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
+REPOS      = "/opt/shahrzad-devops/repos"
+REPORTS    = "/opt/shahrzad-devops/reports"
+LOGS       = "/opt/shahrzad-devops/logs"
+SCRIPTS    = "/opt/shahrzad-devops/scripts"
+UPLOADS    = "/opt/shahrzad-devops/uploads"
+PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
+REPORT_URL = "https://devops.shahrzad.ai/reports"
+DEFAULT_PROJECT = "ZigguratKids4"
+PAUSE_SECONDS = 5
+MAX_SESSIONS  = 3
+SESSION_TIMEOUT_MINUTES = 72 * 60  # 72 hours for most sessions
+PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
+USAGE_DB_PATH = "/opt/shahrzad-devops/configs/usage_tracker.json"
+PROJECTS_FILE = "/opt/shahrzad-devops/configs/projects.json"
 
-BASE_DIR   = os.environ.get("BOT_BASE_DIR", os.path.dirname(os.path.abspath(__file__)))
-REPOS      = os.environ.get("BOT_REPOS_DIR", f"{BASE_DIR}/repos")
-REPORTS    = os.environ.get("BOT_REPORTS_DIR", f"{BASE_DIR}/reports")
-LOGS       = os.environ.get("BOT_LOGS_DIR", f"{BASE_DIR}/logs")
-SCRIPTS    = os.environ.get("BOT_SCRIPTS_DIR", f"{BASE_DIR}/scripts")
-UPLOADS    = os.environ.get("BOT_UPLOADS_DIR", f"{BASE_DIR}/uploads")
-PROMPTS_FILE = os.environ.get("BOT_PROMPTS_FILE", f"{BASE_DIR}/configs/gemini-prompts.json")
-REPORT_URL = os.environ.get("BOT_REPORT_URL", "https://your-server.com/reports")
-
-DEFAULT_PROJECT = os.environ.get("BOT_DEFAULT_PROJECT", "MyProject")
-PAUSE_SECONDS   = int(os.environ.get("BOT_PAUSE_SECONDS", "5"))
-MAX_SESSIONS    = int(os.environ.get("BOT_MAX_SESSIONS", "3"))
-SESSION_TIMEOUT_MINUTES = int(os.environ.get("BOT_SESSION_TIMEOUT_HOURS", "72")) * 60
-
-# Projects that never auto-close (comma-separated)
-PERMANENT_PROJECTS = set(
-    p.strip() for p in os.environ.get("BOT_PERMANENT_PROJECTS", "").split(",") if p.strip()
-)
-
-USAGE_DB_PATH  = os.environ.get("BOT_USAGE_DB", f"{BASE_DIR}/configs/usage_tracker.json")
-PROJECTS_FILE  = os.environ.get("BOT_PROJECTS_FILE", f"{BASE_DIR}/configs/projects.json")
-
-# ── OpenAI / OpenRouter (fallback providers) ──
-OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "")
+# ── OpenAI (GPT fallback) ──
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-GPT_FALLBACK_MODEL = os.environ.get("BOT_GPT_FALLBACK_MODEL", "gpt-4o")
+GPT_FALLBACK_MODEL = "gpt-4o"
 
 # Active fallback model (can be changed at runtime via /model)
+# "gemini" = use Gemini from gemini-prompts.json, "openai" = GPT-4o, "openrouter:<model>" = custom
 ACTIVE_FALLBACK = {"provider": "gemini", "model": ""}
 
 # ── Logging ──
@@ -107,9 +94,9 @@ class UsageTracker:
 
     def __init__(self, db_path=USAGE_DB_PATH):
         self.db_path = db_path
-        self.hourly_limit = int(os.environ.get("BOT_HOURLY_TOKEN_LIMIT", "100000"))
-        self.daily_limit  = int(os.environ.get("BOT_DAILY_TOKEN_LIMIT", "1000000"))
-        self.weekly_limit = int(os.environ.get("BOT_WEEKLY_TOKEN_LIMIT", "5000000"))
+        self.hourly_limit = 100_000   # tokens — adjust based on plan
+        self.daily_limit  = 1_000_000
+        self.weekly_limit = 5_000_000
         self.alert_threshold = 0.8    # 80%
         self._load()
 
@@ -167,20 +154,20 @@ class UsageTracker:
     def format_bar(pct: float) -> str:
         filled = int(pct * 10)
         empty = 10 - filled
-        bar = "█" * filled + "░" * empty
+        bar = "\u2588" * filled + "\u2591" * empty
         if pct > 0.9:
-            emoji = "🔴"
+            emoji = "\U0001f534"
         elif pct > 0.7:
-            emoji = "⚠️"
+            emoji = "\u26a0\ufe0f"
         else:
-            emoji = "✅"
+            emoji = "\u2705"
         return f"{bar} {int(pct * 100)}%  {emoji}"
 
     def format_usage_message(self, active_sessions: int = 0) -> str:
         s = self.get_summary()
         return (
-            "📊 <b>Claude Code Usage</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
+            "\U0001f4ca <b>Claude Code Usage</b>\n"
+            "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
             f"This hour:  <code>{self.format_bar(s['hourly_pct'])}</code>\n"
             f"Today:      <code>{self.format_bar(s['daily_pct'])}</code>\n"
             f"This week:  <code>{self.format_bar(s['weekly_pct'])}</code>\n\n"
@@ -223,11 +210,14 @@ def save_projects(projects: list[dict]):
 
 
 def get_project_names() -> list[str]:
+    """Get list of project names from config."""
     return [p["name"] for p in load_projects()]
 
 
 def add_project(name: str, path: str):
+    """Add a new project to the config."""
     projects = load_projects()
+    # Don't add duplicates
     if any(p["name"] == name for p in projects):
         return
     projects.append({"name": name, "path": path})
@@ -235,6 +225,7 @@ def add_project(name: str, path: str):
 
 
 def get_project_path(name: str) -> str:
+    """Get project path by name. Falls back to REPOS/<name>."""
     for p in load_projects():
         if p["name"] == name:
             return p["path"]
@@ -244,6 +235,7 @@ def get_project_path(name: str) -> str:
 # ═══════════════════════════════════════════
 #  Conversation State (multi-step flows)
 # ═══════════════════════════════════════════
+# chat_id -> {"state": str, "data": dict}
 CONV_STATE: dict[int, dict] = {}
 
 
@@ -253,21 +245,22 @@ CONV_STATE: dict[int, dict] = {}
 async def gemini_fallback(prompt: str, project: str) -> str:
     """Use Gemini as primary fallback for non-code tasks."""
     if not GEMINI_OK:
-        return ""
+        return ""  # empty = try next fallback
     try:
+        # Use refine model from gemini-prompts.json (most capable)
         cfg = load_prompts().get("refine", {})
         model = cfg.get("model", "gemini-2.5-flash")
         r = gemini_client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text":
-                f"You are a DevOps assistant for the {project} project. "
+                f"You are a DevOps assistant for the {project} project at Shahrzad.ai. "
                 f"Be concise and actionable. You cannot execute code or SSH — only advise.\n\n{prompt}"
             }]}])
         short = model.split("-preview")[0] if "-preview" in model else model
-        return f"🔄 <i>[Gemini/{short} fallback — Claude was rate-limited]</i>\n\n{r.text.strip()}"
+        return f"\U0001f504 <i>[Gemini/{short} fallback — Claude was rate-limited]</i>\n\n{r.text.strip()}"
     except Exception as e:
         log.error(f"Gemini fallback error: {e}")
-        return ""
+        return ""  # empty = try next
 
 
 async def openai_fallback(prompt: str, project: str) -> str:
@@ -291,7 +284,7 @@ async def openai_fallback(prompt: str, project: str) -> str:
             resp.raise_for_status()
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
-            return f"🔄 <i>[GPT fallback — Claude was rate-limited]</i>\n\n{content}"
+            return f"\U0001f504 <i>[GPT fallback — Claude was rate-limited]</i>\n\n{content}"
     except Exception as e:
         log.error(f"OpenAI fallback error: {e}")
         return ""
@@ -310,6 +303,8 @@ async def openrouter_fallback(prompt: str, project: str, model: str = "") -> str
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
+                    "HTTP-Referer": "https://shahrzad.ai",
+                    "X-Title": "Shahrzad DevOps",
                 },
                 json={
                     "model": model,
@@ -323,7 +318,7 @@ async def openrouter_fallback(prompt: str, project: str, model: str = "") -> str
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
             short_model = model.split("/")[-1] if "/" in model else model
-            return f"🔄 <i>[OpenRouter/{short_model} — Claude was rate-limited]</i>\n\n{content}"
+            return f"\U0001f504 <i>[OpenRouter/{short_model} — Claude was rate-limited]</i>\n\n{content}"
     except Exception as e:
         log.error(f"OpenRouter fallback error: {e}")
         return ""
@@ -334,6 +329,7 @@ async def gpt_fallback(prompt: str, project: str) -> str:
     provider = ACTIVE_FALLBACK.get("provider", "gemini")
     model = ACTIVE_FALLBACK.get("model", "")
 
+    # Try active fallback first
     if provider == "gemini":
         r = await gemini_fallback(prompt, project)
         if r: return r
@@ -344,6 +340,7 @@ async def gpt_fallback(prompt: str, project: str) -> str:
         r = await openrouter_fallback(prompt, project, model)
         if r: return r
 
+    # Chain: try remaining providers
     if provider != "gemini":
         r = await gemini_fallback(prompt, project)
         if r: return r
@@ -354,7 +351,7 @@ async def gpt_fallback(prompt: str, project: str) -> str:
         r = await openrouter_fallback(prompt, project)
         if r: return r
 
-    return "⚠️ Claude rate-limited. All fallbacks failed. Wait for rate limit to reset."
+    return "\u26a0\ufe0f Claude rate-limited. All fallbacks failed. Wait for rate limit to reset."
 
 
 # ═══════════════════════════════════════════
@@ -364,16 +361,16 @@ SESSION_COLORS = ["🔵", "🟢", "🟡", "🟠", "🔴", "🟣"]
 
 @dataclass
 class Session:
-    id: str
-    label: str
-    color_emoji: str
-    session_uuid: str
+    id: str                          # unique session id
+    label: str                       # user-visible name
+    color_emoji: str                 # rotating color indicator
+    session_uuid: str                # UUID for claude --session-id
     project: str = DEFAULT_PROJECT
     status: str = "idle"             # idle | running | completed | error
     started_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
-    message_ids: list = field(default_factory=list)
-    anchor_message_id: Optional[int] = None
+    message_ids: list = field(default_factory=list)   # telegram msg IDs belonging to this session
+    anchor_message_id: Optional[int] = None           # the /new reply message
     files: list = field(default_factory=list)
     out: str = ""
     tasks: int = 0
@@ -383,9 +380,9 @@ class Session:
 
 class SessionManager:
     def __init__(self):
-        self.sessions: dict[str, Session] = {}
-        self.msg_to_session: dict[int, str] = {}
-        self.color_index: dict[int, int] = {}
+        self.sessions: dict[str, Session] = {}       # session_id -> Session (per chat)
+        self.msg_to_session: dict[int, str] = {}     # telegram_message_id -> session_id
+        self.color_index: dict[int, int] = {}         # chat_id -> next color index
 
     def _next_color(self, chat_id: int) -> str:
         idx = self.color_index.get(chat_id, 0)
@@ -398,11 +395,14 @@ class SessionManager:
 
     def create(self, chat_id: int, label: str) -> Session:
         key = self._key(chat_id, label)
+        # If session with same label exists, kill it first
         if key in self.sessions:
             self.kill(chat_id, label)
         color = self._next_color(chat_id)
         session = Session(
-            id=key, label=label, color_emoji=color,
+            id=key,
+            label=label,
+            color_emoji=color,
             session_uuid=str(uuid.uuid4()),
         )
         self.sessions[key] = session
@@ -415,9 +415,11 @@ class SessionManager:
         return self.sessions.get(key)
 
     def register_message(self, msg_id: int, session_key: str):
+        """Map a telegram message ID to a session for reply routing."""
         self.msg_to_session[msg_id] = session_key
 
     def find_by_message(self, msg_id: int) -> Optional[Session]:
+        """Find session by telegram message ID (for reply routing)."""
         key = self.msg_to_session.get(msg_id)
         if key:
             return self.sessions.get(key)
@@ -432,6 +434,7 @@ class SessionManager:
         key = self._key(chat_id, label)
         session = self.sessions.pop(key, None)
         if session:
+            # Clean up message mappings
             to_remove = [mid for mid, sk in self.msg_to_session.items() if sk == key]
             for mid in to_remove:
                 del self.msg_to_session[mid]
@@ -439,34 +442,93 @@ class SessionManager:
         return False
 
     def get_default(self, chat_id: int) -> Optional[Session]:
+        """Get default session: if only 1 active, return it."""
         active = self.active_for_chat(chat_id)
         if len(active) == 1:
             return active[0]
         return None
 
     def cleanup_timed_out(self, timeout_minutes: int = SESSION_TIMEOUT_MINUTES) -> list[Session]:
+        """Remove sessions inactive for longer than timeout. Returns removed sessions.
+        Sessions on PERMANENT_PROJECTS are never auto-closed."""
         cutoff = time.time() - timeout_minutes * 60
         timed_out = []
         keys_to_remove = []
         for key, session in self.sessions.items():
+            # Never auto-close sessions on permanent projects
             if session.project in PERMANENT_PROJECTS:
                 continue
             if session.status != "running" and session.last_active < cutoff:
                 timed_out.append(session)
                 keys_to_remove.append(key)
         for key in keys_to_remove:
-            self.sessions.pop(key, None)
+            session = self.sessions.pop(key, None)
+            # Clean up message mappings
             to_remove = [mid for mid, sk in self.msg_to_session.items() if sk == key]
             for mid in to_remove:
                 del self.msg_to_session[mid]
         return timed_out
 
     def can_create(self, chat_id: int) -> bool:
+        """Check if chat hasn't exceeded MAX_SESSIONS."""
         return len(self.active_for_chat(chat_id)) < MAX_SESSIONS
 
 
 SM = SessionManager()
+# Store pending messages for multi-session routing: chat_id -> (text, files, message)
 PENDING_MESSAGES: dict[int, dict] = {}
+# Track which session is "focused" per chat — messages without reply go here
+ACTIVE_SESSION: dict[int, str] = {}  # chat_id -> session_key
+# Buffer for multi-message concatenation (Telegram splits long text)
+MESSAGE_BUFFER: dict[int, dict] = {}  # chat_id -> {"texts": [], "timer": task, "update": update, "time": float}
+
+# ═══════════════════════════════════════════
+#  Delayed Prompts
+# ═══════════════════════════════════════════
+DELAY_PATTERN = re.compile(r"^:DELAY=(\d+)(M|H):\s*", re.IGNORECASE)
+
+@dataclass
+class DelayedPrompt:
+    id: str
+    chat_id: int
+    prompt: str
+    project: str
+    session_label: str
+    session_key: str
+    scheduled_at: float
+    fire_at: float
+    delay_str: str
+    task: Optional[asyncio.Task] = None
+    fired: bool = False
+    cancelled: bool = False
+    files: list = field(default_factory=list)
+
+# Global store: delay_id -> DelayedPrompt
+DELAYED_PROMPTS: dict[str, DelayedPrompt] = {}
+
+
+def parse_delay(text: str) -> tuple[Optional[int], str]:
+    """Parse :DELAY=30M: or :DELAY=2H: prefix. Returns (seconds, remaining_text) or (None, text)."""
+    m = DELAY_PATTERN.match(text)
+    if not m:
+        return None, text
+    amount = int(m.group(1))
+    unit = m.group(2).upper()
+    if unit == "M":
+        seconds = amount * 60
+    else:  # H
+        seconds = amount * 3600
+    remaining = text[m.end():]
+    return seconds, remaining
+
+
+def format_delay(seconds: int) -> str:
+    if seconds >= 3600:
+        h = seconds // 3600
+        m = (seconds % 3600) // 60
+        return f"{h}h{f' {m}m' if m else ''}"
+    return f"{seconds // 60}m"
+
 
 # ═══════════════════════════════════════════
 #  UI
@@ -481,6 +543,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 )
 
 def menu_kb():
+    """Inline quick-action buttons — shown on /start and /help only."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("📊 Usage", callback_data="menu:usage"),
@@ -497,6 +560,8 @@ def project_kb(session_key: str = ""):
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"📦 {p}", callback_data=f"proj:{session_key}:{p}")] for p in ps])
 
 def new_session_project_kb(label: str, has_name: bool = True):
+    """Project picker for /new flow — callback stores the session label.
+    has_name=False uses 'newneed:' prefix so we know to ask for name after project pick."""
     ps = get_project_names()
     prefix = "newproj" if has_name else "newneed"
     rows = [[InlineKeyboardButton(f"📁 {p}", callback_data=f"{prefix}:{label}:{p}")] for p in ps]
@@ -504,14 +569,17 @@ def new_session_project_kb(label: str, has_name: bool = True):
     return InlineKeyboardMarkup(rows)
 
 def sessions_kill_kb(sessions: list):
+    """Inline kill buttons for /sessions display."""
     rows = [[InlineKeyboardButton(f"🗑 {s.color_emoji} {s.label}", callback_data=f"skill:{s.id}")] for s in sessions]
     return InlineKeyboardMarkup(rows)
 
 def kill_picker_kb(sessions: list):
+    """Inline buttons for /kill without args."""
     rows = [[InlineKeyboardButton(f"🗑 {s.color_emoji} {s.label}", callback_data=f"skill:{s.id}")] for s in sessions]
     return InlineKeyboardMarkup(rows)
 
 def route_picker_kb(sessions: list):
+    """Inline session picker when user sends message without reply and multiple sessions active."""
     buttons = [InlineKeyboardButton(f"{s.color_emoji} {s.label}", callback_data=f"route:{s.id}") for s in sessions]
     return InlineKeyboardMarkup([buttons])
 
@@ -585,13 +653,15 @@ def authorized(fn):
 async def run_claude(prompt, project, session_uuid, files=None, session_label=""):
     repo = get_project_path(project)
     if not os.path.isdir(repo):
+        # Fallback to REPOS/<project>
         repo = f"{REPOS}/{project}"
     if not os.path.isdir(repo):
+        # Try to create the directory (user may have added a new project path)
         try:
             os.makedirs(repo, exist_ok=True)
             log.info(f"Created project directory: {repo}")
         except Exception as e:
-            return f"❌ Not found: {project}\nCould not create: {e}"
+            return f"\u274c Not found: {project}\nCould not create: {e}"
     fnote = ""
     if files:
         td = f"{repo}/.claude-tasks"; os.makedirs(td, exist_ok=True)
@@ -600,35 +670,35 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
             if os.path.isfile(fp):
                 d = f"{td}/{os.path.basename(fp)}"; subprocess.run(["cp", fp, d]); copied.append(d)
         if copied:
-            fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+            fnote = "\n\n[ATTACHED FILES \u2014 read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
     full_prompt = prompt + fnote
     cmd = ["claude", "--print", "--session-id", session_uuid, full_prompt]
     log.info(f"Claude [{project}] session={session_uuid[:8]}: {prompt[:80]}... ({len(files or [])} files)")
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "HOME": os.path.expanduser("~"),
-                 "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
+            env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
         out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
         r = out.decode("utf-8", errors="replace")
         e = err.decode("utf-8", errors="replace") if err else ""
 
-        # Handle "Session ID already in use" — retry with new UUID
+        # Handle "Session ID already in use" — generate new UUID and retry once
         if proc.returncode != 0 and "already in use" in (r + e).lower():
             log.warning(f"Session ID {session_uuid[:8]} in use, retrying with new UUID")
             new_uuid = str(uuid.uuid4())
             cmd[cmd.index(session_uuid)] = new_uuid
             proc2 = await asyncio.create_subprocess_exec(
                 *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "HOME": os.path.expanduser("~"),
-                     "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")})
+                env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
             out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=3600)
             r = out2.decode("utf-8", errors="replace")
             e = err2.decode("utf-8", errors="replace") if err2 else ""
-            proc = proc2
+            proc = proc2  # use new proc for remaining checks
 
+        # Track usage
         USAGE.record(len(full_prompt), len(r), session_label)
 
+        # Detect rate limiting
         rate_limited = False
         if proc.returncode != 0:
             combined = (r + e).lower()
@@ -636,18 +706,18 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
                 rate_limited = True
 
         if rate_limited:
-            log.warning(f"Claude rate-limited for session {session_uuid[:8]}, falling back")
+            log.warning(f"Claude rate-limited for session {session_uuid[:8]}, falling back to GPT")
             return await gpt_fallback(prompt, project)
 
         if proc.returncode != 0 and e:
-            r += f"\n⚠️ {e[:500]}"
+            r += f"\n\u26a0\ufe0f {e[:500]}"
         return r.strip() or "(no output)"
     except asyncio.TimeoutError:
         try: proc.kill()
         except: pass
-        return "⏰ Timeout (60 min)."
+        return "\u23f0 Timeout (60 min)."
     except Exception as e:
-        return f"❌ {e}"
+        return f"\u274c {e}"
 
 # ═══════════════════════════════════════════
 #  Gemini: Transcribe + Refine
@@ -734,23 +804,53 @@ async def download_doc(doc, ctx):
 # ═══════════════════════════════════════════
 #  Session Resolution
 # ═══════════════════════════════════════════
+def set_active(chat_id: int, session: Session):
+    """Set which session is currently focused for this chat."""
+    ACTIVE_SESSION[chat_id] = session.id
+
+
+def get_active(chat_id: int) -> Optional[Session]:
+    """Get the currently focused session for this chat."""
+    key = ACTIVE_SESSION.get(chat_id)
+    if key:
+        s = SM.get_by_key(key)
+        if s and s.status != "completed":
+            return s
+    # Fallback: if only 1 active, use it
+    return SM.get_default(chat_id)
+
+
 def resolve_session(update) -> Optional[Session]:
+    """Resolve which session a message belongs to.
+    Priority: 1) reply-to, 2) active session, 3) single active session."""
     msg = update.message or (update.callback_query.message if update.callback_query else None)
     if not msg:
         return None
+    cid = msg.chat.id
+
+    # 1. Check if replying to a session message → switch active to that
     if msg.reply_to_message:
         reply_id = msg.reply_to_message.message_id
         session = SM.find_by_message(reply_id)
-        if session:
+        if session and session.status != "completed":
+            set_active(cid, session)
             return session
-    cid = msg.chat.id
-    return SM.get_default(cid)
+
+    # 2. Return active session (most recently interacted)
+    return get_active(cid)
 
 
 async def track_reply(sent_msg: Message, session: Session):
+    """Register a sent message as belonging to a session and set it as active."""
     if sent_msg:
         SM.register_message(sent_msg.message_id, session.id)
         session.message_ids.append(sent_msg.message_id)
+        # Set as active for this chat
+        chat_id_str = session.id.split(":")[0]
+        try:
+            set_active(int(chat_id_str), session)
+        except ValueError:
+            pass
 
 # ═══════════════════════════════════════════
 #  Core: Execute with Pause Window
@@ -760,7 +860,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
     fi = f"\n📎 {len(files)} file(s)" if files else ""
     pfx = session_prefix(session)
 
-    # Pause window
+    # ── Pause window ──
     session.paused = False
     cm = await update.message.reply_text(
         f"{pfx} | {'🎤 Voice' if is_voice else '💬 Message'} received{fi}\n⏳ Starting in {PAUSE_SECONDS}s...\n\n<i>Tap to cancel:</i>",
@@ -777,7 +877,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
         except: pass
     if session.paused: return
 
-    # Refine if voice
+    # ── Refine if voice ──
     if is_voice and len(prompt.split()) > 3:
         await cm.edit_text(f"{pfx} | 🧠 <b>Refining prompt...</b>", parse_mode=ParseMode.HTML)
         refined = await refine_prompt(prompt)
@@ -788,7 +888,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
                 parse_mode=ParseMode.HTML)
             await track_reply(r, session)
 
-    # Run Claude with progress indicator
+    # ── Run Claude with progress indicator ──
     session.status = "running"
     await cm.edit_text(f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n⏳ Working...", parse_mode=ParseMode.HTML)
 
@@ -823,20 +923,40 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
     session.tasks += 1
     session.last_active = time.time()
 
+    # Check if this session is the active one — if not, add "switch" button
+    cid_str = session.id.split(":")[0]
+    try:
+        cid_int = int(cid_str)
+    except ValueError:
+        cid_int = 0
+    current_active = get_active(cid_int)
+    is_bg_session = current_active and current_active.id != session.id
+
+    # Build reply markup: after_kb + optional switch button
+    if is_bg_session:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"↩️ Switch to {session_prefix(session)}", callback_data=f"switch:{session.id}")],
+            [InlineKeyboardButton("📦 Save Report", callback_data="do:report"),
+             InlineKeyboardButton("🚀 Deploy", callback_data="do:deploy_ask")],
+            [InlineKeyboardButton("📊 Health", callback_data="do:health")]])
+    else:
+        kb = after_kb()
+
     sent = await send_long(update.message,
-        f"{pfx} | 🤖 <code>{proj}</code>\n━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
-        rm=after_kb())
+        f"{pfx} | \U0001f916 <code>{proj}</code>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n{fmt_out(output)}",
+        rm=kb)
     await track_reply(sent, session)
 
     if len(output) > 8000:
         lnk = await make_report(f"{proj}-auto", output)
-        r = await update.message.reply_text(f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}", parse_mode=ParseMode.HTML)
+        r = await update.message.reply_text(f"\U0001f4ce <b>Full output:</b>\n\n{fmt_links(lnk)}", parse_mode=ParseMode.HTML)
         await track_reply(r, session)
 
+    # Auto-alert if usage is high
     if USAGE.should_alert():
         s = USAGE.get_summary()
         await update.message.reply_text(
-            f"⚠️ Hourly usage at {int(s['hourly_pct']*100)}% — "
+            f"\u26a0\ufe0f Hourly usage at {int(s['hourly_pct']*100)}% \u2014 "
             f"consider pausing heavy tasks or switching to lighter prompts",
             parse_mode=ParseMode.HTML)
 
@@ -845,20 +965,12 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 # ═══════════════════════════════════════════
 async def do_health(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
-    health_script = f"{SCRIPTS}/health-check.sh"
-    if not os.path.isfile(health_script):
-        await u.message.reply_text("⚠️ health-check.sh not found. See scripts/ for an example.", parse_mode=ParseMode.HTML)
-        return
-    r = subprocess.run([health_script], capture_output=True, text=True, timeout=30)
+    r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_logs(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
-    logs_script = f"{SCRIPTS}/collect-logs.sh"
-    if not os.path.isfile(logs_script):
-        await u.message.reply_text("⚠️ collect-logs.sh not found. See scripts/ for an example.", parse_mode=ParseMode.HTML)
-        return
-    r = subprocess.run([logs_script], capture_output=True, text=True, timeout=30)
+    r = subprocess.run([f"{SCRIPTS}/collect-logs.sh", "138.197.76.197", "30"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📋 <b>Logs</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_projects(u, c):
@@ -872,6 +984,7 @@ async def do_projects(u, c):
     cur_proj = session.project if session else DEFAULT_PROJECT
     for p in ps:
         check = " ✅" if p == cur_proj else ""
+        # Show sessions per project
         proj_sessions = [s for s in active if s.project == p]
         sess_info = ", ".join(f"{s.color_emoji} {s.label} ({s.status})" for s in proj_sessions) if proj_sessions else "no sessions"
         lines.append(f"  <b>{p}</b>{check} — {sess_info}")
@@ -906,7 +1019,7 @@ async def cmd_start(u, c):
     cid = u.effective_chat.id
     active = SM.active_for_chat(cid)
     await u.message.reply_text(
-        f"🤖 <b>Claude Code Telegram Bot v4</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🤖 <b>Shahrzad DevOps Bot v4</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📂 Default project: <b>{DEFAULT_PROJECT}</b>\n"
         f"🎤 Voice: {'✅ Gemini' if GEMINI_OK else '❌ Set GEMINI_API_KEY'}\n"
         f"💬 Sessions: {len(active)} active\n\n"
@@ -920,32 +1033,36 @@ async def cmd_start(u, c):
 @authorized
 async def cmd_help(u, c):
     await u.message.reply_text(
-        "📖 <b>How to use — v4 Multi-Session</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "\U0001f4d6 <b>How to use \u2014 v4 Multi-Session</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "<b>Sessions:</b>\n"
-        "/new &lt;name&gt; — start a new session (max 3)\n"
-        "/sessions — list all active sessions\n"
-        "/kill &lt;name&gt; — end a session\n"
-        "/project &lt;name&gt; — change project for current session\n"
-        "/usage — view token usage stats\n"
-        "/model — change fallback model\n\n"
+        "/new &lt;name&gt; \u2014 start a new session (max 3)\n"
+        "/sessions \u2014 list all active sessions\n"
+        "/kill &lt;name&gt; \u2014 end a session\n"
+        "/project &lt;name&gt; \u2014 change project for current session\n"
+        "/usage \u2014 view token usage stats\n\n"
         "<b>Routing:</b>\n"
-        "Reply to any session message → routes to that session\n"
-        "If only 1 session active → auto-routes there\n\n"
-        "💬 <b>Text:</b> Type anything → Claude Code\n"
-        "🎤 <b>Voice:</b> Speak in Farsi/English\n"
-        "    Short commands auto-execute (deploy, test...)\n"
-        "    Long commands → refined → confirm → execute\n"
-        "📎 <b>Files:</b> Send files → then reply with instructions\n"
-        "⏸ <b>Pause:</b> 5s window to cancel after sending\n"
-        "📦 <b>Reports:</b> Tap Save Report → link for Claude Chat\n\n"
+        "Reply to any session message \u2192 routes to that session\n"
+        "If only 1 session active \u2192 auto-routes there\n\n"
+        "\U0001f4ac <b>Text:</b> Type anything \u2192 Claude Code\n"
+        "\U0001f3a4 <b>Voice:</b> Speak in Farsi/English\n"
+        "    Short commands auto-execute (\u062f\u06cc\u067e\u0644\u0648\u06cc\u060c \u062a\u0633\u062a...)\n"
+        "    Long commands \u2192 refined \u2192 confirm \u2192 execute\n"
+        "\U0001f4ce <b>Files:</b> Send files \u2192 then reply with instructions\n"
+        "\u23f8 <b>Pause:</b> 5s window to cancel after sending\n"
+        "\U0001f4e6 <b>Reports:</b> Tap Save Report \u2192 link for Claude Chat\n\n"
+        "⏰ <b>Delayed prompts:</b>\n"
+        "<code>:DELAY=30M:</code> your prompt → runs in 30 minutes\n"
+        "<code>:DELAY=2H:</code> your prompt → runs in 2 hours\n"
+        "/delayed — view/cancel pending\n\n"
         "<b>Smart features:</b>\n"
-        "• Sessions auto-close after configurable inactivity\n"
-        "• Multi-provider fallback when Claude is rate-limited\n"
-        "• Usage alerts at 80% hourly limit\n",
+        "\u2022 Sessions auto-close after 72h inactivity (ZigguratKids4: never)\n"
+        "\u2022 GPT fallback when Claude is rate-limited\n"
+        "\u2022 Usage alerts at 80% hourly limit\n",
         parse_mode=ParseMode.HTML)
 
 @authorized
 async def cmd_usage(u, c):
+    """Show usage stats: /usage"""
     cid = u.effective_chat.id
     active = SM.active_for_chat(cid)
     await u.message.reply_text(
@@ -954,6 +1071,7 @@ async def cmd_usage(u, c):
 
 @authorized
 async def cmd_new(u, c):
+    """Create a new session: /new <name>"""
     cid = u.effective_chat.id
     parts = u.message.text.strip().split(maxsplit=1)
     has_name = len(parts) > 1
@@ -962,10 +1080,12 @@ async def cmd_new(u, c):
     if not SM.can_create(cid):
         active = SM.active_for_chat(cid)
         await u.message.reply_text(
-            f"⚠️ Max {MAX_SESSIONS} concurrent sessions. Kill one first:",
+            f"\u26a0\ufe0f Max {MAX_SESSIONS} concurrent sessions. Kill one first:",
             parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
         return
 
+    # Show project picker — session created on project selection
+    # If no name given, we'll ask for name after project selection
     await u.message.reply_text(
         f"🆕 New session{f' <b>{esc(label)}</b>' if has_name else ''} — which project?",
         parse_mode=ParseMode.HTML, reply_markup=new_session_project_kb(label, has_name=has_name))
@@ -990,6 +1110,7 @@ async def cmd_sessions(u, c):
 
 @authorized
 async def cmd_kill(u, c):
+    """Kill a session: /kill <name>"""
     cid = u.effective_chat.id
     parts = u.message.text.strip().split(maxsplit=1)
     if len(parts) < 2:
@@ -1013,12 +1134,15 @@ async def cmd_kill(u, c):
 
 @authorized
 async def cmd_project(u, c):
+    """Change project for session: /project <name>"""
     session = resolve_session(u)
     parts = u.message.text.strip().split(maxsplit=1)
+    # If no session and no args → show project list (same as Projects button)
     if not session and len(parts) < 2:
         await do_projects(u, c)
         return
     if not session:
+        # Has args but no session — still show projects
         await do_projects(u, c)
         return
     if len(parts) < 2:
@@ -1028,7 +1152,7 @@ async def cmd_project(u, c):
             parse_mode=ParseMode.HTML, reply_markup=project_kb(key))
         return
     proj = parts[1].strip()
-    if not os.path.isdir(get_project_path(proj)):
+    if not os.path.isdir(f"{REPOS}/{proj}"):
         await u.message.reply_text(f"❌ Project <b>{esc(proj)}</b> not found.", parse_mode=ParseMode.HTML)
         return
     session.project = proj
@@ -1053,9 +1177,11 @@ OPENROUTER_POPULAR = [
 
 @authorized
 async def cmd_model(u, c):
+    """Show/change active fallback model: /model"""
     prov = ACTIVE_FALLBACK["provider"]
     model = ACTIVE_FALLBACK.get("model", "")
 
+    # Get Gemini models from config
     prompts_cfg = load_prompts()
     gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-2.5-flash")
     gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-2.5-flash")
@@ -1088,9 +1214,121 @@ async def cmd_model(u, c):
         reply_markup=InlineKeyboardMarkup(rows))
 
 # ═══════════════════════════════════════════
+#  Delayed Prompt Execution
+# ═══════════════════════════════════════════
+async def schedule_delayed_prompt(dp: DelayedPrompt, app):
+    """Sleep for the delay, then execute the prompt."""
+    delay_secs = dp.fire_at - time.time()
+    if delay_secs > 0:
+        log.info(f"Delayed prompt {dp.id[:8]}: sleeping {delay_secs:.0f}s")
+        await asyncio.sleep(delay_secs)
+
+    if dp.cancelled:
+        log.info(f"Delayed prompt {dp.id[:8]}: cancelled, skipping")
+        return
+
+    dp.fired = True
+    chat_id = dp.chat_id
+    project = dp.project
+
+    # Try to find the original session
+    session = SM.get_by_key(dp.session_key)
+    if not session or session.status == "completed":
+        # Session closed — create a new one in the same project
+        label = f"delayed-{int(time.time()) % 10000}"
+        session = SM.create(chat_id, label)
+        session.project = project
+        try:
+            await app.bot.send_message(
+                chat_id,
+                f"⏰ {session.color_emoji} New session <b>{esc(session.label)}</b> created for delayed prompt.\n"
+                f"📁 Project: <b>{project}</b>",
+                parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.error(f"Delayed prompt notify error: {e}")
+
+    # Notify that the delayed prompt is firing
+    try:
+        notify_msg = await app.bot.send_message(
+            chat_id,
+            f"⏰ <b>Delayed prompt firing now!</b>\n"
+            f"{session_prefix(session)} | 📂 <code>{project}</code>\n"
+            f"Scheduled {dp.delay_str} ago\n\n"
+            f"<pre>{esc(dp.prompt[:500])}</pre>",
+            parse_mode=ParseMode.HTML)
+        await track_reply(notify_msg, session)
+    except Exception as e:
+        log.error(f"Delayed prompt notify error: {e}")
+
+    # Execute
+    session.status = "running"
+    session.last_active = time.time()
+    try:
+        output = await run_claude(dp.prompt, project, session.session_uuid, dp.files or None, session.label)
+    except Exception as e:
+        output = f"❌ Delayed execution error: {e}"
+
+    session.out = output
+    session.status = "idle"
+    session.tasks += 1
+    session.last_active = time.time()
+
+    try:
+        sent = await app.bot.send_message(
+            chat_id,
+            f"⏰ {session_prefix(session)} | 🤖 <code>{project}</code> (delayed)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
+            parse_mode=ParseMode.HTML, reply_markup=after_kb())
+        await track_reply(sent, session)
+
+        if len(output) > 8000:
+            lnk = await make_report(f"{project}-delayed", output)
+            r = await app.bot.send_message(
+                chat_id,
+                f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
+                parse_mode=ParseMode.HTML)
+            await track_reply(r, session)
+    except Exception as e:
+        log.error(f"Delayed prompt output error: {e}")
+
+    # Cleanup
+    DELAYED_PROMPTS.pop(dp.id, None)
+
+
+@authorized
+async def cmd_delayed(u, c):
+    """List and manage delayed prompts: /delayed"""
+    cid = u.effective_chat.id
+    pending = [dp for dp in DELAYED_PROMPTS.values()
+               if dp.chat_id == cid and not dp.fired and not dp.cancelled]
+
+    if not pending:
+        await u.message.reply_text("📭 No pending delayed prompts.", parse_mode=ParseMode.HTML)
+        return
+
+    lines = []
+    rows = []
+    for dp in sorted(pending, key=lambda x: x.fire_at):
+        remaining = max(0, dp.fire_at - time.time())
+        lines.append(
+            f"⏰ <b>{dp.delay_str}</b> → fires in <b>{format_delay(int(remaining))}</b>\n"
+            f"   📂 {dp.project} | 💬 <code>{esc(dp.prompt[:60])}</code>")
+        rows.append([InlineKeyboardButton(
+            f"❌ Cancel: {dp.prompt[:30]}...",
+            callback_data=f"delaycancel:{dp.id}")])
+
+    await u.message.reply_text(
+        f"⏰ <b>Pending Delayed Prompts ({len(pending)})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n" + "\n\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
+
+# ═══════════════════════════════════════════
 #  Error Handler
 # ═══════════════════════════════════════════
 async def error_handler(update, context):
+    """Handle errors gracefully."""
     err = context.error
     if "Query is too old" in str(err) or "query id is invalid" in str(err):
         log.debug(f"Expired callback (ignored): {err}")
@@ -1113,9 +1351,11 @@ async def on_callback(u, c):
     q = u.callback_query; await q.answer()
     d = q.data; cid = q.message.chat.id
 
+    # Resolve session from the callback message
     session = SM.find_by_message(q.message.message_id)
 
     if d.startswith("proj:"):
+        # proj:<session_key>:<project>
         parts = d.split(":", 2)
         session_key = parts[1] if len(parts) > 2 else ""
         proj_name = parts[2] if len(parts) > 2 else parts[1]
@@ -1145,30 +1385,22 @@ async def on_callback(u, c):
     elif d.startswith("dbr:"):
         _, proj, br = d.split(":")
         if br == "claude_latest":
-            r = subprocess.run(["git","branch","-r","--sort=-committerdate"], cwd=get_project_path(proj), capture_output=True, text=True)
+            r = subprocess.run(["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
             cbs = [b.strip().replace("origin/","") for b in r.stdout.splitlines() if "claude/" in b]
             br = cbs[0] if cbs else "main"
         await q.edit_message_text(f"⚠️ <b>Deploy {proj}@{br}</b> → production?\n\nSure?", parse_mode=ParseMode.HTML, reply_markup=deploy_confirm_kb(proj, br))
 
     elif d.startswith("dpl:"):
         _, proj, br = d.split(":")
-        deploy_script = f"{SCRIPTS}/deploy-to-prod.sh"
         await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
-        if os.path.isfile(deploy_script):
-            r = subprocess.run([deploy_script, proj, br], capture_output=True, text=True, timeout=120)
-            ok = r.returncode == 0
-            await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
-        else:
-            await c.bot.send_message(cid, "⚠️ deploy-to-prod.sh not found. Create it in scripts/.", parse_mode=ParseMode.HTML)
+        r = subprocess.run([f"{SCRIPTS}/deploy-to-prod.sh", proj, br], capture_output=True, text=True, timeout=120)
+        ok = r.returncode == 0
+        await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
 
     elif d == "do:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
-        health_script = f"{SCRIPTS}/health-check.sh"
-        if os.path.isfile(health_script):
-            r = subprocess.run([health_script], capture_output=True, text=True, timeout=30)
-            await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
-        else:
-            await c.bot.send_message(cid, "⚠️ health-check.sh not found.", parse_mode=ParseMode.HTML)
+        r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+        await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     elif d == "do:pause":
         if session:
@@ -1206,6 +1438,7 @@ async def on_callback(u, c):
         await q.edit_message_text("✏️ <b>Edit mode.</b> Type corrected message (reply to session):", parse_mode=ParseMode.HTML)
 
     elif d.startswith("newproj:"):
+        # newproj:<label>:<project> — create session with chosen project
         parts = d.split(":", 2)
         label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
         proj_name = parts[2] if len(parts) > 2 else parts[1]
@@ -1222,12 +1455,14 @@ async def on_callback(u, c):
             f"📁 Project: <b>{proj_name}</b>\n\n"
             f"Reply to this message to interact with this session.",
             parse_mode=ParseMode.HTML)
+        # Track the anchor message
         session.anchor_message_id = q.message.message_id
         SM.register_message(q.message.message_id, session.id)
         session.message_ids.append(q.message.message_id)
-        log.info(f"Session created: {session.label} → {proj_name} for chat {cid}")
+        log.info(f"Session created (picker): {session.label} → {proj_name} for chat {cid}")
 
     elif d.startswith("newneed:"):
+        # newneed:<auto_label>:<project> — project selected but no name given, ask for name
         parts = d.split(":", 2)
         auto_label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
         proj_name = parts[2] if len(parts) > 2 else parts[1]
@@ -1237,6 +1472,7 @@ async def on_callback(u, c):
                 f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
                 parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
             return
+        # Store state: waiting for session name
         CONV_STATE[cid] = {"state": "awaiting_session_name", "project": proj_name, "auto_label": auto_label}
         await q.edit_message_text(
             f"📁 Project: <b>{esc(proj_name)}</b>\n\nEnter a name for this session (or tap Skip):",
@@ -1246,6 +1482,7 @@ async def on_callback(u, c):
             ]))
 
     elif d.startswith("skipname:"):
+        # skipname:<auto_label>:<project> — user skipped naming, use auto-generated label
         parts = d.split(":", 2)
         auto_label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
         proj_name = parts[2] if len(parts) > 2 else parts[1]
@@ -1266,19 +1503,22 @@ async def on_callback(u, c):
         session.anchor_message_id = q.message.message_id
         SM.register_message(q.message.message_id, session.id)
         session.message_ids.append(q.message.message_id)
-        log.info(f"Session created: {session.label} → {proj_name} for chat {cid}")
+        log.info(f"Session created (skip-name): {session.label} → {proj_name} for chat {cid}")
 
     elif d.startswith("addproj:"):
+        # addproj:<label>:<has_name> — user wants to add a new project path
         parts = d.split(":", 2)
         label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
         has_name_flag = parts[2] if len(parts) > 2 else "1"
         CONV_STATE[cid] = {"state": "awaiting_project_path", "label": label, "has_name": has_name_flag == "1"}
         await q.edit_message_text(
-            "📂 Enter the full path to your project:\n"
-            "Example: <code>/home/user/repos/MyProject</code>",
+            "📂 Enter the full path on this server:\n"
+            "Example: <code>/opt/shahrzad-devops/repos/MyProject</code>\n"
+            "Or on production: <code>~/MyNewProject</code>",
             parse_mode=ParseMode.HTML)
 
     elif d.startswith("skill:"):
+        # skill:<session_key> — kill a session via inline button
         session_key = d.split(":", 1)[1]
         session = SM.get_by_key(session_key)
         if session:
@@ -1293,6 +1533,7 @@ async def on_callback(u, c):
             await q.edit_message_text("❌ Session not found or already ended.", parse_mode=ParseMode.HTML)
 
     elif d.startswith("route:"):
+        # route:<session_key> — route pending message to chosen session
         session_key = d.split(":", 1)[1]
         session = SM.get_by_key(session_key)
         pending = PENDING_MESSAGES.pop(cid, None)
@@ -1305,6 +1546,7 @@ async def on_callback(u, c):
             if original_update:
                 await execute(original_update, c, pending["text"], session, f or None)
             else:
+                # Fallback: run claude directly and send output
                 session.status = "running"
                 output = await run_claude(pending["text"], session.project, session.session_uuid, f or None, session.label)
                 session.out = output; session.status = "idle"
@@ -1318,9 +1560,34 @@ async def on_callback(u, c):
         else:
             await q.edit_message_text("❌ Session not found.", parse_mode=ParseMode.HTML)
 
+    elif d.startswith("delaycancel:"):
+        delay_id = d.split(":", 1)[1]
+        dp = DELAYED_PROMPTS.get(delay_id)
+        if dp and not dp.fired:
+            dp.cancelled = True
+            if dp.task:
+                dp.task.cancel()
+            DELAYED_PROMPTS.pop(delay_id, None)
+            await q.edit_message_text(
+                f"❌ Delayed prompt cancelled.\n<code>{esc(dp.prompt[:100])}</code>",
+                parse_mode=ParseMode.HTML)
+        else:
+            await q.edit_message_text("❌ Already fired or not found.", parse_mode=ParseMode.HTML)
+
     elif d == "do:cancel":
         await q.edit_message_text("❌ Cancelled.")
 
+    elif d.startswith("switch:"):
+        # switch:<session_key> — user taps "Switch to session" button
+        session_key = d.split(":", 1)[1]
+        session = SM.get_by_key(session_key)
+        if session and session.status != "completed":
+            set_active(cid, session)
+            await q.answer(f"Switched to {session.color_emoji} {session.label}", show_alert=False)
+        else:
+            await q.answer("Session not found or ended.", show_alert=True)
+
+    # ── Menu inline buttons ──
     elif d == "menu:usage":
         active = SM.active_for_chat(cid)
         await c.bot.send_message(cid, USAGE.format_usage_message(len(active)), parse_mode=ParseMode.HTML)
@@ -1356,19 +1623,17 @@ async def on_callback(u, c):
 
     elif d == "menu:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
-        health_script = f"{SCRIPTS}/health-check.sh"
-        if os.path.isfile(health_script):
-            r = subprocess.run([health_script], capture_output=True, text=True, timeout=30)
-            await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
-        else:
-            await c.bot.send_message(cid, "⚠️ health-check.sh not found.", parse_mode=ParseMode.HTML)
+        r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+        await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
+    # ── Model selection ──
     elif d.startswith("mdl:"):
         parts = d.split(":", 2)
         provider = parts[1] if len(parts) > 1 else "gemini"
         model = parts[2] if len(parts) > 2 else ""
 
         if provider == "search":
+            # Search OpenRouter models
             CONV_STATE[cid] = {"state": "awaiting_model_search"}
             await q.edit_message_text(
                 "🔍 Type a model name or keyword to search OpenRouter:\n"
@@ -1385,6 +1650,7 @@ async def on_callback(u, c):
         log.info(f"Fallback model changed: {provider}/{model}")
 
     elif d.startswith("mdlpick:"):
+        # mdlpick:<model_id> — select from search results
         model_id = d.split(":", 1)[1]
         ACTIVE_FALLBACK["provider"] = "openrouter"
         ACTIVE_FALLBACK["model"] = model_id
@@ -1403,28 +1669,24 @@ async def on_document(u, c):
     lp = await download_doc(u.message.document, c)
     cap = u.message.caption or ""
 
-    if cap.strip():
-        if not session:
-            session = SM.create(u.effective_chat.id, f"task-{int(time.time()) % 10000}")
-            anchor = await u.message.reply_text(
-                f"{session.color_emoji} Auto-session <b>{esc(session.label)}</b> created.",
-                parse_mode=ParseMode.HTML)
-            await track_reply(anchor, session)
+    # Auto-create session if none exists
+    if not session:
+        session = SM.create(u.effective_chat.id, f"task-{int(time.time()) % 10000}")
+        anchor = await u.message.reply_text(
+            f"{session.color_emoji} Auto-session <b>{esc(session.label)}</b> created.",
+            parse_mode=ParseMode.HTML)
+        await track_reply(anchor, session)
 
+    if cap.strip():
         all_f = session.files + [lp]; session.files = []
         await execute(u, c, cap.strip(), session, all_f)
     else:
-        if not session:
-            await u.message.reply_text(
-                "📎 File received. Reply to a session message with instructions, or create one with /new.",
-                parse_mode=ParseMode.HTML)
-            return
         session.files.append(lp)
         names = [os.path.basename(f) for f in session.files]
         sent = await u.message.reply_text(
             f"{session_prefix(session)} | 📎 <b>Queued ({len(session.files)}):</b>\n" +
             "\n".join(f"  • <code>{esc(n)}</code>" for n in names) +
-            "\n\n💬 <i>Reply to send instructions.</i>",
+            "\n\n💬 <i>Send instructions to use these files.</i>",
             parse_mode=ParseMode.HTML)
         await track_reply(sent, session)
 
@@ -1437,25 +1699,20 @@ async def on_photo(u, c):
     tf = await c.bot.get_file(photo.file_id); await tf.download_to_drive(lp)
     cap = u.message.caption or ""
 
-    if cap.strip():
-        if not session:
-            session = SM.create(u.effective_chat.id, f"task-{int(time.time()) % 10000}")
-            anchor = await u.message.reply_text(
-                f"{session.color_emoji} Auto-session <b>{esc(session.label)}</b> created.",
-                parse_mode=ParseMode.HTML)
-            await track_reply(anchor, session)
+    # Auto-create session if none exists
+    if not session:
+        session = SM.create(u.effective_chat.id, f"task-{int(time.time()) % 10000}")
+        anchor = await u.message.reply_text(
+            f"{session.color_emoji} Auto-session <b>{esc(session.label)}</b> created.",
+            parse_mode=ParseMode.HTML)
+        await track_reply(anchor, session)
 
         all_f = session.files + [lp]; session.files = []
         await execute(u, c, cap.strip(), session, all_f)
     else:
-        if not session:
-            await u.message.reply_text(
-                "📷 Photo received. Reply to a session message with instructions, or create one with /new.",
-                parse_mode=ParseMode.HTML)
-            return
         session.files.append(lp)
         sent = await u.message.reply_text(
-            f"{session_prefix(session)} | 📷 <b>Queued.</b> Files: {len(session.files)}\n💬 <i>Reply to send instructions.</i>",
+            f"{session_prefix(session)} | 📷 <b>Queued.</b> Files: {len(session.files)}\n💬 <i>Send instructions to use these files.</i>",
             parse_mode=ParseMode.HTML)
         await track_reply(sent, session)
 
@@ -1527,6 +1784,7 @@ async def on_voice(u, c):
         f"{session_prefix(session)} | 🎤 <b>Transcription:</b>\n\n<code>{esc(txt)}</code>\n\n"
         f"🧠 <i>Will be refined into a structured prompt before sending.</i>",
         parse_mode=ParseMode.HTML, reply_markup=voice_confirm_kb())
+    # st was already tracked or register it now
     SM.register_message(st.message_id, session.id)
 
 # ═══════════════════════════════════════════
@@ -1538,12 +1796,13 @@ async def on_text(u, c):
     if not t: return
     cid = u.effective_chat.id
 
-    # Handle conversation states (multi-step flows)
+    # ── Handle conversation states (multi-step flows) ──
     conv = CONV_STATE.get(cid)
     if conv:
         state = conv.get("state")
 
         if state == "awaiting_session_name":
+            # User typed a session name
             CONV_STATE.pop(cid, None)
             proj_name = conv["project"]
             label = t.strip().replace(" ", "-")[:30]
@@ -1563,22 +1822,26 @@ async def on_text(u, c):
             session.anchor_message_id = sent.message_id
             SM.register_message(sent.message_id, session.id)
             session.message_ids.append(sent.message_id)
-            log.info(f"Session created: {session.label} → {proj_name} for chat {cid}")
+            log.info(f"Session created (named): {session.label} → {proj_name} for chat {cid}")
             return
 
         if state == "awaiting_project_path":
+            # User typed a project path
             CONV_STATE.pop(cid, None)
             path = t.strip()
             label = conv["label"]
             has_name = conv["has_name"]
+            # Derive project name from path
             proj_name = os.path.basename(path.rstrip("/"))
             if not proj_name:
                 await u.message.reply_text("❌ Invalid path.", parse_mode=ParseMode.HTML)
                 return
+            # Add to projects config
             add_project(proj_name, path)
             log.info(f"New project added: {proj_name} → {path}")
 
             if has_name:
+                # Name was already given, create session directly
                 if not SM.can_create(cid):
                     active = SM.active_for_chat(cid)
                     await u.message.reply_text(
@@ -1596,6 +1859,7 @@ async def on_text(u, c):
                 SM.register_message(sent.message_id, session.id)
                 session.message_ids.append(sent.message_id)
             else:
+                # No name given — ask for name
                 CONV_STATE[cid] = {"state": "awaiting_session_name", "project": proj_name, "auto_label": label}
                 await u.message.reply_text(
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n\nEnter a name for this session (or tap Skip):",
@@ -1606,6 +1870,7 @@ async def on_text(u, c):
             return
 
         if state == "awaiting_model_search":
+            # User typed a model search query
             CONV_STATE.pop(cid, None)
             query = t.strip().lower()
             if not OPENROUTER_API_KEY:
@@ -1648,32 +1913,114 @@ async def on_text(u, c):
         elif action == "usage": await cmd_usage(u, c)
         elif action == "help": await cmd_help(u, c)
         elif action == "new_session":
+            # Simulate /new
             u.message.text = "/new"
             await cmd_new(u, c)
         return
 
-    # Resolve session
+    # Resolve session (uses active session, not just reply-to)
     session = resolve_session(u)
 
     if not session:
-        active = SM.active_for_chat(cid)
-        if len(active) > 1:
-            PENDING_MESSAGES[cid] = {"text": t, "files": [], "message": u.message, "update": u}
-            await u.message.reply_text(
-                "❓ Which session?",
-                parse_mode=ParseMode.HTML, reply_markup=route_picker_kb(active))
-            return
-        # No sessions → auto-create one
+        # No active session at all → auto-create
         session = SM.create(cid, f"session-{int(time.time()) % 10000}")
         anchor = await u.message.reply_text(
-            f"{session.color_emoji} Auto-session <b>{esc(session.label)}</b> created.\nReply to interact, or continue below.",
+            f"{session.color_emoji} Auto-session <b>{esc(session.label)}</b> created.",
             parse_mode=ParseMode.HTML)
         await track_reply(anchor, session)
 
+    # Register the user's message as belonging to this session
     SM.register_message(u.message.message_id, session.id)
+    set_active(cid, session)
+
+    # ── Message buffer: concatenate rapid successive messages ──
+    # Telegram splits long text into multiple messages. We buffer them
+    # and send as one after a short pause (2 seconds of silence).
+    buf = MESSAGE_BUFFER.get(cid)
+    if buf and buf.get("session_key") == session.id:
+        # Append to existing buffer
+        buf["texts"].append(t)
+        buf["update"] = u
+        buf["time"] = time.time()
+        # Cancel old timer, set new one
+        if buf.get("timer"):
+            buf["timer"].cancel()
+        buf["timer"] = asyncio.get_event_loop().call_later(
+            2.0, lambda: asyncio.ensure_future(_flush_buffer(cid, c)))
+        return
+
+    # Start new buffer
+    MESSAGE_BUFFER[cid] = {
+        "texts": [t],
+        "session_key": session.id,
+        "update": u,
+        "time": time.time(),
+        "timer": asyncio.get_event_loop().call_later(
+            2.0, lambda: asyncio.ensure_future(_flush_buffer(cid, c))),
+    }
+
+
+async def _flush_buffer(cid: int, context):
+    """Flush message buffer and execute combined prompt."""
+    buf = MESSAGE_BUFFER.pop(cid, None)
+    if not buf:
+        return
+    if buf.get("timer"):
+        buf["timer"].cancel()
+
+    combined = "\n".join(buf["texts"])
+    session_key = buf["session_key"]
+    update = buf["update"]
+    session = SM.get_by_key(session_key)
+
+    if not session or session.status == "completed":
+        return
+
+    # ── Check for :DELAY=...: prefix ──
+    delay_secs, remaining_text = parse_delay(combined)
+    if delay_secs is not None and remaining_text.strip():
+        f = session.files; session.files = []
+        delay_id = str(uuid.uuid4())
+        dp = DelayedPrompt(
+            id=delay_id,
+            chat_id=cid,
+            prompt=remaining_text.strip(),
+            project=session.project,
+            session_label=session.label,
+            session_key=session.id,
+            scheduled_at=time.time(),
+            fire_at=time.time() + delay_secs,
+            delay_str=format_delay(delay_secs),
+            files=f,
+        )
+        DELAYED_PROMPTS[delay_id] = dp
+
+        # Schedule the async task
+        app = context.application
+        dp.task = asyncio.create_task(schedule_delayed_prompt(dp, app))
+
+        # Confirm to user
+        fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M:%S")
+        try:
+            confirm = await update.message.reply_text(
+                f"⏰ <b>Prompt scheduled!</b>\n"
+                f"{session_prefix(session)} | 📂 <code>{session.project}</code>\n\n"
+                f"⏱ Delay: <b>{dp.delay_str}</b>\n"
+                f"🕐 Fires at: <b>{fire_time}</b>\n\n"
+                f"<pre>{esc(remaining_text.strip()[:300])}</pre>\n\n"
+                f"Use /delayed to view or cancel pending prompts.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{delay_id}")]
+                ]))
+            await track_reply(confirm, session)
+        except Exception as e:
+            log.error(f"Delay confirm error: {e}")
+        log.info(f"Delayed prompt scheduled: {delay_id[:8]} fires in {delay_secs}s for session {session.label}")
+        return
 
     f = session.files; session.files = []
-    await execute(u, c, t, session, f or None)
+    await execute(update, context, combined, session, f or None)
 
 # ═══════════════════════════════════════════
 #  Boot
@@ -1682,7 +2029,7 @@ async def session_cleanup_task(app):
     """Background task: clean up timed-out sessions every 5 minutes."""
     try:
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(300)  # every 5 min
             try:
                 timed_out = SM.cleanup_timed_out()
                 for s in timed_out:
@@ -1692,7 +2039,7 @@ async def session_cleanup_task(app):
                         chat_id = int(chat_id_str)
                         await app.bot.send_message(
                             chat_id,
-                            f"⏰ Session <b>{esc(s.label)}</b> auto-closed after {SESSION_TIMEOUT_MINUTES // 60}h inactivity.",
+                            f"\u23f0 Session <b>{esc(s.label)}</b> auto-closed after {SESSION_TIMEOUT_MINUTES // 60}h inactivity.",
                             parse_mode=ParseMode.HTML)
                     except Exception:
                         pass
@@ -1705,22 +2052,33 @@ async def session_cleanup_task(app):
 
 async def post_init(app):
     await app.bot.set_my_commands([
-        BotCommand("start", "Home"),
-        BotCommand("help", "Help"),
-        BotCommand("new", "New session"),
-        BotCommand("sessions", "List sessions"),
-        BotCommand("kill", "End session"),
-        BotCommand("project", "Change project"),
-        BotCommand("model", "Fallback model"),
-        BotCommand("usage", "Usage stats"),
+        BotCommand("start", "\U0001f3e0 Home"),
+        BotCommand("help", "\U0001f4d6 Help"),
+        BotCommand("new", "\u2795 New session"),
+        BotCommand("sessions", "\U0001f4cb List sessions"),
+        BotCommand("kill", "\U0001f5d1 End session"),
+        BotCommand("project", "\U0001f4c2 Change project"),
+        BotCommand("model", "\U0001f916 Fallback model"),
+        BotCommand("usage", "\U0001f4ca Usage stats"),
+        BotCommand("delayed", "⏰ Pending delayed prompts"),
     ])
+    # Start background cleanup task
     asyncio.create_task(session_cleanup_task(app))
-    log.info(f"Bot v4 ready. Gemini={'OK' if GEMINI_OK else 'OFF'} | GPT fallback={'OK' if OPENAI_API_KEY else 'OFF'}")
+    log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
 
 def main():
-    if not BOT_TOKEN: print("Set TELEGRAM_BOT_TOKEN in .env"); sys.exit(1)
-    log.info("Starting Claude Code Telegram Bot v4 (Multi-Session)...")
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
+    log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
+    from telegram.ext import Defaults
+    from telegram.request import HTTPXRequest
+    # Increase timeouts to prevent ReadError during long Claude operations
+    request = HTTPXRequest(
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=30,
+        pool_timeout=30,
+    )
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).request(request).read_timeout(60).write_timeout(60).connect_timeout(30).pool_timeout(30).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
@@ -1729,6 +2087,7 @@ def main():
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("project", cmd_project))
     app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("delayed", cmd_delayed))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
