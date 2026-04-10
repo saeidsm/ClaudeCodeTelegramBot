@@ -52,7 +52,7 @@ Core execution function — runs Claude Code CLI as an async subprocess.
 
 - Uses `claude --print --session-id <uuid> <prompt>`
 - Runs in the project's directory
-- 10-minute timeout
+- 60-minute timeout
 - Handles "session ID already in use" by retrying with new UUID
 - Detects rate limiting and triggers fallback chain
 - Copies attached files to `.claude-tasks/` in the project directory

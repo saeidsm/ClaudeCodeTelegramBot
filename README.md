@@ -4,6 +4,20 @@ A Telegram bot that bridges [Claude Code CLI](https://docs.anthropic.com/en/docs
 
 Built for DevOps engineers and developers who want to interact with Claude Code on the go.
 
+## Why This Exists
+
+If you've used Claude Code or OpenAI Codex, you know the frustration: SSH sessions drop, VPN connections timeout mid-task, and you lose hours of AI-generated work. This is especially painful for developers in regions with unreliable connectivity to AI services (Iran, etc.).
+
+**The solution:** Deploy this bot on a VPS where the connection to Anthropic is stable, then control everything through Telegram — which works everywhere, even on the slowest connections.
+
+```
+You (anywhere) → Telegram → VPS (stable connection) → Claude Code CLI → Results back to Telegram
+```
+
+**Fire a task, close your phone, come back to a full report.** No more babysitting SSH sessions. No more re-running commands after a disconnect. Your VPS maintains the stable connection while you interact through Telegram's lightweight protocol.
+
+This is async DevOps — send your coding task, go about your day, get the results as Telegram messages with shareable report links.
+
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
 ![Telegram Bot API](https://img.shields.io/badge/Telegram-Bot%20API-blue.svg)
