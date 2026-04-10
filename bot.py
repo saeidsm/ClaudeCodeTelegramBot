@@ -486,6 +486,7 @@ MESSAGE_BUFFER: dict[int, dict] = {}  # chat_id -> {"texts": [], "timer": task, 
 #  Delayed Prompts
 # ═══════════════════════════════════════════
 DELAY_PATTERN = re.compile(r"^:DELAY=(\d+)(M|H):\s*", re.IGNORECASE)
+DELAY_NEXT_PATTERN = re.compile(r"^:DELAY=NEXT:\s*", re.IGNORECASE)
 
 @dataclass
 class DelayedPrompt:
@@ -502,16 +503,25 @@ class DelayedPrompt:
     fired: bool = False
     cancelled: bool = False
     files: list = field(default_factory=list)
+    fire_after_task: bool = False  # True = fire 5 min after last task completes
 
 # Global store: delay_id -> DelayedPrompt
 DELAYED_PROMPTS: dict[str, DelayedPrompt] = {}
+# Pending delay picks: chat_id -> delay info waiting for session selection
+PENDING_DELAYS: dict[int, dict] = {}
 
 
-def parse_delay(text: str) -> tuple[Optional[int], str]:
-    """Parse :DELAY=30M: or :DELAY=2H: prefix. Returns (seconds, remaining_text) or (None, text)."""
+def parse_delay(text: str) -> tuple[Optional[int], str, bool]:
+    """Parse :DELAY=30M: or :DELAY=2H: or :DELAY=NEXT: prefix.
+    Returns (seconds, remaining_text, fire_after_task) or (None, text, False)."""
+    # Check NEXT pattern first
+    m_next = DELAY_NEXT_PATTERN.match(text)
+    if m_next:
+        remaining = text[m_next.end():]
+        return 300, remaining, True  # 5 min after last task
     m = DELAY_PATTERN.match(text)
     if not m:
-        return None, text
+        return None, text, False
     amount = int(m.group(1))
     unit = m.group(2).upper()
     if unit == "M":
@@ -519,7 +529,7 @@ def parse_delay(text: str) -> tuple[Optional[int], str]:
     else:  # H
         seconds = amount * 3600
     remaining = text[m.end():]
-    return seconds, remaining
+    return seconds, remaining, False
 
 
 def format_delay(seconds: int) -> str:
@@ -1295,6 +1305,102 @@ async def schedule_delayed_prompt(dp: DelayedPrompt, app):
     DELAYED_PROMPTS.pop(dp.id, None)
 
 
+async def schedule_next_delayed_prompt(dp: DelayedPrompt, app):
+    """Wait for session to become idle, then fire 5 minutes later."""
+    log.info(f"NEXT delayed prompt {dp.id[:8]}: waiting for session {dp.session_key} to finish task")
+    try:
+        # Poll every 10 seconds — check if session is idle
+        while not dp.cancelled:
+            session = SM.get_by_key(dp.session_key)
+            if not session or session.status == "completed":
+                # Session gone — fire after 5 min from now
+                break
+            if session.status in ("idle", "error"):
+                # Session is idle — wait 5 more minutes then fire
+                break
+            await asyncio.sleep(10)
+
+        if dp.cancelled:
+            log.info(f"NEXT delayed prompt {dp.id[:8]}: cancelled")
+            return
+
+        # Wait 5 minutes after task completion
+        log.info(f"NEXT delayed prompt {dp.id[:8]}: session idle, waiting 5 min")
+        dp.fire_at = time.time() + 300
+        dp.delay_str = "after task + 5m"
+        await asyncio.sleep(300)
+
+        if dp.cancelled:
+            log.info(f"NEXT delayed prompt {dp.id[:8]}: cancelled during wait")
+            return
+
+        # Now fire using the standard execution logic
+        dp.fired = True
+        dp.fire_after_task = False  # reset so standard logic works
+        chat_id = dp.chat_id
+        project = dp.project
+
+        session = SM.get_by_key(dp.session_key)
+        if not session or session.status == "completed":
+            label = f"delayed-{int(time.time()) % 10000}"
+            session = SM.create(chat_id, label)
+            session.project = project
+            try:
+                await app.bot.send_message(
+                    chat_id,
+                    f"⏰ {session.color_emoji} New session <b>{esc(session.label)}</b> created for delayed prompt.\n"
+                    f"📁 Project: <b>{project}</b>",
+                    parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.error(f"NEXT delayed prompt notify error: {e}")
+
+        try:
+            notify_msg = await app.bot.send_message(
+                chat_id,
+                f"⏭ <b>Delayed prompt firing now!</b> (after task + 5m)\n"
+                f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
+                f"<pre>{esc(dp.prompt[:500])}</pre>",
+                parse_mode=ParseMode.HTML)
+            await track_reply(notify_msg, session)
+        except Exception as e:
+            log.error(f"NEXT delayed prompt notify error: {e}")
+
+        session.status = "running"
+        session.last_active = time.time()
+        try:
+            output = await run_claude(dp.prompt, project, session.session_uuid, dp.files or None, session.label)
+        except Exception as e:
+            output = f"❌ Delayed execution error: {e}"
+
+        session.out = output
+        session.status = "idle"
+        session.tasks += 1
+        session.last_active = time.time()
+
+        try:
+            sent = await app.bot.send_message(
+                chat_id,
+                f"⏭ {session_prefix(session)} | 🤖 <code>{project}</code> (after task)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
+                parse_mode=ParseMode.HTML, reply_markup=after_kb())
+            await track_reply(sent, session)
+
+            if len(output) > 8000:
+                lnk = await make_report(f"{project}-delayed", output)
+                r = await app.bot.send_message(
+                    chat_id,
+                    f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
+                    parse_mode=ParseMode.HTML)
+                await track_reply(r, session)
+        except Exception as e:
+            log.error(f"NEXT delayed prompt output error: {e}")
+
+    except asyncio.CancelledError:
+        log.info(f"NEXT delayed prompt {dp.id[:8]}: task cancelled")
+    finally:
+        DELAYED_PROMPTS.pop(dp.id, None)
+
+
 @authorized
 async def cmd_delayed(u, c):
     """List and manage delayed prompts: /delayed"""
@@ -1309,13 +1415,19 @@ async def cmd_delayed(u, c):
     lines = []
     rows = []
     for dp in sorted(pending, key=lambda x: x.fire_at):
-        remaining = max(0, dp.fire_at - time.time())
+        if dp.fire_after_task:
+            time_info = "⏳ after last task + 5m"
+        else:
+            remaining = max(0, dp.fire_at - time.time())
+            time_info = f"fires in <b>{format_delay(int(remaining))}</b>"
         lines.append(
-            f"⏰ <b>{dp.delay_str}</b> → fires in <b>{format_delay(int(remaining))}</b>\n"
+            f"⏰ <b>{dp.delay_str}</b> → {time_info}\n"
             f"   📂 {dp.project} | 💬 <code>{esc(dp.prompt[:60])}</code>")
-        rows.append([InlineKeyboardButton(
-            f"❌ Cancel: {dp.prompt[:30]}...",
-            callback_data=f"delaycancel:{dp.id}")])
+        rows.append([
+            InlineKeyboardButton("▶️ Send Now", callback_data=f"delaysend:{dp.id}"),
+            InlineKeyboardButton("⏭ After Task", callback_data=f"delaynext:{dp.id}"),
+            InlineKeyboardButton("❌", callback_data=f"delaycancel:{dp.id}"),
+        ])
 
     await u.message.reply_text(
         f"⏰ <b>Pending Delayed Prompts ({len(pending)})</b>\n"
@@ -1573,6 +1685,130 @@ async def on_callback(u, c):
                 parse_mode=ParseMode.HTML)
         else:
             await q.edit_message_text("❌ Already fired or not found.", parse_mode=ParseMode.HTML)
+
+    elif d.startswith("delaysend:"):
+        # Send Now — fire the delayed prompt immediately
+        delay_id = d.split(":", 1)[1]
+        dp = DELAYED_PROMPTS.get(delay_id)
+        if dp and not dp.fired and not dp.cancelled:
+            # Cancel the existing timer
+            dp.cancelled = True
+            if dp.task:
+                dp.task.cancel()
+            DELAYED_PROMPTS.pop(delay_id, None)
+            await q.edit_message_text(
+                f"▶️ Sending now...\n<code>{esc(dp.prompt[:100])}</code>",
+                parse_mode=ParseMode.HTML)
+            # Create a new prompt that fires immediately
+            dp_now = DelayedPrompt(
+                id=str(uuid.uuid4()), chat_id=dp.chat_id, prompt=dp.prompt,
+                project=dp.project, session_label=dp.session_label,
+                session_key=dp.session_key, scheduled_at=time.time(),
+                fire_at=time.time(), delay_str="now", files=dp.files,
+            )
+            DELAYED_PROMPTS[dp_now.id] = dp_now
+            dp_now.task = asyncio.create_task(schedule_delayed_prompt(dp_now, c.application))
+        else:
+            await q.edit_message_text("❌ Already fired or not found.", parse_mode=ParseMode.HTML)
+
+    elif d.startswith("delaynext:"):
+        # Send 5 min after last task
+        delay_id = d.split(":", 1)[1]
+        dp = DELAYED_PROMPTS.get(delay_id)
+        if dp and not dp.fired and not dp.cancelled:
+            # Cancel the existing timer
+            if dp.task:
+                dp.task.cancel()
+            # Convert to fire_after_task mode
+            dp.fire_after_task = True
+            dp.delay_str = "after task + 5m"
+            dp.fire_at = 0  # will be set when task completes
+            # Reschedule with the NEXT logic
+            dp.task = asyncio.create_task(schedule_next_delayed_prompt(dp, c.application))
+            await q.edit_message_text(
+                f"⏭ Will send 5 min after last task completes.\n"
+                f"📂 {dp.project} | <code>{esc(dp.prompt[:100])}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{dp.id}")]
+                ]))
+        else:
+            await q.edit_message_text("❌ Already fired or not found.", parse_mode=ParseMode.HTML)
+
+    elif d.startswith("dpick:"):
+        # User picked a session/project for a delayed prompt
+        parts = d.split(":", 2)
+        delay_id = parts[1]
+        target = parts[2] if len(parts) > 2 else ""
+        pending = PENDING_DELAYS.pop(cid, None)
+        if not pending or pending["delay_id"] != delay_id:
+            await q.edit_message_text("❌ Delay selection expired.", parse_mode=ParseMode.HTML)
+        else:
+            # Resolve target session
+            if target == "__new__":
+                label = f"delayed-{int(time.time()) % 10000}"
+                session = SM.create(cid, label)
+                # Use current session's project as default
+                cur = SM.get_by_key(pending["current_session_key"])
+                session.project = cur.project if cur else DEFAULT_PROJECT
+                try:
+                    await c.bot.send_message(
+                        cid,
+                        f"{session.color_emoji} New session <b>{esc(session.label)}</b> created.\n"
+                        f"📁 Project: <b>{session.project}</b>",
+                        parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            else:
+                session = SM.get_by_key(target)
+                if not session or session.status == "completed":
+                    await q.edit_message_text("❌ Session no longer active.", parse_mode=ParseMode.HTML)
+                    return
+
+            is_next = pending["is_next"]
+            delay_secs = pending["delay_secs"]
+            dp = DelayedPrompt(
+                id=delay_id,
+                chat_id=cid,
+                prompt=pending["prompt"],
+                project=session.project,
+                session_label=session.label,
+                session_key=session.id,
+                scheduled_at=time.time(),
+                fire_at=0 if is_next else time.time() + delay_secs,
+                delay_str="after task + 5m" if is_next else format_delay(delay_secs),
+                files=pending["files"],
+                fire_after_task=is_next,
+            )
+            DELAYED_PROMPTS[delay_id] = dp
+
+            app = c.application
+            if is_next:
+                dp.task = asyncio.create_task(schedule_next_delayed_prompt(dp, app))
+                await q.edit_message_text(
+                    f"⏭ <b>Prompt scheduled!</b> (after last task + 5m)\n"
+                    f"{session_prefix(session)} | 📂 <code>{session.project}</code>\n\n"
+                    f"<pre>{esc(dp.prompt[:300])}</pre>\n\n"
+                    f"Use /delayed to view or cancel.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{delay_id}")]
+                    ]))
+            else:
+                dp.task = asyncio.create_task(schedule_delayed_prompt(dp, app))
+                fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M:%S")
+                await q.edit_message_text(
+                    f"⏰ <b>Prompt scheduled!</b>\n"
+                    f"{session_prefix(session)} | 📂 <code>{session.project}</code>\n\n"
+                    f"⏱ Delay: <b>{dp.delay_str}</b>\n"
+                    f"🕐 Fires at: <b>{fire_time}</b>\n\n"
+                    f"<pre>{esc(dp.prompt[:300])}</pre>\n\n"
+                    f"Use /delayed to view or cancel.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{delay_id}")]
+                    ]))
+            log.info(f"Delayed prompt {delay_id[:8]} scheduled for session {session.label} ({'NEXT' if is_next else dp.delay_str})")
 
     elif d == "do:cancel":
         await q.edit_message_text("❌ Cancelled.")
@@ -1977,46 +2213,43 @@ async def _flush_buffer(cid: int, context):
         return
 
     # ── Check for :DELAY=...: prefix ──
-    delay_secs, remaining_text = parse_delay(combined)
+    delay_secs, remaining_text, is_next = parse_delay(combined)
     if delay_secs is not None and remaining_text.strip():
         f = session.files; session.files = []
-        delay_id = str(uuid.uuid4())
-        dp = DelayedPrompt(
-            id=delay_id,
-            chat_id=cid,
-            prompt=remaining_text.strip(),
-            project=session.project,
-            session_label=session.label,
-            session_key=session.id,
-            scheduled_at=time.time(),
-            fire_at=time.time() + delay_secs,
-            delay_str=format_delay(delay_secs),
-            files=f,
-        )
-        DELAYED_PROMPTS[delay_id] = dp
+        delay_id = uuid.uuid4().hex[:8]  # short ID for callback data limits
 
-        # Schedule the async task
-        app = context.application
-        dp.task = asyncio.create_task(schedule_delayed_prompt(dp, app))
+        # Store pending delay — ask user which session/project to use
+        active_sessions = SM.active_for_chat(cid)
+        PENDING_DELAYS[cid] = {
+            "delay_id": delay_id,
+            "prompt": remaining_text.strip(),
+            "delay_secs": delay_secs,
+            "is_next": is_next,
+            "files": f,
+            "current_session_key": session.id,
+        }
 
-        # Confirm to user
-        fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M:%S")
+        # Build session/project picker buttons
+        picker_rows = []
+        for s in active_sessions:
+            label_text = f"{s.color_emoji} {s.label} ({s.project})"
+            picker_rows.append([InlineKeyboardButton(
+                label_text, callback_data=f"dpick:{delay_id}:{s.id}")])
+        picker_rows.append([InlineKeyboardButton(
+            "🆕 New session (random name)", callback_data=f"dpick:{delay_id}:__new__")])
+
+        delay_label = "after last task + 5m" if is_next else format_delay(delay_secs)
         try:
             confirm = await update.message.reply_text(
-                f"⏰ <b>Prompt scheduled!</b>\n"
-                f"{session_prefix(session)} | 📂 <code>{session.project}</code>\n\n"
-                f"⏱ Delay: <b>{dp.delay_str}</b>\n"
-                f"🕐 Fires at: <b>{fire_time}</b>\n\n"
+                f"⏰ <b>Delayed prompt received!</b>\n"
+                f"⏱ Delay: <b>{delay_label}</b>\n\n"
                 f"<pre>{esc(remaining_text.strip()[:300])}</pre>\n\n"
-                f"Use /delayed to view or cancel pending prompts.",
+                f"📌 <b>Which session/project should this run in?</b>",
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{delay_id}")]
-                ]))
+                reply_markup=InlineKeyboardMarkup(picker_rows))
             await track_reply(confirm, session)
         except Exception as e:
-            log.error(f"Delay confirm error: {e}")
-        log.info(f"Delayed prompt scheduled: {delay_id[:8]} fires in {delay_secs}s for session {session.label}")
+            log.error(f"Delay picker error: {e}")
         return
 
     f = session.files; session.files = []
