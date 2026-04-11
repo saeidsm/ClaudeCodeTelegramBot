@@ -1228,81 +1228,85 @@ async def cmd_model(u, c):
 # ═══════════════════════════════════════════
 async def schedule_delayed_prompt(dp: DelayedPrompt, app):
     """Sleep for the delay, then execute the prompt."""
-    delay_secs = dp.fire_at - time.time()
-    if delay_secs > 0:
-        log.info(f"Delayed prompt {dp.id[:8]}: sleeping {delay_secs:.0f}s")
-        await asyncio.sleep(delay_secs)
+    session = None
+    try:
+        delay_secs = dp.fire_at - time.time()
+        if delay_secs > 0:
+            log.info(f"Delayed prompt {dp.id[:8]}: sleeping {delay_secs:.0f}s")
+            await asyncio.sleep(delay_secs)
 
-    if dp.cancelled:
-        log.info(f"Delayed prompt {dp.id[:8]}: cancelled, skipping")
-        return
+        if dp.cancelled:
+            log.info(f"Delayed prompt {dp.id[:8]}: cancelled, skipping")
+            return
 
-    dp.fired = True
-    chat_id = dp.chat_id
-    project = dp.project
+        dp.fired = True
+        chat_id = dp.chat_id
+        project = dp.project
 
-    # Try to find the original session
-    session = SM.get_by_key(dp.session_key)
-    if not session or session.status == "completed":
-        # Session closed — create a new one in the same project
-        label = f"delayed-{int(time.time()) % 10000}"
-        session = SM.create(chat_id, label)
-        session.project = project
+        # Try to find the original session
+        session = SM.get_by_key(dp.session_key)
+        if not session or session.status == "completed":
+            label = f"delayed-{int(time.time()) % 10000}"
+            session = SM.create(chat_id, label)
+            session.project = project
+            try:
+                await app.bot.send_message(
+                    chat_id,
+                    f"⏰ {session.color_emoji} New session <b>{esc(session.label)}</b> created for delayed prompt.\n"
+                    f"📁 Project: <b>{project}</b>",
+                    parse_mode=ParseMode.HTML)
+            except Exception as e:
+                log.error(f"Delayed prompt notify error: {e}")
+
+        # Notify that the delayed prompt is firing
         try:
-            await app.bot.send_message(
+            notify_msg = await app.bot.send_message(
                 chat_id,
-                f"⏰ {session.color_emoji} New session <b>{esc(session.label)}</b> created for delayed prompt.\n"
-                f"📁 Project: <b>{project}</b>",
+                f"⏰ <b>Delayed prompt firing now!</b>\n"
+                f"{session_prefix(session)} | 📂 <code>{project}</code>\n"
+                f"Scheduled {dp.delay_str} ago\n\n"
+                f"<pre>{esc(dp.prompt[:500])}</pre>",
                 parse_mode=ParseMode.HTML)
+            await track_reply(notify_msg, session)
         except Exception as e:
             log.error(f"Delayed prompt notify error: {e}")
 
-    # Notify that the delayed prompt is firing
-    try:
-        notify_msg = await app.bot.send_message(
-            chat_id,
-            f"⏰ <b>Delayed prompt firing now!</b>\n"
-            f"{session_prefix(session)} | 📂 <code>{project}</code>\n"
-            f"Scheduled {dp.delay_str} ago\n\n"
-            f"<pre>{esc(dp.prompt[:500])}</pre>",
-            parse_mode=ParseMode.HTML)
-        await track_reply(notify_msg, session)
-    except Exception as e:
-        log.error(f"Delayed prompt notify error: {e}")
+        session.status = "running"
+        session.last_active = time.time()
+        try:
+            output = await run_claude(dp.prompt, project, session.session_uuid, dp.files or None, session.label)
+        except Exception as e:
+            output = f"❌ Delayed execution error: {e}"
 
-    # Execute
-    session.status = "running"
-    session.last_active = time.time()
-    try:
-        output = await run_claude(dp.prompt, project, session.session_uuid, dp.files or None, session.label)
-    except Exception as e:
-        output = f"❌ Delayed execution error: {e}"
+        session.out = output
+        session.status = "idle"
+        session.tasks += 1
+        session.last_active = time.time()
 
-    session.out = output
-    session.status = "idle"
-    session.tasks += 1
-    session.last_active = time.time()
-
-    try:
-        sent = await app.bot.send_message(
-            chat_id,
-            f"⏰ {session_prefix(session)} | 🤖 <code>{project}</code> (delayed)\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
-            parse_mode=ParseMode.HTML, reply_markup=after_kb())
-        await track_reply(sent, session)
-
-        if len(output) > 8000:
-            lnk = await make_report(f"{project}-delayed", output)
-            r = await app.bot.send_message(
+        try:
+            sent = await app.bot.send_message(
                 chat_id,
-                f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
-                parse_mode=ParseMode.HTML)
-            await track_reply(r, session)
-    except Exception as e:
-        log.error(f"Delayed prompt output error: {e}")
+                f"⏰ {session_prefix(session)} | 🤖 <code>{project}</code> (delayed)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
+                parse_mode=ParseMode.HTML, reply_markup=after_kb())
+            await track_reply(sent, session)
 
-    # Cleanup
-    DELAYED_PROMPTS.pop(dp.id, None)
+            if len(output) > 8000:
+                lnk = await make_report(f"{project}-delayed", output)
+                r = await app.bot.send_message(
+                    chat_id,
+                    f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
+                    parse_mode=ParseMode.HTML)
+                await track_reply(r, session)
+        except Exception as e:
+            log.error(f"Delayed prompt output error: {e}")
+
+    except asyncio.CancelledError:
+        log.info(f"Delayed prompt {dp.id[:8]}: task cancelled")
+    finally:
+        if session and session.status == "running":
+            session.status = "idle"
+        DELAYED_PROMPTS.pop(dp.id, None)
 
 
 async def schedule_next_delayed_prompt(dp: DelayedPrompt, app):
@@ -1691,6 +1695,7 @@ async def on_callback(u, c):
         delay_id = d.split(":", 1)[1]
         dp = DELAYED_PROMPTS.get(delay_id)
         if dp and not dp.fired and not dp.cancelled:
+            log.info(f"Send Now: cancelling delayed prompt {delay_id[:8]} (was {dp.delay_str})")
             # Cancel the existing timer
             dp.cancelled = True
             if dp.task:
@@ -1700,15 +1705,18 @@ async def on_callback(u, c):
                 f"▶️ Sending now...\n<code>{esc(dp.prompt[:100])}</code>",
                 parse_mode=ParseMode.HTML)
             # Create a new prompt that fires immediately
+            now_id = uuid.uuid4().hex[:8]
             dp_now = DelayedPrompt(
-                id=str(uuid.uuid4()), chat_id=dp.chat_id, prompt=dp.prompt,
+                id=now_id, chat_id=dp.chat_id, prompt=dp.prompt,
                 project=dp.project, session_label=dp.session_label,
                 session_key=dp.session_key, scheduled_at=time.time(),
                 fire_at=time.time(), delay_str="now", files=dp.files,
             )
             DELAYED_PROMPTS[dp_now.id] = dp_now
             dp_now.task = asyncio.create_task(schedule_delayed_prompt(dp_now, c.application))
+            log.info(f"Send Now: created immediate prompt {now_id} replacing {delay_id[:8]}")
         else:
+            log.info(f"Send Now: prompt {delay_id[:8]} already fired={dp.fired if dp else '?'} cancelled={dp.cancelled if dp else '?'}")
             await q.edit_message_text("❌ Already fired or not found.", parse_mode=ParseMode.HTML)
 
     elif d.startswith("delaynext:"):
