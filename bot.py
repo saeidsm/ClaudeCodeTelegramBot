@@ -2363,7 +2363,7 @@ def main():
         connect_timeout=30,
         pool_timeout=30,
     )
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).request(request).read_timeout(60).write_timeout(60).connect_timeout(30).pool_timeout(30).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).request(request).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
