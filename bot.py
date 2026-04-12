@@ -238,6 +238,32 @@ def get_project_path(name: str) -> str:
 # chat_id -> {"state": str, "data": dict}
 CONV_STATE: dict[int, dict] = {}
 
+# ═══════════════════════════════════════════
+#  Callback Data Registry (Telegram 64-byte limit)
+# ═══════════════════════════════════════════
+# Maps short keys → full callback_data strings.
+# Telegram limits callback_data to 64 bytes; we store long payloads here.
+_CB_REGISTRY: dict[str, str] = {}
+_cb_counter = 0
+
+def _cb(data: str) -> str:
+    """Return data as-is if ≤64 bytes, otherwise store in registry and return a short key."""
+    global _cb_counter
+    if len(data.encode("utf-8")) <= 64:
+        return data
+    _cb_counter += 1
+    key = f"_r:{_cb_counter}"
+    _CB_REGISTRY[key] = data
+    # Evict old entries to prevent memory leak (keep last 500)
+    if len(_CB_REGISTRY) > 500:
+        for old_key in list(_CB_REGISTRY)[:100]:
+            _CB_REGISTRY.pop(old_key, None)
+    return key
+
+def _cb_resolve(data: str) -> str:
+    """Resolve callback_data: if it's a registry key, return the real value."""
+    return _CB_REGISTRY.pop(data, data)
+
 
 # ═══════════════════════════════════════════
 #  Fallback Chain: Gemini → GPT → OpenRouter
@@ -567,30 +593,30 @@ def menu_kb():
 
 def project_kb(session_key: str = ""):
     ps = get_project_names()
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"📦 {p}", callback_data=f"proj:{session_key}:{p}")] for p in ps])
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"📦 {p}", callback_data=_cb(f"proj:{session_key}:{p}"))] for p in ps])
 
 def new_session_project_kb(label: str, has_name: bool = True):
     """Project picker for /new flow — callback stores the session label.
     has_name=False uses 'newneed:' prefix so we know to ask for name after project pick."""
     ps = get_project_names()
     prefix = "newproj" if has_name else "newneed"
-    rows = [[InlineKeyboardButton(f"📁 {p}", callback_data=f"{prefix}:{label}:{p}")] for p in ps]
-    rows.append([InlineKeyboardButton("➕ New project...", callback_data=f"addproj:{label}:{'1' if has_name else '0'}")])
+    rows = [[InlineKeyboardButton(f"📁 {p}", callback_data=_cb(f"{prefix}:{label}:{p}"))] for p in ps]
+    rows.append([InlineKeyboardButton("➕ New project...", callback_data=_cb(f"addproj:{label}:{'1' if has_name else '0'}"))])
     return InlineKeyboardMarkup(rows)
 
 def sessions_kill_kb(sessions: list):
     """Inline kill buttons for /sessions display."""
-    rows = [[InlineKeyboardButton(f"🗑 {s.color_emoji} {s.label}", callback_data=f"skill:{s.id}")] for s in sessions]
+    rows = [[InlineKeyboardButton(f"🗑 {s.color_emoji} {s.label}", callback_data=_cb(f"skill:{s.id}"))] for s in sessions]
     return InlineKeyboardMarkup(rows)
 
 def kill_picker_kb(sessions: list):
     """Inline buttons for /kill without args."""
-    rows = [[InlineKeyboardButton(f"🗑 {s.color_emoji} {s.label}", callback_data=f"skill:{s.id}")] for s in sessions]
+    rows = [[InlineKeyboardButton(f"🗑 {s.color_emoji} {s.label}", callback_data=_cb(f"skill:{s.id}"))] for s in sessions]
     return InlineKeyboardMarkup(rows)
 
 def route_picker_kb(sessions: list):
     """Inline session picker when user sends message without reply and multiple sessions active."""
-    buttons = [InlineKeyboardButton(f"{s.color_emoji} {s.label}", callback_data=f"route:{s.id}") for s in sessions]
+    buttons = [InlineKeyboardButton(f"{s.color_emoji} {s.label}", callback_data=_cb(f"route:{s.id}")) for s in sessions]
     return InlineKeyboardMarkup([buttons])
 
 def after_kb():
@@ -601,14 +627,14 @@ def after_kb():
 
 def deploy_branch_kb(proj):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌿 main", callback_data=f"dbr:{proj}:main")],
-        [InlineKeyboardButton("🔧 dev", callback_data=f"dbr:{proj}:dev")],
-        [InlineKeyboardButton("🤖 latest claude/*", callback_data=f"dbr:{proj}:claude_latest")],
+        [InlineKeyboardButton("🌿 main", callback_data=_cb(f"dbr:{proj}:main"))],
+        [InlineKeyboardButton("🔧 dev", callback_data=_cb(f"dbr:{proj}:dev"))],
+        [InlineKeyboardButton("🤖 latest claude/*", callback_data=_cb(f"dbr:{proj}:claude_latest"))],
         [InlineKeyboardButton("❌ Cancel", callback_data="do:cancel")]])
 
 def deploy_confirm_kb(proj, branch):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"✅ Deploy {proj}@{branch}", callback_data=f"dpl:{proj}:{branch}"),
+        InlineKeyboardButton(f"✅ Deploy {proj}@{branch}", callback_data=_cb(f"dpl:{proj}:{branch}")),
         InlineKeyboardButton("❌ Cancel", callback_data="do:cancel")]])
 
 def pause_kb():
@@ -945,7 +971,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
     # Build reply markup: after_kb + optional switch button
     if is_bg_session:
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"↩️ Switch to {session_prefix(session)}", callback_data=f"switch:{session.id}")],
+            [InlineKeyboardButton(f"↩️ Switch to {session_prefix(session)}", callback_data=_cb(f"switch:{session.id}"))],
             [InlineKeyboardButton("📦 Save Report", callback_data="do:report"),
              InlineKeyboardButton("🚀 Deploy", callback_data="do:deploy_ask")],
             [InlineKeyboardButton("📊 Health", callback_data="do:health")]])
@@ -1201,7 +1227,7 @@ async def cmd_model(u, c):
     rows = [
         [InlineKeyboardButton(
             ("✅ " if prov == "gemini" else "🔹 ") + f"Gemini — {gemini_refine} (primary)",
-            callback_data=f"mdl:gemini:{gemini_refine}")],
+            callback_data=_cb(f"mdl:gemini:{gemini_refine}"))],
         [InlineKeyboardButton(
             ("✅ " if prov == "openai" else "🔹 ") + "GPT-4o (OpenAI)",
             callback_data="mdl:openai:gpt-4o")],
@@ -1209,7 +1235,7 @@ async def cmd_model(u, c):
     for model_id, label in OPENROUTER_POPULAR:
         is_active = prov == "openrouter" and model == model_id
         icon = "✅" if is_active else "🔸"
-        rows.append([InlineKeyboardButton(f"{icon} {label}", callback_data=f"mdl:openrouter:{model_id}")])
+        rows.append([InlineKeyboardButton(f"{icon} {label}", callback_data=_cb(f"mdl:openrouter:{model_id}"))])
 
     rows.append([InlineKeyboardButton("🔍 Search OpenRouter...", callback_data="mdl:search")])
 
@@ -1461,7 +1487,7 @@ async def error_handler(update, context):
 @authorized
 async def on_callback(u, c):
     q = u.callback_query; await q.answer()
-    d = q.data; cid = q.message.chat.id
+    d = _cb_resolve(q.data); cid = q.message.chat.id
 
     # Resolve session from the callback message
     session = SM.find_by_message(q.message.message_id)
@@ -1590,7 +1616,7 @@ async def on_callback(u, c):
             f"📁 Project: <b>{esc(proj_name)}</b>\n\nEnter a name for this session (or tap Skip):",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭ Skip", callback_data=f"skipname:{auto_label}:{proj_name}")]
+                [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{auto_label}:{proj_name}"))]
             ]))
 
     elif d.startswith("skipname:"):
@@ -2101,7 +2127,7 @@ async def on_text(u, c):
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n\nEnter a name for this session (or tap Skip):",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⏭ Skip", callback_data=f"skipname:{label}:{proj_name}")]
+                        [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{label}:{proj_name}"))]
                     ]))
             return
 
@@ -2127,7 +2153,7 @@ async def on_text(u, c):
                 for m in matches:
                     mid = m["id"]
                     name = m.get("name", mid)[:40]
-                    rows.append([InlineKeyboardButton(f"🔸 {name}", callback_data=f"mdlpick:{mid}")])
+                    rows.append([InlineKeyboardButton(f"🔸 {name}", callback_data=_cb(f"mdlpick:{mid}"))])
                 await u.message.reply_text(
                     f"🔍 Results for <code>{esc(query)}</code>:",
                     parse_mode=ParseMode.HTML,
@@ -2234,9 +2260,9 @@ async def _flush_buffer(cid: int, context):
         for s in active_sessions:
             label_text = f"{s.color_emoji} {s.label} ({s.project})"
             picker_rows.append([InlineKeyboardButton(
-                label_text, callback_data=f"dpick:{delay_id}:{s.id}")])
+                label_text, callback_data=_cb(f"dpick:{delay_id}:{s.id}"))])
         picker_rows.append([InlineKeyboardButton(
-            "🆕 New session (random name)", callback_data=f"dpick:{delay_id}:__new__")])
+            "🆕 New session (random name)", callback_data=_cb(f"dpick:{delay_id}:__new__"))])
 
         delay_label = "after last task + 5m" if is_next else format_delay(delay_secs)
         try:
