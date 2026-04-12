@@ -214,14 +214,22 @@ def get_project_names() -> list[str]:
     return [p["name"] for p in load_projects()]
 
 
-def add_project(name: str, path: str):
-    """Add a new project to the config."""
+def add_project(name: str, path: str) -> str | None:
+    """Add a new project to the config. Returns error message or None on success."""
+    # Validate name and path length
+    if len(name) > 50:
+        return "Project name too long (max 50 chars)"
+    if len(path) > 200:
+        return "Project path too long (max 200 chars)"
+    if not name.replace("-", "").replace("_", "").replace(".", "").isalnum():
+        return "Project name must be alphanumeric (hyphens/underscores allowed)"
     projects = load_projects()
     # Don't add duplicates
     if any(p["name"] == name for p in projects):
-        return
+        return "Project already exists"
     projects.append({"name": name, "path": path})
     save_projects(projects)
+    return None
 
 
 def get_project_path(name: str) -> str:
@@ -251,18 +259,25 @@ def _cb(data: str) -> str:
     global _cb_counter
     if len(data.encode("utf-8")) <= 64:
         return data
+    # Check if this exact data is already registered (avoid duplicates)
+    for k, v in _CB_REGISTRY.items():
+        if v == data:
+            return k
     _cb_counter += 1
     key = f"_r:{_cb_counter}"
     _CB_REGISTRY[key] = data
-    # Evict old entries to prevent memory leak (keep last 500)
-    if len(_CB_REGISTRY) > 500:
-        for old_key in list(_CB_REGISTRY)[:100]:
+    # Evict old entries to prevent memory leak (keep last 2000)
+    if len(_CB_REGISTRY) > 2000:
+        for old_key in list(_CB_REGISTRY)[:200]:
             _CB_REGISTRY.pop(old_key, None)
     return key
 
 def _cb_resolve(data: str) -> str:
-    """Resolve callback_data: if it's a registry key, return the real value."""
-    return _CB_REGISTRY.pop(data, data)
+    """Resolve callback_data: if it's a registry key, return the real value.
+    Uses .get() instead of .pop() so buttons remain clickable multiple times."""
+    if data.startswith("_r:"):
+        return _CB_REGISTRY.get(data, "")  # empty string = expired
+    return data
 
 
 # ═══════════════════════════════════════════
@@ -1489,6 +1504,14 @@ async def on_callback(u, c):
     q = u.callback_query; await q.answer()
     d = _cb_resolve(q.data); cid = q.message.chat.id
 
+    # Handle expired registry keys (after bot restart or eviction)
+    if not d:
+        await q.edit_message_text(
+            "⚠️ This button has expired (bot was restarted).\n"
+            "Please use the command again: /project or /new",
+            parse_mode=ParseMode.HTML)
+        return
+
     # Resolve session from the callback message
     session = SM.find_by_message(q.message.message_id)
 
@@ -2099,7 +2122,10 @@ async def on_text(u, c):
                 await u.message.reply_text("❌ Invalid path.", parse_mode=ParseMode.HTML)
                 return
             # Add to projects config
-            add_project(proj_name, path)
+            err = add_project(proj_name, path)
+            if err:
+                await u.message.reply_text(f"❌ {err}", parse_mode=ParseMode.HTML)
+                return
             log.info(f"New project added: {proj_name} → {path}")
 
             if has_name:
