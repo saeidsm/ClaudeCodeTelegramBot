@@ -24,7 +24,7 @@ This is async DevOps — send your coding task, go about your day, get the resul
 
 ## Features
 
-- **Multi-Session Management** — Run up to 3 concurrent Claude Code sessions, each with its own project context
+- **Multi-Session Management** — Run up to 4 concurrent Claude Code sessions, each with its own project context
 - **Voice Commands** — Speak in Farsi or English; Gemini transcribes and refines your voice into structured prompts
 - **File Attachments** — Send documents/photos with instructions; they're passed to Claude Code automatically
 - **Smart Fallback Chain** — When Claude is rate-limited, falls back to Gemini → GPT-4o → OpenRouter (configurable)
@@ -33,6 +33,8 @@ This is async DevOps — send your coding task, go about your day, get the resul
 - **Health & Logs** — Quick-access buttons for server health checks and log collection
 - **Usage Tracking** — Token usage estimates with hourly/daily/weekly bars and alerts
 - **Session Auto-Cleanup** — Idle sessions auto-close after configurable timeout
+- **Graceful Shutdown** — On SIGTERM, notifies active chats and cleanly terminates Claude processes
+- **OOM Protection** — Systemd memory limits prevent the OS from killing the bot
 - **Pause Window** — 5-second countdown before execution lets you cancel or edit
 - **Report Generation** — Save full outputs as browsable reports with shareable links
 
@@ -151,7 +153,7 @@ All configuration is via environment variables. See [`.env.example`](.env.exampl
 | `GEMINI_API_KEY` | No | Enables voice transcription + Gemini fallback |
 | `OPENAI_API_KEY` | No | Enables GPT fallback |
 | `OPENROUTER_API_KEY` | No | Enables OpenRouter model selection |
-| `BOT_MAX_SESSIONS` | No | Max concurrent sessions (default: 3) |
+| `BOT_MAX_SESSIONS` | No | Max concurrent sessions (default: 4) |
 | `BOT_SESSION_TIMEOUT_HOURS` | No | Auto-close idle sessions after N hours (default: 72) |
 
 ## Custom Scripts
@@ -174,12 +176,18 @@ sudo cp systemd/claude-telegram-bot.service /etc/systemd/system/
 sudo systemctl edit claude-telegram-bot
 
 # Enable and start
+sudo systemctl daemon-reload
 sudo systemctl enable claude-telegram-bot
 sudo systemctl start claude-telegram-bot
 
 # Check status
 sudo systemctl status claude-telegram-bot
 ```
+
+The service file includes:
+- **MemoryHigh/MemoryMax** — Prevents OOM killer from targeting the bot process
+- **KillSignal=SIGTERM** — Triggers graceful shutdown (notifies chats, kills Claude processes)
+- **TimeoutStopSec=30** — Gives the bot 30 seconds to clean up before force kill
 
 ## Project Structure
 

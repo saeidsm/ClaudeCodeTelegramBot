@@ -1,16 +1,24 @@
 [Unit]
-Description=Claude Code Telegram Bot
+Description=Shahrzad Claude Code Telegram Bot
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /opt/your-bot/bot.py
-WorkingDirectory=/opt/your-bot
+ExecStart=/usr/bin/python3 /opt/shahrzad-devops/scripts/claude-telegram-bot.py
+WorkingDirectory=/opt/shahrzad-devops
 Restart=always
 RestartSec=5
 Environment=HOME=/root
 Environment=PATH=/root/.local/bin:/usr/local/bin:/usr/bin:/bin
-EnvironmentFile=/opt/your-bot/.env
+EnvironmentFile=/opt/shahrzad-devops/.env
+
+# Memory limits — prevent OOM killer from targeting the bot
+MemoryHigh=2G
+MemoryMax=2500M
+
+# Graceful shutdown — give bot time to notify chats and kill claude processes
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

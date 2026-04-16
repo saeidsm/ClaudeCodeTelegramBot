@@ -4,7 +4,7 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -43,7 +43,7 @@ PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
 REPORT_URL = "https://devops.shahrzad.ai/reports"
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
-MAX_SESSIONS  = 3
+MAX_SESSIONS  = 4
 SESSION_TIMEOUT_MINUTES = 72 * 60  # 72 hours for most sessions
 PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
 USAGE_DB_PATH = "/opt/shahrzad-devops/configs/usage_tracker.json"
@@ -516,6 +516,8 @@ class SessionManager:
 
 
 SM = SessionManager()
+# Track active claude subprocess PIDs for graceful shutdown
+ACTIVE_PROCS: dict[int, asyncio.subprocess.Process] = {}  # pid -> Process
 # Store pending messages for multi-session routing: chat_id -> (text, files, message)
 PENDING_MESSAGES: dict[int, dict] = {}
 # Track which session is "focused" per chat — messages without reply go here
@@ -729,7 +731,11 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
+        ACTIVE_PROCS[proc.pid] = proc
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
+        finally:
+            ACTIVE_PROCS.pop(proc.pid, None)
         r = out.decode("utf-8", errors="replace")
         e = err.decode("utf-8", errors="replace") if err else ""
 
@@ -741,7 +747,11 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
             proc2 = await asyncio.create_subprocess_exec(
                 *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
-            out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=3600)
+            ACTIVE_PROCS[proc2.pid] = proc2
+            try:
+                out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=3600)
+            finally:
+                ACTIVE_PROCS.pop(proc2.pid, None)
             r = out2.decode("utf-8", errors="replace")
             e = err2.decode("utf-8", errors="replace") if err2 else ""
             proc = proc2  # use new proc for remaining checks
@@ -2351,6 +2361,50 @@ async def post_init(app):
     asyncio.create_task(session_cleanup_task(app))
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
 
+async def graceful_shutdown(app):
+    """Kill all running Claude processes and notify active chats before exit."""
+    log.info("SIGTERM received — starting graceful shutdown...")
+    # Collect active sessions info before killing
+    active = [(k, s) for k, s in SM.sessions.items() if s.status == "running"]
+    # Kill all tracked claude subprocesses
+    for pid, proc in list(ACTIVE_PROCS.items()):
+        try:
+            proc.terminate()
+            log.info(f"Terminated claude process PID {pid}")
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    ACTIVE_PROCS.clear()
+    # Notify each chat with active sessions
+    notified_chats = set()
+    for key, session in active:
+        chat_id_str = key.split(":")[0]
+        try:
+            chat_id = int(chat_id_str)
+        except ValueError:
+            continue
+        if chat_id in notified_chats:
+            continue
+        notified_chats.add(chat_id)
+        chat_sessions = [s for k, s in active if k.startswith(f"{chat_id}:")]
+        lines = [f"  • {s.color_emoji} {s.label} ({s.project})" for s in chat_sessions]
+        msg = (
+            "⚠️ <b>Bot restarting (SIGTERM)</b>\n\n"
+            f"Active sessions interrupted:\n" + "\n".join(lines) + "\n\n"
+            "Sessions will resume after restart. Use /sessions to check status."
+        )
+        try:
+            await app.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.error(f"Failed to notify chat {chat_id}: {e}")
+    # Mark all running sessions as error so they don't block on restart
+    for key, session in active:
+        session.status = "error"
+    log.info(f"Graceful shutdown complete. Killed {len(active)} active sessions.")
+
+
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
     log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
@@ -2363,7 +2417,7 @@ def main():
         connect_timeout=30,
         pool_timeout=30,
     )
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).request(request).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(graceful_shutdown).request(request).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
