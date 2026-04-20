@@ -20,6 +20,7 @@ from telegram.ext import (
     filters, ContextTypes
 )
 from telegram.constants import ParseMode, ChatAction
+from telegram.error import BadRequest
 
 # ── Gemini ──
 try:
@@ -838,20 +839,80 @@ async def make_report(name, content):
 # ═══════════════════════════════════════════
 #  Send
 # ═══════════════════════════════════════════
-async def send_long(msg, text, pm=ParseMode.HTML, rm=None):
-    mx = 4000
+def _split_html_chunks(text: str, mx: int = 4000) -> list:
+    """Split text into Telegram-safe chunks preserving HTML tag balance.
+
+    If a chunk would end with an unclosed <pre> or <code>, close it in the
+    current chunk and reopen it at the start of the next. Prevents
+    telegram.error.BadRequest: "Can't parse entities: can't find end tag
+    corresponding to start tag 'pre'" — the dominant cause of silent
+    dropped reports in the bot's history.
+    """
     if len(text) <= mx:
-        return await msg.reply_text(text, parse_mode=pm, reply_markup=rm, disable_web_page_preview=True)
+        return [text]
     chunks = []
-    while text:
-        if len(text) <= mx: chunks.append(text); break
-        c = text.rfind("\n", 0, mx)
-        if c == -1: c = mx
-        chunks.append(text[:c]); text = text[c:].lstrip("\n")
+    remaining = text
+    carry_open = []  # tags carried from previous chunk's unclosed state
+    while remaining:
+        if len(remaining) <= mx:
+            chunk = remaining
+            for tag in carry_open:
+                chunk = f"<{tag}>" + chunk
+            chunks.append(chunk)
+            break
+        cut = remaining.rfind("\n", 0, mx)
+        if cut == -1 or cut < mx // 4:
+            cut = mx
+        chunk = remaining[:cut]
+        rest = remaining[cut:].lstrip("\n")
+        for tag in carry_open:
+            chunk = f"<{tag}>" + chunk
+        new_carry = []
+        for tag in ("pre", "code"):
+            if chunk.count(f"<{tag}>") > chunk.count(f"</{tag}>"):
+                chunk += f"</{tag}>"
+                new_carry.append(tag)
+        chunks.append(chunk)
+        carry_open = new_carry
+        remaining = rest
+    return chunks
+
+
+async def send_long(msg, text, pm=ParseMode.HTML, rm=None):
+    """Send a long message, splitting safely on HTML tag boundaries.
+
+    On BadRequest (HTML parse error) retries the same chunk as plain text
+    so the user always sees *something* — silent drops were the #1 reason
+    reports appeared lost across sessions.
+    """
+    mx = 4000
+    chunks = _split_html_chunks(text, mx) if pm == ParseMode.HTML else (
+        [text] if len(text) <= mx else [text[i:i+mx] for i in range(0, len(text), mx)]
+    )
     last = None
     for i, ch in enumerate(chunks):
-        last = await msg.reply_text(ch, parse_mode=pm,
-            reply_markup=rm if i == len(chunks)-1 else None, disable_web_page_preview=True)
+        is_last = (i == len(chunks) - 1)
+        mk = rm if is_last else None
+        try:
+            last = await msg.reply_text(
+                ch, parse_mode=pm, reply_markup=mk, disable_web_page_preview=True)
+        except BadRequest as e:
+            err = str(e).lower()
+            if "parse entities" in err or "end tag" in err or "can't parse" in err:
+                log.warning(
+                    f"HTML parse failed on chunk {i+1}/{len(chunks)}, "
+                    f"retrying as plain text: {e}")
+                plain = re.sub(r"<[^>]+>", "", ch)
+                try:
+                    last = await msg.reply_text(
+                        plain, parse_mode=None, reply_markup=mk,
+                        disable_web_page_preview=True)
+                except Exception as ee:
+                    log.error(f"Plain-text fallback also failed: {ee}")
+            else:
+                log.error(f"send_long BadRequest (non-parse): {e}")
+        except Exception as e:
+            log.error(f"send_long unexpected error on chunk {i+1}/{len(chunks)}: {e}")
         await asyncio.sleep(0.3)
     return last
 
@@ -2259,63 +2320,84 @@ async def on_text(u, c):
 
 
 async def _flush_buffer(cid: int, context):
-    """Flush message buffer and execute combined prompt."""
-    buf = MESSAGE_BUFFER.pop(cid, None)
-    if not buf:
-        return
-    if buf.get("timer"):
-        buf["timer"].cancel()
+    """Flush message buffer and execute combined prompt.
 
-    combined = "\n".join(buf["texts"])
-    session_key = buf["session_key"]
-    update = buf["update"]
-    session = SM.get_by_key(session_key)
+    Wrapped top-to-bottom in try/except because this runs as a detached
+    asyncio task (scheduled via call_later → ensure_future). Any
+    unhandled exception would surface as "Task exception was never
+    retrieved" and the user would see silence — historically the main
+    reason chat sessions appeared to "lose context".
+    """
+    update_for_error = None
+    try:
+        buf = MESSAGE_BUFFER.pop(cid, None)
+        if not buf:
+            return
+        if buf.get("timer"):
+            buf["timer"].cancel()
 
-    if not session or session.status == "completed":
-        return
+        combined = "\n".join(buf["texts"])
+        session_key = buf["session_key"]
+        update = buf["update"]
+        update_for_error = update
+        session = SM.get_by_key(session_key)
 
-    # ── Check for :DELAY=...: prefix ──
-    delay_secs, remaining_text, is_next = parse_delay(combined)
-    if delay_secs is not None and remaining_text.strip():
-        f = session.files; session.files = []
-        delay_id = uuid.uuid4().hex[:8]  # short ID for callback data limits
+        if not session or session.status == "completed":
+            return
 
-        # Store pending delay — ask user which session/project to use
-        active_sessions = SM.active_for_chat(cid)
-        PENDING_DELAYS[cid] = {
-            "delay_id": delay_id,
-            "prompt": remaining_text.strip(),
-            "delay_secs": delay_secs,
-            "is_next": is_next,
-            "files": f,
-            "current_session_key": session.id,
-        }
+        # ── Check for :DELAY=...: prefix ──
+        delay_secs, remaining_text, is_next = parse_delay(combined)
+        if delay_secs is not None and remaining_text.strip():
+            f = session.files; session.files = []
+            delay_id = uuid.uuid4().hex[:8]  # short ID for callback data limits
 
-        # Build session/project picker buttons
-        picker_rows = []
-        for s in active_sessions:
-            label_text = f"{s.color_emoji} {s.label} ({s.project})"
+            # Store pending delay — ask user which session/project to use
+            active_sessions = SM.active_for_chat(cid)
+            PENDING_DELAYS[cid] = {
+                "delay_id": delay_id,
+                "prompt": remaining_text.strip(),
+                "delay_secs": delay_secs,
+                "is_next": is_next,
+                "files": f,
+                "current_session_key": session.id,
+            }
+
+            # Build session/project picker buttons
+            picker_rows = []
+            for s in active_sessions:
+                label_text = f"{s.color_emoji} {s.label} ({s.project})"
+                picker_rows.append([InlineKeyboardButton(
+                    label_text, callback_data=_cb(f"dpick:{delay_id}:{s.id}"))])
             picker_rows.append([InlineKeyboardButton(
-                label_text, callback_data=_cb(f"dpick:{delay_id}:{s.id}"))])
-        picker_rows.append([InlineKeyboardButton(
-            "🆕 New session (random name)", callback_data=_cb(f"dpick:{delay_id}:__new__"))])
+                "🆕 New session (random name)", callback_data=_cb(f"dpick:{delay_id}:__new__"))])
 
-        delay_label = "after last task + 5m" if is_next else format_delay(delay_secs)
+            delay_label = "after last task + 5m" if is_next else format_delay(delay_secs)
+            try:
+                confirm = await update.message.reply_text(
+                    f"⏰ <b>Delayed prompt received!</b>\n"
+                    f"⏱ Delay: <b>{delay_label}</b>\n\n"
+                    f"<pre>{esc(remaining_text.strip()[:300])}</pre>\n\n"
+                    f"📌 <b>Which session/project should this run in?</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(picker_rows))
+                await track_reply(confirm, session)
+            except Exception as e:
+                log.error(f"Delay picker error: {e}")
+            return
+
+        f = session.files; session.files = []
+        await execute(update, context, combined, session, f or None)
+    except Exception as e:
+        log.error(f"_flush_buffer unhandled error (chat {cid}): {e}", exc_info=True)
+        # Best-effort notify user so they know something went wrong
         try:
-            confirm = await update.message.reply_text(
-                f"⏰ <b>Delayed prompt received!</b>\n"
-                f"⏱ Delay: <b>{delay_label}</b>\n\n"
-                f"<pre>{esc(remaining_text.strip()[:300])}</pre>\n\n"
-                f"📌 <b>Which session/project should this run in?</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(picker_rows))
-            await track_reply(confirm, session)
-        except Exception as e:
-            log.error(f"Delay picker error: {e}")
-        return
-
-    f = session.files; session.files = []
-    await execute(update, context, combined, session, f or None)
+            if update_for_error and update_for_error.message:
+                await update_for_error.message.reply_text(
+                    f"⚠️ Internal bot error while handling your message.\n"
+                    f"Check logs: <code>journalctl -u claude-telegram-bot -n 100</code>",
+                    parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
 
 # ═══════════════════════════════════════════
 #  Boot

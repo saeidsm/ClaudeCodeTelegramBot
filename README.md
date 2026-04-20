@@ -233,6 +233,12 @@ Voice transcription and prompt refinement use Gemini. Customize the prompts in `
 }
 ```
 
+## Changelog
+
+See [docs/CHANGELOG.md](docs/CHANGELOG.md) for notable changes. Most recent
+entry: **2026-04-20** — fix silent drop of long reports caused by HTML
+`<pre>` tag splitting.
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request.
