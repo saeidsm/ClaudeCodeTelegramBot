@@ -49,6 +49,7 @@ SESSION_TIMEOUT_MINUTES = 72 * 60  # 72 hours for most sessions
 PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
 USAGE_DB_PATH = "/opt/shahrzad-devops/configs/usage_tracker.json"
 PROJECTS_FILE = "/opt/shahrzad-devops/configs/projects.json"
+STATE_FILE    = "/opt/shahrzad-devops/configs/bot-state.json"
 
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -418,6 +419,7 @@ class Session:
     tasks: int = 0
     paused: bool = False
     voice_text: str = ""
+    claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
 
 
 class SessionManager:
@@ -448,6 +450,10 @@ class SessionManager:
             session_uuid=str(uuid.uuid4()),
         )
         self.sessions[key] = session
+        # Newly created session becomes the active one for this chat —
+        # otherwise non-reply messages still route to whatever was active
+        # before (the cause of "session mixing" reports).
+        ACTIVE_SESSION[chat_id] = key
         return session
 
     def get(self, chat_id: int, label: str) -> Optional[Session]:
@@ -704,18 +710,39 @@ def authorized(fn):
 # ═══════════════════════════════════════════
 #  Claude Code
 # ═══════════════════════════════════════════
-async def run_claude(prompt, project, session_uuid, files=None, session_label=""):
+async def _spawn_claude(cmd, repo):
+    """Spawn a `claude` subprocess and return (proc, stdout_str, stderr_str)."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
+    ACTIVE_PROCS[proc.pid] = proc
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
+    finally:
+        ACTIVE_PROCS.pop(proc.pid, None)
+    r = out.decode("utf-8", errors="replace")
+    e = err.decode("utf-8", errors="replace") if err else ""
+    return proc, r, e
+
+
+async def run_claude(prompt, project, session, files=None):
+    """Invoke Claude Code for a session.
+
+    First call uses --session-id (creates session with our UUID).
+    Subsequent calls use --resume (preserves conversation context).
+    Previously used --session-id every time, which always failed with
+    "already in use" after the first call and silently rerolled the UUID
+    — losing all prior context on every message after the first.
+    """
     repo = get_project_path(project)
     if not os.path.isdir(repo):
-        # Fallback to REPOS/<project>
         repo = f"{REPOS}/{project}"
     if not os.path.isdir(repo):
-        # Try to create the directory (user may have added a new project path)
         try:
             os.makedirs(repo, exist_ok=True)
             log.info(f"Created project directory: {repo}")
         except Exception as e:
-            return f"\u274c Not found: {project}\nCould not create: {e}"
+            return f"❌ Not found: {project}\nCould not create: {e}"
     fnote = ""
     if files:
         td = f"{repo}/.claude-tasks"; os.makedirs(td, exist_ok=True)
@@ -724,62 +751,66 @@ async def run_claude(prompt, project, session_uuid, files=None, session_label=""
             if os.path.isfile(fp):
                 d = f"{td}/{os.path.basename(fp)}"; subprocess.run(["cp", fp, d]); copied.append(d)
         if copied:
-            fnote = "\n\n[ATTACHED FILES \u2014 read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+            fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
     full_prompt = prompt + fnote
-    cmd = ["claude", "--print", "--session-id", session_uuid, full_prompt]
-    log.info(f"Claude [{project}] session={session_uuid[:8]}: {prompt[:80]}... ({len(files or [])} files)")
+
+    def build_cmd(mode, uuid_str):
+        flag = "--resume" if mode == "resume" else "--session-id"
+        return ["claude", "--print", flag, uuid_str, full_prompt]
+
+    mode = "resume" if session.claude_created else "create"
+    cmd = build_cmd(mode, session.session_uuid)
+    log.info(f"Claude [{project}] {mode} session={session.session_uuid[:8]}: {prompt[:80]}... ({len(files or [])} files)")
+
+    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
-        ACTIVE_PROCS[proc.pid] = proc
-        try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
-        finally:
-            ACTIVE_PROCS.pop(proc.pid, None)
-        r = out.decode("utf-8", errors="replace")
-        e = err.decode("utf-8", errors="replace") if err else ""
+        proc, r, e = await _spawn_claude(cmd, repo)
 
-        # Handle "Session ID already in use" — generate new UUID and retry once
-        if proc.returncode != 0 and "already in use" in (r + e).lower():
-            log.warning(f"Session ID {session_uuid[:8]} in use, retrying with new UUID")
-            new_uuid = str(uuid.uuid4())
-            cmd[cmd.index(session_uuid)] = new_uuid
-            proc2 = await asyncio.create_subprocess_exec(
-                *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
-            ACTIVE_PROCS[proc2.pid] = proc2
-            try:
-                out2, err2 = await asyncio.wait_for(proc2.communicate(), timeout=3600)
-            finally:
-                ACTIVE_PROCS.pop(proc2.pid, None)
-            r = out2.decode("utf-8", errors="replace")
-            e = err2.decode("utf-8", errors="replace") if err2 else ""
-            proc = proc2  # use new proc for remaining checks
+        # Recovery paths
+        if proc.returncode != 0:
+            err_low = (r + e).lower()
+            session_missing = any(kw in err_low for kw in [
+                "no such session", "session not found", "session does not exist",
+                "could not find session", "no session with id"
+            ])
+            uuid_collision = "already in use" in err_low
 
-        # Track usage
-        USAGE.record(len(full_prompt), len(r), session_label)
+            if mode == "resume" and session_missing:
+                log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
+                session.session_uuid = str(uuid.uuid4())
+                session.claude_created = False
+                cmd = build_cmd("create", session.session_uuid)
+                proc, r, e = await _spawn_claude(cmd, repo)
+                mode = "create"
+            elif mode == "create" and uuid_collision:
+                log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
+                session.session_uuid = str(uuid.uuid4())
+                cmd = build_cmd("create", session.session_uuid)
+                proc, r, e = await _spawn_claude(cmd, repo)
 
-        # Detect rate limiting
-        rate_limited = False
+        # Mark session persisted on first successful create
+        if proc.returncode == 0 and not session.claude_created:
+            session.claude_created = True
+
+        USAGE.record(len(full_prompt), len(r), session.label)
+
+        # Rate-limit fallback
         if proc.returncode != 0:
             combined = (r + e).lower()
             if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
-                rate_limited = True
-
-        if rate_limited:
-            log.warning(f"Claude rate-limited for session {session_uuid[:8]}, falling back to GPT")
-            return await gpt_fallback(prompt, project)
+                log.warning(f"Claude rate-limited for session {session.session_uuid[:8]}, falling back to GPT")
+                return await gpt_fallback(prompt, project)
 
         if proc.returncode != 0 and e:
-            r += f"\n\u26a0\ufe0f {e[:500]}"
+            r += f"\n⚠️ {e[:500]}"
         return r.strip() or "(no output)"
     except asyncio.TimeoutError:
-        try: proc.kill()
+        try:
+            if proc: proc.kill()
         except: pass
-        return "\u23f0 Timeout (60 min)."
+        return "⏰ Timeout (60 min)."
     except Exception as e:
-        return f"\u274c {e}"
+        return f"❌ {e}"
 
 # ═══════════════════════════════════════════
 #  Gemini: Transcribe + Refine
@@ -1033,7 +1064,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 
     progress_task = asyncio.create_task(progress_updater())
     try:
-        output = await run_claude(prompt, proj, session.session_uuid, files, session.label)
+        output = await run_claude(prompt, proj, session, files)
     finally:
         progress_task.cancel()
 
@@ -1386,7 +1417,7 @@ async def schedule_delayed_prompt(dp: DelayedPrompt, app):
     session.status = "running"
     session.last_active = time.time()
     try:
-        output = await run_claude(dp.prompt, project, session.session_uuid, dp.files or None, session.label)
+        output = await run_claude(dp.prompt, project, session, dp.files or None)
     except Exception as e:
         output = f"❌ Delayed execution error: {e}"
 
@@ -1480,7 +1511,7 @@ async def schedule_next_delayed_prompt(dp: DelayedPrompt, app):
         session.status = "running"
         session.last_active = time.time()
         try:
-            output = await run_claude(dp.prompt, project, session.session_uuid, dp.files or None, session.label)
+            output = await run_claude(dp.prompt, project, session, dp.files or None)
         except Exception as e:
             output = f"❌ Delayed execution error: {e}"
 
@@ -1652,7 +1683,7 @@ async def on_callback(u, c):
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
         files = session.files; session.files = []
         session.status = "running"
-        output = await run_claude(vt, session.project, session.session_uuid, files or None, session.label)
+        output = await run_claude(vt, session.project, session, files or None)
         session.out = output; session.status = "idle"
         session.tasks += 1; session.last_active = time.time()
         sent = await c.bot.send_message(cid,
@@ -1780,7 +1811,7 @@ async def on_callback(u, c):
             else:
                 # Fallback: run claude directly and send output
                 session.status = "running"
-                output = await run_claude(pending["text"], session.project, session.session_uuid, f or None, session.label)
+                output = await run_claude(pending["text"], session.project, session, f or None)
                 session.out = output; session.status = "idle"
                 session.tasks += 1; session.last_active = time.time()
                 sent = await c.bot.send_message(cid,
@@ -2400,6 +2431,112 @@ async def _flush_buffer(cid: int, context):
             pass
 
 # ═══════════════════════════════════════════
+#  State Persistence
+# ═══════════════════════════════════════════
+# Fields of Session that survive a restart. Ephemeral fields (files, out,
+# paused, voice_text) are deliberately skipped — they have no meaning once
+# the in-flight prompt is gone.
+_PERSISTED_SESSION_FIELDS = (
+    "id", "label", "color_emoji", "session_uuid", "project", "status",
+    "started_at", "last_active", "message_ids", "anchor_message_id",
+    "tasks", "claude_created",
+)
+
+
+def save_state():
+    """Dump SessionManager + ACTIVE_SESSION to disk atomically.
+
+    Called on graceful shutdown and periodically by state_autosave_task.
+    """
+    try:
+        state = {
+            "version": 1,
+            "saved_at": time.time(),
+            "sessions": {
+                k: {fld: getattr(s, fld) for fld in _PERSISTED_SESSION_FIELDS}
+                for k, s in SM.sessions.items()
+            },
+            "msg_to_session": {str(mid): sk for mid, sk in SM.msg_to_session.items()},
+            "color_index": {str(cid): idx for cid, idx in SM.color_index.items()},
+            "active_session": {str(cid): sk for cid, sk in ACTIVE_SESSION.items()},
+        }
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        log.error(f"save_state error: {e}")
+
+
+def load_state():
+    """Restore SessionManager + ACTIVE_SESSION from disk. Best-effort."""
+    if not os.path.isfile(STATE_FILE):
+        log.info("No saved state file; starting fresh")
+        return
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        log.error(f"load_state parse error: {e}; starting fresh")
+        return
+    try:
+        restored = 0
+        for k, s in state.get("sessions", {}).items():
+            # Skip sessions left in "running" — their subprocess is dead.
+            # Mark them "error" so users know to re-send.
+            status = s.get("status", "idle")
+            if status == "running":
+                status = "error"
+            session = Session(
+                id=s["id"],
+                label=s["label"],
+                color_emoji=s.get("color_emoji", "🔵"),
+                session_uuid=s["session_uuid"],
+                project=s.get("project", DEFAULT_PROJECT),
+                status=status,
+                started_at=s.get("started_at", time.time()),
+                last_active=s.get("last_active", time.time()),
+                message_ids=s.get("message_ids", []),
+                anchor_message_id=s.get("anchor_message_id"),
+                tasks=s.get("tasks", 0),
+                claude_created=s.get("claude_created", False),
+            )
+            SM.sessions[k] = session
+            restored += 1
+        for mid_str, sk in state.get("msg_to_session", {}).items():
+            try:
+                SM.msg_to_session[int(mid_str)] = sk
+            except ValueError:
+                pass
+        for cid_str, idx in state.get("color_index", {}).items():
+            try:
+                SM.color_index[int(cid_str)] = idx
+            except ValueError:
+                pass
+        for cid_str, sk in state.get("active_session", {}).items():
+            try:
+                ACTIVE_SESSION[int(cid_str)] = sk
+            except ValueError:
+                pass
+        saved_ago = int(time.time() - state.get("saved_at", 0))
+        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old)")
+    except Exception as e:
+        log.error(f"load_state restore error: {e}")
+
+
+async def state_autosave_task():
+    """Background task: save state to disk every 10s."""
+    try:
+        while True:
+            await asyncio.sleep(10)
+            save_state()
+    except asyncio.CancelledError:
+        save_state()  # final save
+        log.info("State autosave cancelled (shutdown) — final save done")
+        return
+
+
+# ═══════════════════════════════════════════
 #  Boot
 # ═══════════════════════════════════════════
 async def session_cleanup_task(app):
@@ -2439,8 +2576,11 @@ async def post_init(app):
         BotCommand("usage", "\U0001f4ca Usage stats"),
         BotCommand("delayed", "⏰ Pending delayed prompts"),
     ])
-    # Start background cleanup task
+    # Restore previous session state before starting handlers
+    load_state()
+    # Start background cleanup + autosave tasks
     asyncio.create_task(session_cleanup_task(app))
+    asyncio.create_task(state_autosave_task())
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
 
 async def graceful_shutdown(app):
@@ -2484,6 +2624,8 @@ async def graceful_shutdown(app):
     # Mark all running sessions as error so they don't block on restart
     for key, session in active:
         session.status = "error"
+    # Persist final state so sessions can be restored after restart
+    save_state()
     log.info(f"Graceful shutdown complete. Killed {len(active)} active sessions.")
 
 
