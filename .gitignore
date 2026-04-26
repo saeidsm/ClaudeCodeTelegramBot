@@ -12,3 +12,4 @@ configs/projects.json
 *.bak2
 .venv/
 PATCH_TEST_NOTES.md
+PHASE2B_SMOKE_NOTES.md
