@@ -2,6 +2,20 @@
 
 All notable changes to the Shahrzad DevOps Telegram Bot.
 
+## [Unreleased] — 2026-04-26 — Merge of fix-session-resume-and-routing
+
+Brought into main:
+- `70fe758` — HTML chunk-splitter safety (closes `<pre>`/`<code>` at chunk
+  boundaries; `BadRequest` fallback to plain text; surfaced exceptions in
+  `_flush_buffer`)
+- `fd7c656` — Multi-turn session fix (`--session-id` on first call, `--resume`
+  after; `SessionManager.create` sets `ACTIVE_SESSION`; state persistence
+  to `/opt/shahrzad-devops/configs/bot-state.json` with 10 s autosave
+  and `post_init` restore)
+
+This brings main into parity with what has been running on production
+since 2026-04-21. Future deploys will once again happen from main.
+
 ## [Unreleased] — 2026-04-20 — Fix silent report loss on long Claude outputs
 
 ### Fixed — critical
