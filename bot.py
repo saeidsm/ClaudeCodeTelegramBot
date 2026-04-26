@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 
 import aiohttp
 from aiohttp import web as _aw
@@ -2578,6 +2578,9 @@ async def post_init(app):
         BotCommand("model", "\U0001f916 Fallback model"),
         BotCommand("usage", "\U0001f4ca Usage stats"),
         BotCommand("delayed", "⏰ Pending delayed prompts"),
+        BotCommand("nightwatch_ping", "\U0001f319 NightWatch IPC healthz"),
+        BotCommand("nightwatch_run", "\U0001f680 Run NightWatch now"),
+        BotCommand("nightwatch_last", "\U0001f4e8 Re-send last digest"),
     ])
     # Restore previous session state before starting handlers
     load_state()
@@ -2636,18 +2639,33 @@ async def graceful_shutdown(app):
     log.info(f"Graceful shutdown complete. Killed {len(active)} active sessions.")
 
 
-# ── NightWatch IPC (Phase 2A — test-mode only) ──
+# ── NightWatch IPC (Phase 2B — direct digest delivery) ──
 NW_HMAC = os.environ.get("BOT_NIGHTWATCH_HMAC_SECRET", "").strip()
 NW_PORT = int(os.environ.get("BOT_NIGHTWATCH_IPC_PORT", "9091"))
 NW_BIND = os.environ.get("BOT_NIGHTWATCH_IPC_BIND", "127.0.0.1")
 NW_PREFIXES = [p.strip() for p in os.environ.get("BOT_NIGHTWATCH_ALLOWED_FILE_PREFIXES", "/opt/sentry-nightwatch/snapshots/").split(",") if p.strip()]
 NW_MAX_BYTES = 25 * 1024 * 1024
-_NW_T0, _NW_RUNNER, _NW_DOWN, _NW_APP, _NW_SEEN = 0.0, None, False, None, set()
+NW_RUN_PYTHON = os.environ.get("NIGHTWATCH_VENV_PYTHON", "/opt/sentry-nightwatch/venv/bin/python")
+NW_RUN_CWD = os.environ.get("NIGHTWATCH_HOME", "/opt/sentry-nightwatch")
+NW_LAST_DIGEST_FILE = "/opt/sentry-nightwatch/snapshots/last-digest.txt"
+_NW_T0, _NW_RUNNER, _NW_DOWN, _NW_APP = 0.0, None, False, None
+_NW_SEEN: "OrderedDict[tuple, None]" = OrderedDict()
+_NW_SEEN_CAP = 256
+
+def _nw_seen_record(chat_id, label):
+    """LRU-bounded dedup. Returns True if newly recorded, False if duplicate."""
+    key = (chat_id, label)
+    if key in _NW_SEEN: return False
+    _NW_SEEN[key] = None
+    while len(_NW_SEEN) > _NW_SEEN_CAP: _NW_SEEN.popitem(last=False)
+    return True
 
 async def _nw_healthz(req):
-    return _aw.json_response({"ok": True, "uptime_s": int(time.time() - _NW_T0), "version": "phase-2a"})
+    return _aw.json_response({"ok": True, "uptime_s": int(time.time() - _NW_T0), "version": "phase-2b"})
 
 async def _nw_inject(req):
+    # Phase 2B: deliver a pre-formatted Telegram-HTML digest to chat_ids.
+    # The `prompt` field is no longer used; Phase 3 will reintroduce it for Claude handoff.
     if _NW_DOWN: return _aw.json_response({"ok": False, "error": "shutting_down"}, status=503)
     raw = await req.read()
     sig = req.headers.get("X-NightWatch-Signature", "")
@@ -2658,11 +2676,13 @@ async def _nw_inject(req):
     except Exception: return _aw.json_response({"ok": False, "error": "invalid_json"}, status=400)
     label = (body.get("session_label") or "").strip()
     project = (body.get("project") or "").strip()
-    prompt = body.get("prompt") or ""
-    if not (label and project and prompt) or len(label) > 80 or len(prompt) > 50000:
+    message_html = body.get("message_html") or ""
+    chat_ids = body.get("chat_ids") or []
+    if (not label or not project or not message_html or not isinstance(chat_ids, list)
+            or not chat_ids or len(label) > 80):
         return _aw.json_response({"ok": False, "error": "invalid_payload"}, status=400)
-    if label in _NW_SEEN:
-        return _aw.json_response({"ok": False, "error": "duplicate_session_label"}, status=409)
+    if not all(isinstance(x, int) for x in chat_ids):
+        return _aw.json_response({"ok": False, "error": "invalid_chat_ids"}, status=400)
     files = body.get("files") or []
     for f in files:
         rp = os.path.realpath(str(f))
@@ -2670,21 +2690,29 @@ async def _nw_inject(req):
             return _aw.json_response({"ok": False, "error": f"path_not_allowed:{f}"}, status=400)
         if not os.path.isfile(rp): return _aw.json_response({"ok": False, "error": f"file_missing:{f}"}, status=400)
         if os.path.getsize(rp) > NW_MAX_BYTES: return _aw.json_response({"ok": False, "error": f"file_too_large:{f}"}, status=400)
-    _NW_SEEN.add(label)
-    chat_ids = body.get("chat_ids") or ALLOWED_IDS
     btns = body.get("buttons") or []
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(b["text"], url=b["url"])] for b in btns
-        if isinstance(b, dict) and b.get("text") and b.get("url")]) if btns else None
-    msg = (f"🔧 <b>[Phase 2A test] IPC received</b>\n"
-           f"label: <code>{html.escape(label)}</code>\nproject: <code>{html.escape(project)}</code>\n"
-           f"files: {len(files)}\nreport: {html.escape(body.get('report_url') or '-')}\n\n"
-           f"<i>{html.escape(prompt[:200])}</i>")
-    # TODO Phase 2B: replace this test message with SessionManager.create + run_claude
+    valid_btns = [InlineKeyboardButton(b["text"], url=b["url"]) for b in btns
+                  if isinstance(b, dict) and b.get("text") and b.get("url")]
+    kb = InlineKeyboardMarkup([valid_btns]) if valid_btns else None  # one row
+    delivered = duplicates = failed = 0
     for cid in chat_ids:
-        try: await _NW_APP.bot.send_message(cid, msg, parse_mode=ParseMode.HTML, reply_markup=kb)
-        except Exception as e: log.error(f"nightwatch_ipc.tg_send_failed cid={cid}: {e}")
-    log.info(f"nightwatch_ipc.injected label={label} project={project} files={len(files)}")
-    return _aw.json_response({"ok": True, "session_label": label, "queued": True}, status=202)
+        if not _nw_seen_record(cid, label):
+            duplicates += 1
+            continue
+        try:
+            await _NW_APP.bot.send_message(cid, message_html, parse_mode=ParseMode.HTML,
+                                           reply_markup=kb, disable_web_page_preview=True)
+            delivered += 1
+        except Exception as e:
+            failed += 1
+            log.error(f"nightwatch_ipc.tg_send_failed cid={cid} label={label}: {e}")
+    log.info(f"nightwatch_ipc.injected label={label} project={project} delivered={delivered} duplicates={duplicates} failed={failed}")
+    if delivered == 0 and duplicates == 0:
+        return _aw.json_response({"ok": False, "error": "all_chats_failed", "failed": failed}, status=500)
+    if delivered == 0:
+        return _aw.json_response({"ok": False, "error": "all_chats_were_duplicates", "duplicates": duplicates}, status=409)
+    return _aw.json_response({"ok": True, "session_label": label, "delivered": delivered,
+                              "duplicates": duplicates, "failed": failed}, status=202)
 
 async def _nw_ipc_start(app):
     global _NW_T0, _NW_RUNNER, _NW_APP
@@ -2715,6 +2743,52 @@ async def cmd_nightwatch_ping(update, context):
     except Exception as e:
         await update.message.reply_text(f"❌ healthz unreachable: {e}")
 
+@authorized
+async def cmd_nightwatch_run(update, context):
+    """Spawn a NightWatch run in the background. Publisher delivers the digest."""
+    if not os.path.isfile(NW_RUN_PYTHON):
+        await update.message.reply_text(
+            f"❌ NightWatch python not found at <code>{html.escape(NW_RUN_PYTHON)}</code>",
+            parse_mode=ParseMode.HTML); return
+    cmd = [NW_RUN_PYTHON, "-m", "app.main", "run"]
+    try:
+        await asyncio.create_subprocess_exec(
+            *cmd, cwd=NW_RUN_CWD,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ failed to spawn NightWatch run: {e}"); return
+    log.info(f"nightwatch_run.spawned cwd={NW_RUN_CWD}")
+    await update.message.reply_text("🚀 NightWatch run kicked off, results in ~2 min")
+
+@authorized
+async def cmd_nightwatch_last(update, context):
+    """Re-send the most recent digest (republish). Reads last-digest.txt for the path."""
+    if not os.path.isfile(NW_LAST_DIGEST_FILE):
+        await update.message.reply_text(
+            "⚠️ No previous NightWatch digest on file (last-digest.txt not found)."); return
+    try:
+        with open(NW_LAST_DIGEST_FILE, encoding="utf-8") as f:
+            last_path = f.read().strip()
+    except Exception as e:
+        await update.message.reply_text(f"❌ failed to read last-digest: {e}"); return
+    if not os.path.isfile(NW_RUN_PYTHON):
+        await update.message.reply_text(
+            f"❌ NightWatch python not found at <code>{html.escape(NW_RUN_PYTHON)}</code>",
+            parse_mode=ParseMode.HTML); return
+    cmd = [NW_RUN_PYTHON, "-m", "app.main", "republish"]
+    try:
+        await asyncio.create_subprocess_exec(
+            *cmd, cwd=NW_RUN_CWD,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True)
+    except Exception as e:
+        await update.message.reply_text(f"❌ failed to spawn republish: {e}"); return
+    log.info(f"nightwatch_last.spawned path={last_path}")
+    await update.message.reply_text(
+        f"📨 Re-sending last digest from <code>{html.escape(last_path)}</code>",
+        parse_mode=ParseMode.HTML)
+
 
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
@@ -2739,6 +2813,8 @@ def main():
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("delayed", cmd_delayed))
     app.add_handler(CommandHandler("nightwatch_ping", cmd_nightwatch_ping))
+    app.add_handler(CommandHandler("nightwatch_run", cmd_nightwatch_run))
+    app.add_handler(CommandHandler("nightwatch_last", cmd_nightwatch_last))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
