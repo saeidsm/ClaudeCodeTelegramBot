@@ -11,3 +11,4 @@ configs/projects.json
 *.bak
 *.bak2
 .venv/
+PATCH_TEST_NOTES.md

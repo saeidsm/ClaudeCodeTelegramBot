@@ -4,12 +4,15 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 from collections import defaultdict
+
+import aiohttp
+from aiohttp import web as _aw
 
 from telegram import (
     Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -2581,11 +2584,15 @@ async def post_init(app):
     # Start background cleanup + autosave tasks
     asyncio.create_task(session_cleanup_task(app))
     asyncio.create_task(state_autosave_task())
+    # NightWatch IPC last: it returns 503 while the bot is still booting, so
+    # any in-flight inject from a fast-firing nightwatch sees the bot ready.
+    await _nw_ipc_start(app)
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
 
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
     log.info("SIGTERM received — starting graceful shutdown...")
+    await _nw_ipc_stop()
     # Collect active sessions info before killing
     active = [(k, s) for k, s in SM.sessions.items() if s.status == "running"]
     # Kill all tracked claude subprocesses
@@ -2629,6 +2636,86 @@ async def graceful_shutdown(app):
     log.info(f"Graceful shutdown complete. Killed {len(active)} active sessions.")
 
 
+# ── NightWatch IPC (Phase 2A — test-mode only) ──
+NW_HMAC = os.environ.get("BOT_NIGHTWATCH_HMAC_SECRET", "").strip()
+NW_PORT = int(os.environ.get("BOT_NIGHTWATCH_IPC_PORT", "9091"))
+NW_BIND = os.environ.get("BOT_NIGHTWATCH_IPC_BIND", "127.0.0.1")
+NW_PREFIXES = [p.strip() for p in os.environ.get("BOT_NIGHTWATCH_ALLOWED_FILE_PREFIXES", "/opt/sentry-nightwatch/snapshots/").split(",") if p.strip()]
+NW_MAX_BYTES = 25 * 1024 * 1024
+_NW_T0, _NW_RUNNER, _NW_DOWN, _NW_APP, _NW_SEEN = 0.0, None, False, None, set()
+
+async def _nw_healthz(req):
+    return _aw.json_response({"ok": True, "uptime_s": int(time.time() - _NW_T0), "version": "phase-2a"})
+
+async def _nw_inject(req):
+    if _NW_DOWN: return _aw.json_response({"ok": False, "error": "shutting_down"}, status=503)
+    raw = await req.read()
+    sig = req.headers.get("X-NightWatch-Signature", "")
+    exp = hmac.new(NW_HMAC.encode(), raw, hashlib.sha256).hexdigest()
+    if not (sig and hmac.compare_digest(sig.lower(), exp)):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    try: body = json.loads(raw.decode("utf-8") or "{}")
+    except Exception: return _aw.json_response({"ok": False, "error": "invalid_json"}, status=400)
+    label = (body.get("session_label") or "").strip()
+    project = (body.get("project") or "").strip()
+    prompt = body.get("prompt") or ""
+    if not (label and project and prompt) or len(label) > 80 or len(prompt) > 50000:
+        return _aw.json_response({"ok": False, "error": "invalid_payload"}, status=400)
+    if label in _NW_SEEN:
+        return _aw.json_response({"ok": False, "error": "duplicate_session_label"}, status=409)
+    files = body.get("files") or []
+    for f in files:
+        rp = os.path.realpath(str(f))
+        if not any(rp.startswith(os.path.realpath(p)) for p in NW_PREFIXES):
+            return _aw.json_response({"ok": False, "error": f"path_not_allowed:{f}"}, status=400)
+        if not os.path.isfile(rp): return _aw.json_response({"ok": False, "error": f"file_missing:{f}"}, status=400)
+        if os.path.getsize(rp) > NW_MAX_BYTES: return _aw.json_response({"ok": False, "error": f"file_too_large:{f}"}, status=400)
+    _NW_SEEN.add(label)
+    chat_ids = body.get("chat_ids") or ALLOWED_IDS
+    btns = body.get("buttons") or []
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(b["text"], url=b["url"])] for b in btns
+        if isinstance(b, dict) and b.get("text") and b.get("url")]) if btns else None
+    msg = (f"🔧 <b>[Phase 2A test] IPC received</b>\n"
+           f"label: <code>{html.escape(label)}</code>\nproject: <code>{html.escape(project)}</code>\n"
+           f"files: {len(files)}\nreport: {html.escape(body.get('report_url') or '-')}\n\n"
+           f"<i>{html.escape(prompt[:200])}</i>")
+    # TODO Phase 2B: replace this test message with SessionManager.create + run_claude
+    for cid in chat_ids:
+        try: await _NW_APP.bot.send_message(cid, msg, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as e: log.error(f"nightwatch_ipc.tg_send_failed cid={cid}: {e}")
+    log.info(f"nightwatch_ipc.injected label={label} project={project} files={len(files)}")
+    return _aw.json_response({"ok": True, "session_label": label, "queued": True}, status=202)
+
+async def _nw_ipc_start(app):
+    global _NW_T0, _NW_RUNNER, _NW_APP
+    if not NW_HMAC: log.warning("nightwatch_ipc_disabled reason=missing_secret"); return
+    _NW_APP, _NW_T0 = app, time.time()
+    a = _aw.Application()
+    a.router.add_get("/healthz", _nw_healthz)
+    a.router.add_post("/inject", _nw_inject)
+    runner = _aw.AppRunner(a); await runner.setup()
+    await _aw.TCPSite(runner, NW_BIND, NW_PORT).start()
+    _NW_RUNNER = runner
+    log.info(f"nightwatch_ipc.listening bind={NW_BIND}:{NW_PORT}")
+
+async def _nw_ipc_stop():
+    global _NW_DOWN
+    _NW_DOWN = True
+    if _NW_RUNNER is None: return
+    try: await asyncio.wait_for(_NW_RUNNER.cleanup(), timeout=5.0)
+    except asyncio.TimeoutError: log.warning("nightwatch_ipc.cleanup_timeout")
+
+@authorized
+async def cmd_nightwatch_ping(update, context):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"http://{NW_BIND}:{NW_PORT}/healthz", timeout=aiohttp.ClientTimeout(total=3)) as r:
+                txt = await r.text()
+        await update.message.reply_text(f"✅ <code>{html.escape(txt)}</code>", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await update.message.reply_text(f"❌ healthz unreachable: {e}")
+
+
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
     log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
@@ -2651,6 +2738,7 @@ def main():
     app.add_handler(CommandHandler("project", cmd_project))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("delayed", cmd_delayed))
+    app.add_handler(CommandHandler("nightwatch_ping", cmd_nightwatch_ping))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
