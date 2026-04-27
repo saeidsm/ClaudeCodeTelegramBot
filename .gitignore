@@ -1,4 +1,6 @@
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 *.log
@@ -9,7 +11,9 @@ reports/
 configs/usage_tracker.json
 configs/projects.json
 *.bak
+*.bak.*
 *.bak2
 .venv/
+venv/
 PATCH_TEST_NOTES.md
 PHASE2B_SMOKE_NOTES.md

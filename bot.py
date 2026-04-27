@@ -44,7 +44,7 @@ LOGS       = "/opt/shahrzad-devops/logs"
 SCRIPTS    = "/opt/shahrzad-devops/scripts"
 UPLOADS    = "/opt/shahrzad-devops/uploads"
 PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
-REPORT_URL = "https://devops.shahrzad.ai/reports"
+REPORT_URL = os.environ.get("REPORTS_BASE_URL", "http://localhost:8080/reports")
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
 MAX_SESSIONS  = 4
@@ -349,8 +349,8 @@ async def openrouter_fallback(prompt: str, project: str, model: str = "") -> str
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://shahrzad.ai",
-                    "X-Title": "Shahrzad DevOps",
+                    "HTTP-Referer": os.environ.get("APP_REFERER_URL", "http://localhost"),
+                    "X-Title": os.environ.get("APP_TITLE", "Claude Code Telegram Bot"),
                 },
                 json={
                     "model": model,
@@ -1126,7 +1126,8 @@ async def do_health(u, c):
 
 async def do_logs(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
-    r = subprocess.run([f"{SCRIPTS}/collect-logs.sh", "138.197.76.197", "30"], capture_output=True, text=True, timeout=30)
+    prod_host = os.environ.get("PROD_HOST", "127.0.0.1")
+    r = subprocess.run([f"{SCRIPTS}/collect-logs.sh", prod_host, "30"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📋 <b>Logs</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_projects(u, c):
