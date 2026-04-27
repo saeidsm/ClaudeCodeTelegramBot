@@ -38,6 +38,30 @@ This is async DevOps — send your coding task, go about your day, get the resul
 - **Pause Window** — 5-second countdown before execution lets you cancel or edit
 - **Report Generation** — Save full outputs as browsable reports with shareable links
 
+## Optional: NightWatch IPC integration
+
+The bot can act as a delivery channel for an external monitoring service. A
+small HMAC-authenticated HTTP endpoint listens on `127.0.0.1:9091` and accepts
+pre-formatted digest messages from any tool you trust — typical use case is a
+nightly Sentry summary that you want delivered to the bot's admin chat
+without coupling the summarizer to the Telegram API.
+
+- **What it is:** an opt-in localhost-only HTTP server (`POST /inject`,
+  `GET /healthz`) that turns the bot into a Telegram-delivery layer for any
+  external job that produces a daily report.
+- **Why use it:** keep Telegram credentials in *one* place (this bot), and
+  let any monitoring/digest pipeline POST messages here. The job stays
+  decoupled from Telegram's rate limits, retry policy, and chat allowlist.
+- **How to enable:** set `BOT_NIGHTWATCH_HMAC_SECRET` in `.env` (32+ random
+  hex chars). The IPC server starts at bot startup. Leave the variable
+  unset and the IPC stays off — the bot logs a warning at startup and
+  otherwise runs normally.
+- **New commands** (registered when the IPC is enabled): `/nightwatch_ping`
+  (health probe), `/nightwatch_run` (manual trigger of the external service
+  if installed), `/nightwatch_last` (re-send the previous digest).
+- **Protocol reference:** see [`docs/NIGHTWATCH_IPC.md`](docs/NIGHTWATCH_IPC.md)
+  for the full request/response schema, signing rules, and security notes.
+
 ## Quick Start
 
 ### Prerequisites

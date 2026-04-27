@@ -2,6 +2,41 @@
 
 All notable changes to the Shahrzad DevOps Telegram Bot.
 
+## [Unreleased] — 2026-04-27 — NightWatch IPC integration
+
+Added optional localhost HTTP endpoint for external monitoring services to
+deliver formatted messages and inline buttons to the bot's admin chat.
+Designed for nightly digest pipelines (e.g., Sentry summarizers) that want
+to ride the bot's existing Telegram delivery rather than talking to the
+Telegram API themselves.
+
+Highlights:
+- HMAC-authenticated `POST /inject` + unauthenticated `GET /healthz` on
+  `127.0.0.1:9091`.
+- Three new commands: `/nightwatch_ping`, `/nightwatch_run`, `/nightwatch_last`.
+- `set_my_commands` now registers the new commands at startup so they
+  appear in Telegram's `/`-menu.
+- Protocol docs at [`docs/NIGHTWATCH_IPC.md`](NIGHTWATCH_IPC.md) — full
+  request/response schema, signing rules, security notes.
+- Bot remains fully functional if `BOT_NIGHTWATCH_HMAC_SECRET` is unset
+  (the IPC server simply does not start; a startup warning is logged).
+
+Implementation: aiohttp server runs on the same asyncio loop as
+python-telegram-bot's polling, with graceful shutdown integrated so SIGTERM
+cleanly drains both surfaces.
+
+Migration: none. Existing bot behavior is unchanged when the new env vars
+are not set.
+
+Also in this release — small hygiene scrub of three previously-hardcoded
+identifiers in `bot.py`, all moved to env vars with safe localhost defaults
+so the bot is deployable by external users without further patching:
+
+- `REPORT_URL` now reads `REPORTS_BASE_URL` (default `http://localhost:8080/reports`).
+- OpenRouter `HTTP-Referer` and `X-Title` headers now read `APP_REFERER_URL`
+  and `APP_TITLE`.
+- `/logs` button now reads `PROD_HOST` (default `127.0.0.1`).
+
 ## [Unreleased] — 2026-04-26 — Merge of fix-session-resume-and-routing
 
 Brought into main:
