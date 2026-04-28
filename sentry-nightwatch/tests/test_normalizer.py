@@ -180,3 +180,75 @@ def test_normalize_release_resolution_table(
         event = {"tags": [{"key": "release", "value": event_release}]}
     n = normalize_issue(raw, "shahrzad-backend", event=event)
     assert n["release"] == expected
+
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2026-04-28 verdict-delta fix: count_24h extraction from per-issue stats
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _stats_issue() -> dict:
+    """Minimal raw Sentry issue dict for the count_24h tests."""
+    return {
+        "id": "9001",
+        "shortId": "TEST-1",
+        "title": "ExampleError",
+        "level": "error",
+        "count": "100",
+        "userCount": 5,
+        "firstSeen": "2026-04-20T12:00:00Z",
+        "lastSeen": "2026-04-27T12:00:00Z",
+        "project": {"slug": "shahrzad-backend"},
+    }
+
+
+def test_count_24h_extracted_from_stats_24h_buckets() -> None:
+    """Sentry's `stats.24h` is a list of [unix_ts, event_count] pairs.
+
+    The normalizer sums the bucket counts to produce `count_24h`."""
+    raw = _stats_issue()
+    raw["stats"] = {
+        "24h": [
+            [1714298400, 3],
+            [1714302000, 7],
+            [1714305600, 0],
+            [1714309200, 5],
+        ],
+    }
+    n = normalize_issue(raw, "shahrzad-backend")
+    assert n["count"] == 100               # lifetime preserved
+    assert n["count_24h"] == 15            # 3 + 7 + 0 + 5
+
+
+def test_count_24h_is_none_when_stats_absent() -> None:
+    """No stats fetched (e.g., capped at top-30) → count_24h is None.
+
+    None is distinct from 0: the verdict treats both as "no triggers"
+    but the digest can label it differently for transparency.
+    """
+    raw = _stats_issue()
+    n = normalize_issue(raw, "shahrzad-backend")
+    assert n.get("count_24h") is None
+
+
+def test_count_24h_is_none_when_stats_fetch_failed() -> None:
+    """Sentry returned 404/429 → main attaches stats=None to flag the failure."""
+    raw = _stats_issue()
+    raw["stats"] = None
+    n = normalize_issue(raw, "shahrzad-backend")
+    assert n.get("count_24h") is None
+
+
+def test_count_24h_handles_malformed_stats_gracefully() -> None:
+    """A malformed bucket entry must not raise; coerce to 0 and continue."""
+    raw = _stats_issue()
+    raw["stats"] = {
+        "24h": [
+            [1714298400, "not-a-number"],
+            [1714302000, None],
+            [1714305600, 4],
+        ],
+    }
+    n = normalize_issue(raw, "shahrzad-backend")
+    assert n["count_24h"] == 4  # only the valid bucket counted

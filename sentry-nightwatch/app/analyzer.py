@@ -18,7 +18,8 @@ class ScoredIssue(TypedDict):
     project_slug: str
     title: str
     level: str
-    count: int
+    count: int                # lifetime
+    count_24h: int | None     # 2026-04-28 verdict-delta: events in last 24h
     user_count: int
     first_seen: str
     last_seen: str
@@ -78,12 +79,24 @@ def _is_release_correlated(
 
 
 def _is_spike(issue: NormalizedIssue, baseline: dict[str, Any], multiplier: float) -> bool:
+    """2026-04-28 verdict-delta: spike measured against count_24h, not lifetime.
+
+    Old logic flagged a 10000-event lifetime issue as a spike even when it
+    had zero new events in the last day. We now compare 24h-window events
+    to the rolling baseline; festering issues with low 24h activity stay
+    quiet.
+    """
     sig = issue.get("stack_signature", "")
     base = baseline.get(sig, {}).get("avg_daily", 0.0)
+    c24 = issue.get("count_24h")
+    # When stats fetch failed/skipped, count_24h is None → no spike signal.
+    if c24 is None:
+        return False
     if base <= 0:
-        # No baseline → only treat as spike if today's count is unusually high (>20).
-        return issue["count"] >= 20 and _is_new_signature(issue, baseline)
-    return issue["count"] > base * multiplier
+        # No baseline → only treat as spike if 24h count is unusually high
+        # AND the signature is genuinely new to us.
+        return c24 >= 20 and _is_new_signature(issue, baseline)
+    return c24 > base * multiplier
 
 
 def _is_new_signature(issue: NormalizedIssue, baseline: dict[str, Any]) -> bool:
@@ -143,6 +156,17 @@ def score_issue(
         score += weights["cross_project_member"]
         reasons.append("cross_project")
 
+    # 2026-04-28 verdict-delta: festering bonus.
+    # Award a small fixed bonus (capped via weights["cumulative_festering_bonus_max"])
+    # to issues with a high lifetime count, so they don't disappear from the
+    # severity ranking entirely. Cap is set deliberately low (10) so this can
+    # NEVER alone push severity ≥ 50 (the NEEDS_ATTENTION threshold).
+    festering_min = getattr(thresholds, "festering_bonus_min_lifetime", 1000)
+    festering_max = weights.get("cumulative_festering_bonus_max", 10)
+    if issue["count"] >= festering_min:
+        score += festering_max
+        reasons.append(f"festering:{issue['count']}_lifetime")
+
     score = max(0, min(score, 100))
 
     return ScoredIssue(
@@ -151,6 +175,7 @@ def score_issue(
         title=issue["title"],
         level=issue["level"],
         count=issue["count"],
+        count_24h=issue.get("count_24h"),
         user_count=issue["user_count"],
         first_seen=issue["first_seen"],
         last_seen=issue["last_seen"],

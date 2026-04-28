@@ -82,13 +82,20 @@ def test_verdict_needs_attention_via_decision() -> None:
 
 
 def test_verdict_critical_via_fatal_level() -> None:
-    icon, label = compute_verdict([_scored(level="fatal", score=10)], decisions=[])
+    """2026-04-28 verdict-delta: fatal needs ≥ 1 event in 24h to fire CRITICAL."""
+    icon, label = compute_verdict(
+        [_scored(level="fatal", score=10, count_24h=1)], decisions=[]
+    )
     assert (icon, label) == ("🚨", "CRITICAL")
 
 
-def test_verdict_critical_via_score() -> None:
+def test_verdict_score_85_now_needs_attention_not_critical() -> None:
+    """2026-04-28 verdict-delta: severity_score is no longer a CRITICAL trigger.
+
+    The old logic raised CRITICAL at severity_score ≥ 80; the new logic only
+    triggers NEEDS_ATTENTION at ≥ 50. Renamed to make the intent obvious."""
     icon, label = compute_verdict([_scored(level="error", score=85)], decisions=[])
-    assert (icon, label) == ("🚨", "CRITICAL")
+    assert (icon, label) == ("⚠️", "NEEDS ATTENTION")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -613,3 +620,139 @@ def test_build_session_label_helper() -> None:
     # Watchdog: also timestamped.
     e = _build_session_label("2026-04-27", "watchdog")
     assert e.startswith("nightwatch-2026-04-27-watchdog-")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2026-04-28 verdict-delta fix: verdict driven by count_24h, top-3 format
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _scored_24h(**overrides) -> dict:
+    """Like _scored() but sets count_24h explicitly (default = same as count).
+
+    The old `_scored()` helper doesn't know about count_24h — keeping it
+    intact preserves all the pre-fix tests (which now treat their `count`
+    as effectively the 24h count via the helper default below)."""
+    base = _scored(**overrides)
+    base.setdefault("count_24h", base["count"])
+    return base
+
+
+def test_verdict_lifetime_high_but_24h_zero_does_not_raise() -> None:
+    """The 2026-04-27 false-positive: count=817 lifetime, count_24h=0,
+    no other flags ⇒ verdict must be ALL_CLEAR.
+
+    severity_score is set to a low value so we test ONLY the count-based
+    behaviour — a separately-elevated severity_score is its own NEEDS_ATTENTION
+    trigger."""
+    issue = _scored_24h(
+        level="error", count=817, count_24h=0, score=10,
+    )
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "ALL CLEAR", (
+        f"festering lifetime count must not raise verdict; got {label}"
+    )
+
+
+def test_verdict_critical_when_new_with_50_events_in_24h() -> None:
+    issue = _scored_24h(
+        level="error", count=50, count_24h=50, is_new=True,
+        first_seen="2026-04-27T01:00:00Z",
+    )
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "CRITICAL"
+
+
+def test_verdict_critical_when_regression_with_20_events_in_24h() -> None:
+    issue = _scored_24h(
+        level="error", count=100, count_24h=20, is_regression=True,
+    )
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "CRITICAL"
+
+
+def test_verdict_critical_when_fatal_with_one_event_in_24h() -> None:
+    issue = _scored_24h(level="fatal", count=10, count_24h=1)
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "CRITICAL"
+
+
+def test_verdict_critical_when_spike_flag_set() -> None:
+    """is_spike (count_24h > 3× baseline) ⇒ CRITICAL with no count threshold."""
+    issue = _scored_24h(level="error", count=200, count_24h=200, is_spike=True)
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "CRITICAL"
+
+
+def test_verdict_needs_attention_when_count_24h_at_50_no_other_flags() -> None:
+    """count_24h ≥ 50 alone (no new/regression/fatal/spike) is NEEDS_ATTENTION."""
+    issue = _scored_24h(level="error", count=50, count_24h=50)
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "NEEDS ATTENTION"
+
+
+def test_verdict_needs_attention_when_decisions_present_no_big_counts() -> None:
+    """Decision items raise verdict to NEEDS_ATTENTION even with low counts."""
+    issue = _scored_24h(level="error", count=2, count_24h=2)
+    decisions = [{"summary": "rollback X"}, {"summary": "investigate Y"}]
+    icon, label = compute_verdict([issue], decisions=decisions)
+    assert label == "NEEDS ATTENTION"
+
+
+def test_verdict_needs_attention_when_severity_score_50_post_rescore() -> None:
+    """severity_score ≥ 50 (post-rescore using count_24h) ⇒ NEEDS_ATTENTION."""
+    issue = _scored_24h(level="error", count=10, count_24h=10, severity_score=50)
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "NEEDS ATTENTION"
+
+
+def test_top_three_format_shows_count_24h_and_lifetime_with_tag() -> None:
+    """Spec: '<count_24h>× in 24h · <count> lifetime · <tag>' for each top-3 row.
+
+    Tags: 'spike' / 'regression' / 'new' / 'cumulative' (24h=0, lifetime>0) / 'steady'.
+    """
+    summary = _summary()
+    top = [
+        _scored_24h(
+            title="LoopErr", count=817, count_24h=0,
+            level="error", is_new=False, is_spike=False, is_regression=False,
+            severity_score=10,
+        )
+    ]
+    out = render_digest_html(summary, top, decisions=[])
+    # Both numbers must appear — explicit "in 24h" and "lifetime" labels.
+    assert "0 in 24h" in out
+    assert "817 lifetime" in out
+    # The "cumulative" tag must mark this issue.
+    assert "cumulative" in out
+
+
+def test_top_three_format_steady_tag_when_no_special_state() -> None:
+    summary = _summary()
+    top = [_scored_24h(title="SteadyErr", count=10, count_24h=10, severity_score=20)]
+    out = render_digest_html(summary, top, decisions=[])
+    assert "10 in 24h" in out
+    assert "10 lifetime" in out
+    assert "steady" in out
+
+
+def test_top_three_format_spike_tag_when_is_spike_true() -> None:
+    summary = _summary()
+    top = [_scored_24h(title="SpikeErr", count=200, count_24h=200, is_spike=True)]
+    out = render_digest_html(summary, top, decisions=[])
+    assert "spike" in out
+
+
+def test_verdict_all_clear_when_high_lifetime_low_24h_low_score() -> None:
+    """Spec acceptance case (c): count=10000, count_24h=2 → ALL_CLEAR.
+
+    severity_score is set to 15 (level=warning weight 5 + festering bonus 10)
+    to mirror what analyzer.score_issue would actually produce — verifies
+    the festering bonus cap holds and the verdict stays ALL_CLEAR."""
+    issue = _scored_24h(
+        level="warning", count=10000, count_24h=2, score=15,
+    )
+    icon, label = compute_verdict([issue], decisions=[])
+    assert label == "ALL CLEAR", (
+        f"festering bonus must not push verdict above ALL_CLEAR; got {label}"
+    )

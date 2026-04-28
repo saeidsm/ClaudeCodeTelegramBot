@@ -9,11 +9,33 @@ scoring:
     is_release_correlated: 10
     is_user_impacting: 15
     cross_project_member: 10
+    # 2026-04-28 verdict-delta fix: small bonus for festering (high-lifetime
+    # but low 24h activity) issues. Capped low so it can NEVER alone push
+    # severity ≥ 50 (the NEEDS-ATTENTION threshold).
+    cumulative_festering_bonus_max: 10
   thresholds:
     user_impacting_min_users: 5
     spike_baseline_multiplier: 3.0
     cluster_time_window_minutes: 5
+    # Lifetime count above which we award the festering bonus.
+    festering_bonus_min_lifetime: 1000
+
+# 2026-04-28 verdict-delta fix: verdict triggers driven by count_24h, not
+# lifetime count. Documented inline so future-you can tune without diving
+# into compute_verdict() in publisher.py.
+verdict:
+  # CRITICAL — any one of these conditions:
+  critical_new_error_24h: 50          # is_new AND count_24h ≥ N
+  critical_regression_24h: 20         # is_regression AND count_24h ≥ N
+  critical_fatal_24h: 1               # level=fatal AND count_24h ≥ N
+  # is_spike (count_24h > spike_baseline_multiplier × baseline) — no count threshold
+  # NEEDS ATTENTION — any one of these conditions:
+  attention_total_24h: 50             # any issue's count_24h ≥ N
+  attention_severity_score_min: 50    # any post-rescore severity_score ≥ N
+  # …or any decision item from detect_decision_required()
 
 rate_limits:
   sentry_max_req_per_min: 30
   sentry_max_event_fetches_per_run: 20
+  # Cap on per-issue stats fetches per run (free Sentry plan budget).
+  sentry_max_stats_fetches_per_run: 30

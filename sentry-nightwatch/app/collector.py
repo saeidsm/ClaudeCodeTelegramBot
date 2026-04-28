@@ -168,6 +168,55 @@ def fetch_event_full(
         return resp.json()
 
 
+def fetch_issue_stats(
+    org: str,
+    issue_id: str,
+    *,
+    stats_period: str = "24h",
+) -> dict[str, Any] | None:
+    """Fetch per-issue bucketed stats for the given window.
+
+    Used by the verdict-delta logic (2026-04-28) to distinguish "lifetime
+    events" from "events in the last 24h". One HTTP request per issue —
+    main.py caps callers at the top-N issues by lifetime count to stay
+    within the free Sentry plan's request budget.
+
+    Returns the raw `stats` field of the response, e.g.::
+
+        {"24h": [[1714298400, 3], [1714302000, 7], ...]}
+
+    or None on 404 / unreachable. The caller stores `None` to flag a
+    failed fetch (vs. simply zero events, which would be `{"24h": [...]}`
+    with all-zero counts).
+    """
+    url = f"{_base_url()}/api/0/organizations/{org}/issues/{issue_id}/"
+    with httpx.Client() as client:
+        try:
+            resp = _request(client, url, params={"expand": "stats", "statsPeriod": stats_period})
+        except SentryUnreachable as exc:
+            log.warning(
+                "collector.stats_unreachable",
+                issue_id=issue_id,
+                error=type(exc).__name__,
+            )
+            return None
+        if resp.status_code == 404:
+            log.warning("collector.stats_404", issue_id=issue_id)
+            return None
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning(
+                "collector.stats_http_error",
+                issue_id=issue_id,
+                status=resp.status_code,
+                error=type(exc).__name__,
+            )
+            return None
+        body = resp.json()
+        return body.get("stats") if isinstance(body, dict) else None
+
+
 def fetch_releases(org: str, project_slug: str, days_back: int = 7) -> list[dict[str, Any]]:
     """List recent releases for deploy correlation."""
     url = f"{_base_url()}/api/0/projects/{org}/{project_slug}/releases/"

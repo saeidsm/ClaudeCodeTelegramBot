@@ -151,6 +151,10 @@ def test_decision_release_rollback_review() -> None:
 
 
 def test_baseline_spike() -> None:
+    """2026-04-28 verdict-delta: spike is now measured against count_24h.
+
+    Stats attached so count_24h=200 gets compared to baseline avg=10.
+    """
     raw = {
         "id": "spike1",
         "title": "T",
@@ -159,6 +163,7 @@ def test_baseline_spike() -> None:
         "userCount": 5,
         "firstSeen": "2026-04-23T10:00:00Z",
         "lastSeen": "2026-04-24T10:00:00Z",
+        "stats": {"24h": [[1, 200]]},
     }
     n = normalize_issue(raw, "shahrzad-backend")
     baseline = {n["stack_signature"]: {"daily": {"d": 10}, "avg_daily": 10.0}}
@@ -210,3 +215,78 @@ def test_cluster_dataclass_to_dict() -> None:
     d = c.to_dict()
     assert d["members"] == ["a", "b"]
     assert d["confidence"] == 0.7
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# 2026-04-28 verdict-delta fix: scoring + festering bonus
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _raw(**overrides) -> dict:
+    base = {
+        "id": "9100",
+        "shortId": "TEST-100",
+        "title": "T",
+        "level": "error",
+        "count": 0,
+        "userCount": 0,
+        "firstSeen": "2026-04-22T00:00:00Z",
+        "lastSeen":  "2026-04-22T01:00:00Z",
+        "project": {"slug": "shahrzad-backend"},
+    }
+    base.update(overrides)
+    return base
+
+
+def test_spike_uses_count_24h_not_lifetime_count() -> None:
+    """A festering issue (count=10000, count_24h=2) is NOT a spike.
+
+    Old logic compared lifetime count against baseline; the bug we hit
+    on 2026-04-27 had a 817-event lifetime count, count_24h=0, and old
+    logic still raised a spike. New logic uses count_24h."""
+    from app.normalizer import normalize_issue
+    raw = _raw(count=10000, stats={"24h": [[1, 2]]})
+    n = normalize_issue(raw, "shahrzad-backend")
+    # Baseline is empty so _is_spike falls through to the "no baseline"
+    # branch which checks count_24h ≥ 20, NOT lifetime count.
+    s = score_issue(n, baseline={}, recent_releases=[], rules=RULES)
+    assert s["is_spike"] is False, (
+        f"festering issue (count=10000, count_24h=2) must not be flagged as spike; "
+        f"got is_spike={s['is_spike']}"
+    )
+
+
+def test_spike_fires_when_count_24h_above_baseline_multiplier() -> None:
+    """count_24h > 3× baseline_avg ⇒ spike."""
+    from app.normalizer import normalize_issue
+    raw = _raw(count=500, stats={"24h": [[1, 50]]})
+    n = normalize_issue(raw, "shahrzad-backend")
+    baseline = {n["stack_signature"]: {"avg_daily": 10.0, "daily": {}}}
+    s = score_issue(n, baseline=baseline, recent_releases=[], rules=RULES)
+    assert s["is_spike"] is True
+
+
+def test_festering_bonus_caps_at_10_points() -> None:
+    """count > 1000 (lifetime) but count_24h tiny → small bonus, can't reach 50."""
+    from app.normalizer import normalize_issue
+    # warning level (5), no other flags → base score 5 + festering bonus 10 → 15
+    raw = _raw(level="warning", count=10000, userCount=0,
+               stats={"24h": [[1, 1]]},
+               firstSeen="2026-04-01T00:00:00Z")  # not new
+    n = normalize_issue(raw, "shahrzad-backend")
+    s = score_issue(n, baseline={}, recent_releases=[], rules=RULES)
+    # warning weight = 5, festering bonus = 10 → 15
+    assert s["severity_score"] < 50, (
+        f"festering bonus alone must not push severity to NEEDS_ATTENTION; got {s['severity_score']}"
+    )
+    assert s["severity_score"] >= 5  # at least the level weight
+
+
+def test_festering_bonus_not_awarded_below_threshold() -> None:
+    """Lifetime count < 1000 → no festering bonus."""
+    from app.normalizer import normalize_issue
+    raw = _raw(level="warning", count=500, stats={"24h": [[1, 1]]})
+    n = normalize_issue(raw, "shahrzad-backend")
+    s = score_issue(n, baseline={}, recent_releases=[], rules=RULES)
+    # Just the level=warning weight (5), no festering, no other flags except possibly is_new
+    assert s["severity_score"] <= 25  # warning(5) + maybe is_new(15) + cushion

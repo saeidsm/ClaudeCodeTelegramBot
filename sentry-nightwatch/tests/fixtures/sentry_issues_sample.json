@@ -13,13 +13,127 @@
       "lastSeen": "2026-04-24T18:45:10Z",
       "culprit": "app.db.session in get_session",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5001/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "DatabaseError", "value": "connection pool exhausted"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "DatabaseError",
+        "value": "connection pool exhausted"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/api/story/create"}
-      ]
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/api/story/create"
+        }
+      ],
+      "stats": {
+        "24h": [
+          [
+            0,
+            16
+          ],
+          [
+            1,
+            16
+          ],
+          [
+            2,
+            16
+          ],
+          [
+            3,
+            16
+          ],
+          [
+            4,
+            16
+          ],
+          [
+            5,
+            16
+          ],
+          [
+            6,
+            16
+          ],
+          [
+            7,
+            16
+          ],
+          [
+            8,
+            16
+          ],
+          [
+            9,
+            16
+          ],
+          [
+            10,
+            16
+          ],
+          [
+            11,
+            16
+          ],
+          [
+            12,
+            16
+          ],
+          [
+            13,
+            16
+          ],
+          [
+            14,
+            16
+          ],
+          [
+            15,
+            16
+          ],
+          [
+            16,
+            16
+          ],
+          [
+            17,
+            16
+          ],
+          [
+            18,
+            16
+          ],
+          [
+            19,
+            16
+          ],
+          [
+            20,
+            15
+          ],
+          [
+            21,
+            15
+          ],
+          [
+            22,
+            15
+          ],
+          [
+            23,
+            15
+          ]
+        ]
+      }
     },
     {
       "id": "5002",
@@ -34,13 +148,127 @@
       "lastSeen": "2026-04-24T17:50:00Z",
       "culprit": "app.services.story.generate",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5002/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "OpenAIRateLimitError", "value": "429 too many requests"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "OpenAIRateLimitError",
+        "value": "429 too many requests"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/api/story/create"}
-      ]
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/api/story/create"
+        }
+      ],
+      "stats": {
+        "24h": [
+          [
+            0,
+            4
+          ],
+          [
+            1,
+            4
+          ],
+          [
+            2,
+            4
+          ],
+          [
+            3,
+            4
+          ],
+          [
+            4,
+            4
+          ],
+          [
+            5,
+            4
+          ],
+          [
+            6,
+            3
+          ],
+          [
+            7,
+            3
+          ],
+          [
+            8,
+            3
+          ],
+          [
+            9,
+            3
+          ],
+          [
+            10,
+            3
+          ],
+          [
+            11,
+            3
+          ],
+          [
+            12,
+            3
+          ],
+          [
+            13,
+            3
+          ],
+          [
+            14,
+            3
+          ],
+          [
+            15,
+            3
+          ],
+          [
+            16,
+            3
+          ],
+          [
+            17,
+            3
+          ],
+          [
+            18,
+            3
+          ],
+          [
+            19,
+            3
+          ],
+          [
+            20,
+            3
+          ],
+          [
+            21,
+            3
+          ],
+          [
+            22,
+            3
+          ],
+          [
+            23,
+            3
+          ]
+        ]
+      }
     },
     {
       "id": "5003",
@@ -55,11 +283,22 @@
       "lastSeen": "2026-04-24T15:30:00Z",
       "culprit": "app.routers.profile",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5003/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "ValidationError", "value": "required field child_age missing"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "ValidationError",
+        "value": "required field child_age missing"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.6"},
-        {"key": "environment", "value": "production"}
+        {
+          "key": "release",
+          "value": "backend@1.4.6"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        }
       ]
     },
     {
@@ -75,13 +314,127 @@
       "lastSeen": "2026-04-24T19:01:00Z",
       "culprit": "app.payments.stripe_handler",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5004/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "StripeError", "value": "card_declined for cus_NeFG1RhZdkc4Yz"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "StripeError",
+        "value": "card_declined for cus_NeFG1RhZdkc4Yz"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/api/payment/charge"}
-      ]
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/api/payment/charge"
+        }
+      ],
+      "stats": {
+        "24h": [
+          [
+            0,
+            0
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            2,
+            0
+          ],
+          [
+            3,
+            0
+          ],
+          [
+            4,
+            0
+          ],
+          [
+            5,
+            0
+          ],
+          [
+            6,
+            0
+          ],
+          [
+            7,
+            0
+          ],
+          [
+            8,
+            0
+          ],
+          [
+            9,
+            0
+          ],
+          [
+            10,
+            0
+          ],
+          [
+            11,
+            0
+          ],
+          [
+            12,
+            0
+          ],
+          [
+            13,
+            0
+          ],
+          [
+            14,
+            0
+          ],
+          [
+            15,
+            0
+          ],
+          [
+            16,
+            0
+          ],
+          [
+            17,
+            0
+          ],
+          [
+            18,
+            0
+          ],
+          [
+            19,
+            0
+          ],
+          [
+            20,
+            0
+          ],
+          [
+            21,
+            0
+          ],
+          [
+            22,
+            0
+          ],
+          [
+            23,
+            0
+          ]
+        ]
+      }
     },
     {
       "id": "5005",
@@ -96,12 +449,26 @@
       "lastSeen": "2026-04-24T01:30:00Z",
       "culprit": "app.services.story.build_prompt",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5005/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "AssertionError", "value": "prompt template empty"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "AssertionError",
+        "value": "prompt template empty"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/api/story/create"}
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/api/story/create"
+        }
       ]
     },
     {
@@ -111,7 +478,9 @@
       "level": "error",
       "status": "unresolved",
       "isRegression": true,
-      "statusDetails": {"inRelease": "backend@1.4.7"},
+      "statusDetails": {
+        "inRelease": "backend@1.4.7"
+      },
       "platform": "python",
       "count": "33",
       "userCount": 29,
@@ -119,11 +488,22 @@
       "lastSeen": "2026-04-24T18:00:00Z",
       "culprit": "app.middleware.auth",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5006/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "JWTError", "value": "expired retry loop"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "JWTError",
+        "value": "expired retry loop"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"}
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        }
       ]
     },
     {
@@ -139,9 +519,19 @@
       "lastSeen": "2026-04-24T10:00:00Z",
       "culprit": "app.routers.legacy",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5007/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "DeprecationWarning", "value": "legacy endpoint hit"},
-      "tags": [{"key": "release", "value": "backend@1.4.6"}]
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "DeprecationWarning",
+        "value": "legacy endpoint hit"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "backend@1.4.6"
+        }
+      ]
     },
     {
       "id": "5008",
@@ -156,11 +546,22 @@
       "lastSeen": "2026-04-24T19:00:00Z",
       "culprit": "app.services.tts.synth",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5008/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "TimeoutError", "value": "upstream tts service"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "TimeoutError",
+        "value": "upstream tts service"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.6"},
-        {"key": "environment", "value": "production"}
+        {
+          "key": "release",
+          "value": "backend@1.4.6"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        }
       ]
     },
     {
@@ -176,11 +577,22 @@
       "lastSeen": "2026-04-24T17:30:00Z",
       "culprit": "app.storage.s3_uploader",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5009/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "S3Error", "value": "signature mismatch"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "S3Error",
+        "value": "signature mismatch"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"}
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        }
       ]
     },
     {
@@ -196,9 +608,19 @@
       "lastSeen": "2026-04-24T09:00:00Z",
       "culprit": "app.services.notify.email",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5010/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "EmailDeliveryError", "value": "smtp temp failure"},
-      "tags": [{"key": "release", "value": "backend@1.4.6"}]
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "EmailDeliveryError",
+        "value": "smtp temp failure"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "backend@1.4.6"
+        }
+      ]
     },
     {
       "id": "5011",
@@ -213,12 +635,26 @@
       "lastSeen": "2026-04-24T18:00:00Z",
       "culprit": "app.services.story.illustrate",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5011/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "KeyError", "value": "illustration_style"},
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "KeyError",
+        "value": "illustration_style"
+      },
       "tags": [
-        {"key": "release", "value": "backend@1.4.7"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/api/story/create"}
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/api/story/create"
+        }
       ]
     },
     {
@@ -234,9 +670,19 @@
       "lastSeen": "2026-04-24T14:00:00Z",
       "culprit": "app.cache.redis_pool",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5012/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "RedisConnectionError", "value": "max retries"},
-      "tags": [{"key": "release", "value": "backend@1.4.7"}]
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "RedisConnectionError",
+        "value": "max retries"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        }
+      ]
     },
     {
       "id": "5013",
@@ -251,9 +697,19 @@
       "lastSeen": "2026-04-24T16:00:00Z",
       "culprit": "app.metrics.word_counter",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5013/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "ZeroDivisionError", "value": "word counter"},
-      "tags": [{"key": "release", "value": "backend@1.4.6"}]
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "ZeroDivisionError",
+        "value": "word counter"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "backend@1.4.6"
+        }
+      ]
     },
     {
       "id": "5014",
@@ -268,9 +724,19 @@
       "lastSeen": "2026-04-24T17:00:00Z",
       "culprit": "app.storage.local_cache",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/5014/",
-      "project": {"slug": "shahrzad-backend"},
-      "metadata": {"type": "PermissionError", "value": "/tmp/illustrations"},
-      "tags": [{"key": "release", "value": "backend@1.4.7"}]
+      "project": {
+        "slug": "shahrzad-backend"
+      },
+      "metadata": {
+        "type": "PermissionError",
+        "value": "/tmp/illustrations"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "backend@1.4.7"
+        }
+      ]
     }
   ],
   "shahrzad-frontend": [
@@ -287,13 +753,127 @@
       "lastSeen": "2026-04-24T18:50:00Z",
       "culprit": "/story/[id] in StoryReader",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6001/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "TypeError", "value": "Cannot read properties of undefined"},
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "TypeError",
+        "value": "Cannot read properties of undefined"
+      },
       "tags": [
-        {"key": "release", "value": "frontend@2.0.3"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/story/abc"}
-      ]
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/story/abc"
+        }
+      ],
+      "stats": {
+        "24h": [
+          [
+            0,
+            9
+          ],
+          [
+            1,
+            9
+          ],
+          [
+            2,
+            9
+          ],
+          [
+            3,
+            9
+          ],
+          [
+            4,
+            9
+          ],
+          [
+            5,
+            9
+          ],
+          [
+            6,
+            9
+          ],
+          [
+            7,
+            9
+          ],
+          [
+            8,
+            8
+          ],
+          [
+            9,
+            8
+          ],
+          [
+            10,
+            8
+          ],
+          [
+            11,
+            8
+          ],
+          [
+            12,
+            8
+          ],
+          [
+            13,
+            8
+          ],
+          [
+            14,
+            8
+          ],
+          [
+            15,
+            8
+          ],
+          [
+            16,
+            8
+          ],
+          [
+            17,
+            8
+          ],
+          [
+            18,
+            8
+          ],
+          [
+            19,
+            8
+          ],
+          [
+            20,
+            8
+          ],
+          [
+            21,
+            8
+          ],
+          [
+            22,
+            8
+          ],
+          [
+            23,
+            8
+          ]
+        ]
+      }
     },
     {
       "id": "6002",
@@ -308,12 +888,26 @@
       "lastSeen": "2026-04-24T18:55:00Z",
       "culprit": "lib/api/story.ts in createStory",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6002/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "FetchError", "value": "504 from /api/story/create"},
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "FetchError",
+        "value": "504 from /api/story/create"
+      },
       "tags": [
-        {"key": "release", "value": "frontend@2.0.3"},
-        {"key": "environment", "value": "production"},
-        {"key": "url", "value": "/api/story/create"}
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        },
+        {
+          "key": "url",
+          "value": "/api/story/create"
+        }
       ]
     },
     {
@@ -329,9 +923,19 @@
       "lastSeen": "2026-04-24T18:00:00Z",
       "culprit": "components/Footer in Footer",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6003/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "HydrationError", "value": "text content mismatch"},
-      "tags": [{"key": "release", "value": "frontend@2.0.2"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "HydrationError",
+        "value": "text content mismatch"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.2"
+        }
+      ]
     },
     {
       "id": "6004",
@@ -346,11 +950,22 @@
       "lastSeen": "2026-04-24T18:00:00Z",
       "culprit": "next/dynamic in PaymentForm",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6004/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "ChunkLoadError", "value": "dynamic import"},
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "ChunkLoadError",
+        "value": "dynamic import"
+      },
       "tags": [
-        {"key": "release", "value": "frontend@2.0.3"},
-        {"key": "url", "value": "/checkout"}
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        },
+        {
+          "key": "url",
+          "value": "/checkout"
+        }
       ]
     },
     {
@@ -366,12 +981,123 @@
       "lastSeen": "2026-04-24T16:00:00Z",
       "culprit": "lib/i18n/rtl in switchDirection",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6005/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "TypeError", "value": "undefined is not a function"},
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "TypeError",
+        "value": "undefined is not a function"
+      },
       "tags": [
-        {"key": "release", "value": "frontend@2.0.3"},
-        {"key": "environment", "value": "production"}
-      ]
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        },
+        {
+          "key": "environment",
+          "value": "production"
+        }
+      ],
+      "stats": {
+        "24h": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            2,
+            0
+          ],
+          [
+            3,
+            0
+          ],
+          [
+            4,
+            0
+          ],
+          [
+            5,
+            0
+          ],
+          [
+            6,
+            0
+          ],
+          [
+            7,
+            0
+          ],
+          [
+            8,
+            0
+          ],
+          [
+            9,
+            0
+          ],
+          [
+            10,
+            0
+          ],
+          [
+            11,
+            0
+          ],
+          [
+            12,
+            0
+          ],
+          [
+            13,
+            0
+          ],
+          [
+            14,
+            0
+          ],
+          [
+            15,
+            0
+          ],
+          [
+            16,
+            0
+          ],
+          [
+            17,
+            0
+          ],
+          [
+            18,
+            0
+          ],
+          [
+            19,
+            0
+          ],
+          [
+            20,
+            0
+          ],
+          [
+            21,
+            0
+          ],
+          [
+            22,
+            0
+          ],
+          [
+            23,
+            0
+          ]
+        ]
+      }
     },
     {
       "id": "6006",
@@ -386,9 +1112,19 @@
       "lastSeen": "2026-04-24T17:00:00Z",
       "culprit": "lib/api/fetch.ts",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6006/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "SyntaxError", "value": "Unexpected token < in JSON"},
-      "tags": [{"key": "release", "value": "frontend@2.0.2"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "SyntaxError",
+        "value": "Unexpected token < in JSON"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.2"
+        }
+      ]
     },
     {
       "id": "6007",
@@ -403,9 +1139,19 @@
       "lastSeen": "2026-04-24T17:00:00Z",
       "culprit": "components/StoryReader/Illustration",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6007/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "ImageDecodeError", "value": "render illustration"},
-      "tags": [{"key": "release", "value": "frontend@2.0.3"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "ImageDecodeError",
+        "value": "render illustration"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        }
+      ]
     },
     {
       "id": "6008",
@@ -420,9 +1166,19 @@
       "lastSeen": "2026-04-24T18:00:00Z",
       "culprit": "lib/api/fetch.ts in abortable",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6008/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "AbortError", "value": "navigated away"},
-      "tags": [{"key": "release", "value": "frontend@2.0.2"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "AbortError",
+        "value": "navigated away"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.2"
+        }
+      ]
     },
     {
       "id": "6009",
@@ -437,9 +1193,19 @@
       "lastSeen": "2026-04-24T16:00:00Z",
       "culprit": "lib/analytics in trackEvent",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6009/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "ReferenceError", "value": "gtag not defined"},
-      "tags": [{"key": "release", "value": "frontend@2.0.3"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "ReferenceError",
+        "value": "gtag not defined"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        }
+      ]
     },
     {
       "id": "6010",
@@ -454,9 +1220,19 @@
       "lastSeen": "2026-04-24T18:00:00Z",
       "culprit": "lib/api/fetch.ts",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6010/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "NetworkError", "value": "fetch failed"},
-      "tags": [{"key": "release", "value": "frontend@2.0.3"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "NetworkError",
+        "value": "fetch failed"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        }
+      ]
     },
     {
       "id": "6011",
@@ -471,9 +1247,19 @@
       "lastSeen": "2026-04-24T13:00:00Z",
       "culprit": "components/Pagination",
       "permalink": "https://sentry.io/organizations/shahrzad/issues/6011/",
-      "project": {"slug": "shahrzad-frontend"},
-      "metadata": {"type": "RangeError", "value": "invalid array length"},
-      "tags": [{"key": "release", "value": "frontend@2.0.3"}]
+      "project": {
+        "slug": "shahrzad-frontend"
+      },
+      "metadata": {
+        "type": "RangeError",
+        "value": "invalid array length"
+      },
+      "tags": [
+        {
+          "key": "release",
+          "value": "frontend@2.0.3"
+        }
+      ]
     }
   ],
   "_releases": {
@@ -481,24 +1267,40 @@
       {
         "version": "backend@1.4.7",
         "dateCreated": "2026-04-24T01:00:00Z",
-        "projects": [{"slug": "shahrzad-backend"}]
+        "projects": [
+          {
+            "slug": "shahrzad-backend"
+          }
+        ]
       },
       {
         "version": "backend@1.4.6",
         "dateCreated": "2026-04-20T10:00:00Z",
-        "projects": [{"slug": "shahrzad-backend"}]
+        "projects": [
+          {
+            "slug": "shahrzad-backend"
+          }
+        ]
       }
     ],
     "shahrzad-frontend": [
       {
         "version": "frontend@2.0.3",
         "dateCreated": "2026-04-24T01:05:00Z",
-        "projects": [{"slug": "shahrzad-frontend"}]
+        "projects": [
+          {
+            "slug": "shahrzad-frontend"
+          }
+        ]
       },
       {
         "version": "frontend@2.0.2",
         "dateCreated": "2026-04-19T09:00:00Z",
-        "projects": [{"slug": "shahrzad-frontend"}]
+        "projects": [
+          {
+            "slug": "shahrzad-frontend"
+          }
+        ]
       }
     ]
   }

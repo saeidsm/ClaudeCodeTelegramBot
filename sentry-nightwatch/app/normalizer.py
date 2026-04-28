@@ -22,7 +22,10 @@ class NormalizedIssue(TypedDict):
     project_slug: str
     title: str
     level: str
-    count: int
+    count: int                  # lifetime event count from Sentry
+    # 2026-04-28 verdict-delta: events in last 24h. None when stats fetch
+    # failed or was skipped (cap at top-N by lifetime).
+    count_24h: int | None
     user_count: int
     first_seen: str  # ISO 8601
     last_seen: str
@@ -66,6 +69,34 @@ def _to_int(v: Any, default: int = 0) -> int:
         return int(v) if v is not None else default
     except (ValueError, TypeError):
         return default
+
+
+def _extract_count_24h(raw_issue: dict) -> int | None:
+    """Sum the per-bucket event counts in `stats["24h"]`.
+
+    Returns None when stats are absent (top-N cap skipped this issue) or
+    `None` (stats fetch failed). Returns 0 when stats are present but
+    every bucket is empty (the user really had zero 24h events).
+    Malformed buckets coerce to 0 individually rather than raising.
+    """
+    stats = raw_issue.get("stats")
+    if stats is None:
+        return None  # not fetched OR fetch failed
+    if not isinstance(stats, dict):
+        return None
+    buckets = stats.get("24h")
+    if not isinstance(buckets, list):
+        return None
+    total = 0
+    for entry in buckets:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        v = entry[1]
+        try:
+            total += int(v) if v is not None else 0
+        except (ValueError, TypeError):
+            continue
+    return total
 
 
 def _tag_value(raw_issue: dict, key: str) -> str | None:
@@ -156,6 +187,7 @@ def normalize_issue(
         title=raw_issue.get("title", "") or "",
         level=raw_issue.get("level", "error") or "error",
         count=_to_int(raw_issue.get("count")),
+        count_24h=_extract_count_24h(raw_issue),
         user_count=_to_int(raw_issue.get("userCount")),
         first_seen=raw_issue.get("firstSeen", "") or "",
         last_seen=raw_issue.get("lastSeen", "") or "",

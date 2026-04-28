@@ -47,12 +47,16 @@ class ScoringWeights(BaseModel):
     is_release_correlated: int
     is_user_impacting: int
     cross_project_member: int
+    # 2026-04-28 verdict-delta fix: see rules.yml comment.
+    cumulative_festering_bonus_max: int = 10
 
 
 class ScoringThresholds(BaseModel):
     user_impacting_min_users: int
     spike_baseline_multiplier: float
     cluster_time_window_minutes: int
+    # Lifetime threshold for festering bonus eligibility.
+    festering_bonus_min_lifetime: int = 1000
 
 
 class ScoringConfig(BaseModel):
@@ -60,14 +64,32 @@ class ScoringConfig(BaseModel):
     thresholds: ScoringThresholds
 
 
+class VerdictConfig(BaseModel):
+    """Verdict thresholds — see compute_verdict in publisher.py.
+
+    Read-but-not-yet-wired: compute_verdict still hard-codes equivalent
+    constants. This config block exists for documentation and to allow
+    future tuning without code changes.
+    """
+
+    critical_new_error_24h: int = 50
+    critical_regression_24h: int = 20
+    critical_fatal_24h: int = 1
+    attention_total_24h: int = 50
+    attention_severity_score_min: int = 50
+
+
 class RateLimits(BaseModel):
     sentry_max_req_per_min: int
     sentry_max_event_fetches_per_run: int
+    # 2026-04-28: cap on per-issue stats fetches per run (free Sentry plan).
+    sentry_max_stats_fetches_per_run: int = 30
 
 
 class RulesConfig(BaseModel):
     scoring: ScoringConfig
     rate_limits: RateLimits
+    verdict: VerdictConfig = Field(default_factory=VerdictConfig)
 
 
 class EnvConfig(BaseModel):

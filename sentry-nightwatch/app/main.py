@@ -162,6 +162,37 @@ def _collect_live(
         if ev:
             evidence[str(raw.get("id", ""))] = ev
             fetched += 1
+
+    # 2026-04-28 verdict-delta: per-issue 24h stats fetch.
+    # One extra HTTP request per issue → cap at top-N by lifetime count.
+    # Issues outside the cap get count_24h=0 (the verdict logic correctly
+    # treats them as "no triggers" without burning request budget on a
+    # near-certain "0 events" answer).
+    stats_cap = getattr(
+        cfg.rules.rate_limits, "sentry_max_stats_fetches_per_run", 30
+    )
+    fetched_stats = 0
+    for slug, raw in flat:  # already sorted by lifetime count desc
+        if fetched_stats >= stats_cap:
+            # Mark un-fetched as 0 (we know low-count issues have ~0 events
+            # in 24h; assigning explicit 0 lets the digest format pick the
+            # "cumulative" tag for festering issues vs. "?" for unknowns).
+            raw["stats"] = {"24h": []}
+            continue
+        issue_id = str(raw.get("id", ""))
+        if not issue_id:
+            continue
+        stats = collector.fetch_issue_stats(org, issue_id, stats_period="24h")
+        # None signals fetch failure — store None so normalizer sets
+        # count_24h=None (distinct from 0); verdict treats None as 0 but
+        # the "stats_unavailable" log line tells us coverage is incomplete.
+        raw["stats"] = stats
+        if stats is None:
+            structlog.get_logger("main").warning(
+                "collector.stats_unavailable", issue_id=issue_id
+            )
+        fetched_stats += 1
+
     return issues_by_project, releases_by_project, evidence
 
 

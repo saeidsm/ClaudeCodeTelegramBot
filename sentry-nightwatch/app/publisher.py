@@ -79,41 +79,70 @@ class PublishResult:
 # ──────────────────────────────────────────────────────────────────────────
 # Verdict thresholds (deterministic — no LLM)
 #
-# Phase-2B-fix2: rewritten as multi-signal logic to fix the false-negative
-# observed on 2026-04-26 (19 spikes + a 806-event runaway returned ALL CLEAR
-# under the old single-signal max_score test).
+# 2026-04-28 verdict-delta fix: completely rewritten to drive verdict
+# from count_24h (events in the last 24h window), NOT lifetime count.
 #
-# Tune values here without touching logic. Conditions (a..f) inside each
-# severity bucket are OR-ed; the first severity bucket whose ANY condition
-# matches wins (CRITICAL > NEEDS ATTENTION > ALL CLEAR).
+# Background:
+#   The previous Phase-2B-fix2 logic used lifetime count, which produced
+#   a false-positive on 2026-04-27: an issue with 817 lifetime events but
+#   ZERO events in the last 24h (cleared by hygiene the day before)
+#   raised CRITICAL via the volume-bomb check, leading us to chase a
+#   non-incident. The new logic ignores lifetime entirely for verdict
+#   purposes and lets festering issues stay quiet until they actually
+#   misbehave again.
+#
+# Mirror values are documented in configs/rules.yml under `verdict:`.
 # ──────────────────────────────────────────────────────────────────────────
 
 VERDICT_THRESHOLDS: dict[str, dict[str, int]] = {
     "critical": {
-        # a) any issue with level == "fatal"   (presence-based, no integer)
-        # b) any issue with count >= N           (volume bomb / runaway loop)
-        "count_volume_bomb": 500,
-        # c) any issue with severity_score >= N
-        "severity_score": 80,
-        # d) total spike-issues across snapshot >= N
-        "spike_count": 5,
-        # e) cluster of new + spike + cross-project (presence-based)
-        # f) any decision flagged is_critical=True (presence-based)
+        "new_error_24h": 50,        # is_new AND count_24h ≥ N
+        "regression_24h": 20,       # is_regression AND count_24h ≥ N
+        "fatal_24h": 1,             # level=fatal AND count_24h ≥ N
+        # is_spike (count_24h > 3× baseline) — flag-based, no count gate
     },
     "needs_attention": {
-        # a) any error-level issue with count >= N
-        "error_count": 50,
-        # b) any issue with severity_score >= N
-        "severity_score": 50,
-        # c) >= N spike-issues
-        "spike_count": 1,
-        # d) >= N regressions
-        "regression_count": 1,
-        # e) any decision present (presence-based)
-        # f) >= N new issues in 24h
-        "new_count": 5,
+        "total_24h": 50,            # any issue's count_24h ≥ N
+        "severity_score": 50,       # any post-rescore severity_score ≥ N
+        # any decision item — presence-based
     },
 }
+
+
+def _c24(s: dict) -> int:
+    """Coerce count_24h to int, treating None (stats fetch failed) as 0."""
+    v = s.get("count_24h")
+    if v is None:
+        return 0
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return 0
+
+
+# 2026-04-28 verdict-delta: lifetime threshold above which a quiet-in-24h
+# issue is labelled "cumulative" rather than "steady". Mirrors the
+# scoring.thresholds.festering_bonus_min_lifetime in rules.yml; duplicated
+# here as a constant so the digest formatter doesn't need a config plumb.
+_CUMULATIVE_LIFETIME_MIN = 100
+
+
+def _activity_tag(s: dict, c24_raw: Any, count: int) -> str:
+    """Return one of: spike / regression / new / cumulative / steady.
+
+    Picked in priority order so each issue gets exactly one tag. Used by
+    the digest's Top-3 section to give the reader an at-a-glance read on
+    why an issue is in the list.
+    """
+    if s.get("is_spike"):
+        return "spike"
+    if s.get("is_regression"):
+        return "regression"
+    if s.get("is_new"):
+        return "new"
+    if c24_raw == 0 and count >= _CUMULATIVE_LIFETIME_MIN:
+        return "cumulative"
+    return "steady"
 
 
 def _critical_reasons(
@@ -122,50 +151,57 @@ def _critical_reasons(
     *,
     clusters: list[dict] | None = None,
 ) -> list[str]:
-    """Return reasons matching CRITICAL conditions, in spec order (a..f)."""
+    """Return reasons matching CRITICAL conditions.
+
+    All thresholds reference count_24h (events in the last 24h window).
+    A festering high-lifetime issue with zero 24h activity raises NO
+    reasons here.
+    """
     reasons: list[str] = []
     crit = VERDICT_THRESHOLDS["critical"]
-    clusters = clusters or []
+    _ = clusters  # signature retained for back-compat; not used directly.
 
-    # a) fatal level
-    fatal_count = sum(1 for s in scored if (s.get("level") == "fatal"))
-    if fatal_count:
-        reasons.append(f"{fatal_count} fatal-level issue(s) present")
+    # is_new + count_24h ≥ critical_new_error_24h
+    new_thr = crit["new_error_24h"]
+    for s in scored:
+        c24 = _c24(s)
+        if s.get("is_new") and c24 >= new_thr:
+            title = (s.get("title") or "?")[:60]
+            reasons.append(
+                f"new error '{title}' has {c24} events in 24h (≥ {new_thr})"
+            )
+            break  # one is enough — verdict is binary, not cumulative
 
-    # b) volume bomb
-    bomb_threshold = crit["count_volume_bomb"]
-    bomb_top = max(
-        ((int(s.get("count") or 0), s.get("title") or "?") for s in scored),
-        default=(0, ""),
-    )
-    if bomb_top[0] >= bomb_threshold:
-        title_short = bomb_top[1][:60]
-        reasons.append(
-            f"Top issue '{title_short}' has {bomb_top[0]} events (≥ {bomb_threshold})"
-        )
+    # is_regression + count_24h ≥ critical_regression_24h
+    reg_thr = crit["regression_24h"]
+    for s in scored:
+        c24 = _c24(s)
+        if s.get("is_regression") and c24 >= reg_thr:
+            title = (s.get("title") or "?")[:60]
+            reasons.append(
+                f"regression '{title}' has {c24} events in 24h (≥ {reg_thr})"
+            )
+            break
 
-    # c) severity score
-    sev_threshold = crit["severity_score"]
-    max_score = max((int(s.get("severity_score") or 0) for s in scored), default=0)
-    if max_score >= sev_threshold:
-        reasons.append(f"Max severity_score = {max_score} (≥ {sev_threshold})")
+    # level=fatal + count_24h ≥ critical_fatal_24h
+    fat_thr = crit["fatal_24h"]
+    for s in scored:
+        c24 = _c24(s)
+        if s.get("level") == "fatal" and c24 >= fat_thr:
+            title = (s.get("title") or "?")[:60]
+            reasons.append(
+                f"fatal-level event in 24h: '{title}' (count_24h={c24} ≥ {fat_thr})"
+            )
+            break
 
-    # d) spike fan-out
-    spike_threshold = crit["spike_count"]
+    # is_spike — by definition (count_24h > 3× baseline) — no count gate
     spike_count = sum(1 for s in scored if s.get("is_spike"))
-    if spike_count >= spike_threshold:
+    if spike_count:
         reasons.append(
-            f"{spike_count} issues spiked vs baseline (≥ {spike_threshold} triggers CRITICAL)"
+            f"{spike_count} issue(s) spiked vs rolling baseline (count_24h > 3× avg)"
         )
 
-    # e) new + spike + cross-project cluster co-occurrence
-    has_new = any(s.get("is_new") for s in scored)
-    has_spike = any(s.get("is_spike") for s in scored)
-    has_cluster = bool(clusters)
-    if has_new and has_spike and has_cluster:
-        reasons.append("New + spike + cross-project cluster co-occur in this window")
-
-    # f) decisions explicitly marked critical
+    # decisions explicitly marked critical (preserved from Phase-2B-fix2)
     crit_decisions = sum(1 for d in decisions if bool(d.get("is_critical")))
     if crit_decisions:
         reasons.append(f"{crit_decisions} decision(s) flagged is_critical=true")
@@ -177,48 +213,31 @@ def _attention_reasons(
     scored: list[dict],
     decisions: list[dict],
 ) -> list[str]:
-    """Return reasons matching NEEDS ATTENTION conditions, in spec order (a..f)."""
+    """Return reasons matching NEEDS ATTENTION conditions.
+
+    Driven entirely by 24h activity, severity score, or decision items.
+    """
     reasons: list[str] = []
     th = VERDICT_THRESHOLDS["needs_attention"]
 
-    # a) error-level + count
-    err_thr = th["error_count"]
-    err_hits = [
-        s for s in scored
-        if s.get("level") == "error" and int(s.get("count") or 0) >= err_thr
-    ]
-    if err_hits:
+    # any issue with count_24h ≥ attention_total_24h
+    tot_thr = th["total_24h"]
+    noisy = [s for s in scored if _c24(s) >= tot_thr]
+    if noisy:
+        worst_24h = max(_c24(s) for s in noisy)
         reasons.append(
-            f"{len(err_hits)} error-level issue(s) with count ≥ {err_thr}"
+            f"{len(noisy)} issue(s) with count_24h ≥ {tot_thr} (max: {worst_24h})"
         )
 
-    # b) severity score
+    # any post-rescore severity_score ≥ attention_severity_score_min
     sev_thr = th["severity_score"]
     max_score = max((int(s.get("severity_score") or 0) for s in scored), default=0)
     if max_score >= sev_thr:
         reasons.append(f"Max severity_score = {max_score} (≥ {sev_thr})")
 
-    # c) any spikes
-    spike_thr = th["spike_count"]
-    spike_count = sum(1 for s in scored if s.get("is_spike"))
-    if spike_count >= spike_thr:
-        reasons.append(f"{spike_count} spike-issue(s) (≥ {spike_thr})")
-
-    # d) regressions
-    reg_thr = th["regression_count"]
-    reg_count = sum(1 for s in scored if s.get("is_regression"))
-    if reg_count >= reg_thr:
-        reasons.append(f"{reg_count} regression(s) (≥ {reg_thr})")
-
-    # e) decisions
+    # any decision item present
     if decisions:
         reasons.append(f"{len(decisions)} decision item(s) surfaced")
-
-    # f) new in 24h
-    new_thr = th["new_count"]
-    new_count = sum(1 for s in scored if s.get("is_new"))
-    if new_count >= new_thr:
-        reasons.append(f"{new_count} new issue(s) in 24h (≥ {new_thr})")
 
     return reasons
 
@@ -347,22 +366,22 @@ def render_digest_html(
             title = _esc(s.get("title") or "(no title)")
             slug = _esc(s.get("project_slug") or "?")
             count = int(s.get("count") or 0)
+            c24_raw = s.get("count_24h")
+            c24 = _c24(s)  # None → 0 for display
             users = int(s.get("user_count") or 0)
-            flags = []
-            if s.get("is_new"):
-                flags.append("new")
-            if s.get("is_regression"):
-                flags.append("regression")
-            if s.get("is_spike"):
-                flags.append("spike")
-            if s.get("is_release_correlated"):
-                flags.append("release")
-            extra = []
-            extra.append(f"{count}×")
+            # 2026-04-28 verdict-delta: explicit "X in 24h · Y lifetime" format
+            # so the human reader can immediately see the "festering" case
+            # (24h=0 with high lifetime) and not assume a CRITICAL incident.
+            extra: list[str] = []
+            if c24_raw is None:
+                extra.append(f"? in 24h · {count} lifetime")
+            else:
+                extra.append(f"{c24} in 24h · {count} lifetime")
             if users:
                 extra.append(f"{users} users")
-            if flags:
-                extra.append(", ".join(flags))
+            # Tag in spec order: spike > regression > new > cumulative > steady
+            tag = _activity_tag(s, c24_raw, count)
+            extra.append(tag)
             lines.append(f"  {i}. <b>{title}</b> · {slug} · {' · '.join(extra)}")
         lines.append("")
 
