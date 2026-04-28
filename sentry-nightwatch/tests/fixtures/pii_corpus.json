@@ -1,0 +1,258 @@
+[
+  {
+    "id": 1,
+    "category": "email",
+    "input": "User reported error: contact admin@shahrzad.ai for help",
+    "must_not_appear_in_output": "admin@shahrzad.ai",
+    "secret": true,
+    "description": "Plain email in error message"
+  },
+  {
+    "id": 2,
+    "category": "email",
+    "input": "url: https://api.example.com/notify?email=user.name+tag@example.co.uk&id=42",
+    "must_not_appear_in_output": "user.name+tag@example.co.uk",
+    "secret": true,
+    "description": "Email inside URL query string"
+  },
+  {
+    "id": 3,
+    "category": "email",
+    "input": "Failed sending to alice@xn--mxa.gr (IDN domain)",
+    "must_not_appear_in_output": "alice@xn--mxa.gr",
+    "secret": true,
+    "description": "Email with IDN punycode domain"
+  },
+  {
+    "id": 4,
+    "category": "phone_iran",
+    "input": "Verification SMS sent to +989121234567",
+    "must_not_appear_in_output": "989121234567",
+    "secret": true,
+    "description": "Iranian phone, international +98"
+  },
+  {
+    "id": 5,
+    "category": "phone_iran",
+    "input": "Phone on file: 00989351112233",
+    "must_not_appear_in_output": "00989351112233",
+    "secret": true,
+    "description": "Iranian phone with 0098 prefix"
+  },
+  {
+    "id": 6,
+    "category": "phone_iran",
+    "input": "Customer mobile: 09121234567",
+    "must_not_appear_in_output": "09121234567",
+    "secret": true,
+    "description": "Iranian phone domestic 09xx format"
+  },
+  {
+    "id": 7,
+    "category": "phone_iran",
+    "input": "Reach me at 0912 123 4567 evenings",
+    "must_not_appear_in_output": "0912 123 4567",
+    "secret": true,
+    "description": "Iranian phone with spaces"
+  },
+  {
+    "id": 8,
+    "category": "phone_intl",
+    "input": "US contact: +1 (415) 555-0123",
+    "must_not_appear_in_output": "415) 555-0123",
+    "secret": true,
+    "description": "US international phone"
+  },
+  {
+    "id": 9,
+    "category": "jwt",
+    "input": "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    "must_not_appear_in_output": "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",
+    "secret": true,
+    "description": "JWT in Authorization header context"
+  },
+  {
+    "id": 10,
+    "category": "jwt",
+    "input": "frame variable token = 'eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL3NoYXJ6YWQuYWkifQ.AbCdEf1234567890XyZ_long-signature-here_qwerty'",
+    "must_not_appear_in_output": "eyJpc3MiOiJodHRwczovL3NoYXJ6YWQuYWkifQ",
+    "secret": true,
+    "description": "JWT inside stack frame variable string"
+  },
+  {
+    "id": 11,
+    "category": "auth_header",
+    "input": "{\"Authorization\": \"Basic YWxhZGRpbjpvcGVuc2VzYW1l\"}",
+    "must_not_appear_in_output": "YWxhZGRpbjpvcGVuc2VzYW1l",
+    "secret": true,
+    "description": "Authorization header value"
+  },
+  {
+    "id": 12,
+    "category": "auth_header",
+    "input": "headers={'authorization': 'Bearer ghp_abcdEfGhIjKlMnOpQrStUvWxYz1234567890'}",
+    "must_not_appear_in_output": "ghp_abcdEfGhIjKlMnOpQrStUvWxYz1234567890",
+    "secret": true,
+    "description": "Lowercase authorization key with bearer token"
+  },
+  {
+    "id": 13,
+    "category": "cookie",
+    "input": "Cookie: session=abc123secret; csrf=xyzPRIVATE",
+    "must_not_appear_in_output": "abc123secret",
+    "secret": true,
+    "description": "Cookie header value"
+  },
+  {
+    "id": 14,
+    "category": "cookie",
+    "input": "{\"Set-Cookie\": \"sid=verysecretvalue42; HttpOnly\"}",
+    "must_not_appear_in_output": "verysecretvalue42",
+    "secret": true,
+    "description": "Set-Cookie header value"
+  },
+  {
+    "id": 15,
+    "category": "stripe",
+    "input": "Stripe customer cus_NeFG1RhZdkc4Yz failed charge",
+    "must_not_appear_in_output": "cus_NeFG1RhZdkc4Yz",
+    "secret": true,
+    "description": "Stripe customer ID in error"
+  },
+  {
+    "id": 16,
+    "category": "stripe",
+    "input": "PaymentIntent pi_3OabcdEFG12HIJ34kl confirmed but webhook failed",
+    "must_not_appear_in_output": "pi_3OabcdEFG12HIJ34kl",
+    "secret": true,
+    "description": "Stripe payment intent ID"
+  },
+  {
+    "id": 17,
+    "category": "stripe",
+    "input": "Subscription sub_1OabcXYZdef456 has invalid plan",
+    "must_not_appear_in_output": "sub_1OabcXYZdef456",
+    "secret": true,
+    "description": "Stripe subscription ID"
+  },
+  {
+    "id": 18,
+    "category": "stripe",
+    "input": "Charge ch_3OcdeFGH123IJ45kl declined: card_declined",
+    "must_not_appear_in_output": "ch_3OcdeFGH123IJ45kl",
+    "secret": true,
+    "description": "Stripe charge ID"
+  },
+  {
+    "id": 19,
+    "category": "stripe_key",
+    "input": "config error: stripe_key=__FAKE_STRIPE_LIVE_KEY__ leaked",
+    "must_not_appear_in_output": "__FAKE_STRIPE_LIVE_KEY__",
+    "secret": true,
+    "description": "Stripe live secret key"
+  },
+  {
+    "id": 20,
+    "category": "stripe_key",
+    "input": "publishable key pk_test_51OabcDeFGhIjKlMnOpQ in code",
+    "must_not_appear_in_output": "pk_test_51OabcDeFGhIjKlMnOpQ",
+    "secret": true,
+    "description": "Stripe test publishable key"
+  },
+  {
+    "id": 21,
+    "category": "aws_signature",
+    "input": "https://s3.amazonaws.com/bucket/key.jpg?X-Amz-Signature=abc123def456SECRETSIGNATURE789xyz&X-Amz-Date=20260424T120000Z",
+    "must_not_appear_in_output": "abc123def456SECRETSIGNATURE789xyz",
+    "secret": true,
+    "description": "AWS pre-signed URL signature"
+  },
+  {
+    "id": 22,
+    "category": "ipv4_public",
+    "input": "Connection from 138.197.76.197 timed out",
+    "must_not_appear_in_output": "138.197.76.197",
+    "secret": true,
+    "description": "Public IPv4 address"
+  },
+  {
+    "id": 23,
+    "category": "ipv4_public",
+    "input": "Refused proxy from 8.8.8.8 (rate limit)",
+    "must_not_appear_in_output": "8.8.8.8",
+    "secret": true,
+    "description": "Public IPv4, well-known"
+  },
+  {
+    "id": 24,
+    "category": "ipv4_private_ok",
+    "input": "Internal call to 10.0.0.42 succeeded",
+    "must_not_appear_in_output": "__PRIVATE_KEPT__",
+    "secret": false,
+    "description": "Private IPv4 must be KEPT (10.x range)"
+  },
+  {
+    "id": 25,
+    "category": "ipv4_private_ok",
+    "input": "DB host 192.168.1.10 reachable",
+    "must_not_appear_in_output": "__PRIVATE_KEPT__",
+    "secret": false,
+    "description": "Private IPv4 must be KEPT (192.168 range)"
+  },
+  {
+    "id": 26,
+    "category": "ipv6_public",
+    "input": "Origin 2001:4860:4860::8888 caused error",
+    "must_not_appear_in_output": "2001:4860:4860::8888",
+    "secret": true,
+    "description": "Public IPv6 address"
+  },
+  {
+    "id": 27,
+    "category": "iran_national_id",
+    "input": "Verification failed for national ID 0012345679",
+    "must_not_appear_in_output": "0012345679",
+    "secret": true,
+    "description": "Valid Iranian national ID (passes checksum)"
+  },
+  {
+    "id": 28,
+    "category": "user_uuid",
+    "input": "GET /api/users/3fa85f64-5717-4562-b3fc-2c963f66afa6/profile failed",
+    "must_not_appear_in_output": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "secret": true,
+    "description": "User UUID in URL — must be hash-truncated"
+  },
+  {
+    "id": 29,
+    "category": "session_id",
+    "input": "session_id=8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e cleared",
+    "must_not_appear_in_output": "8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e",
+    "secret": true,
+    "description": "Session ID hex string — must be hash-truncated"
+  },
+  {
+    "id": 30,
+    "category": "whitelist_keep",
+    "input": "Test fixture user Nikrouz logged in via 3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "must_not_appear_in_output": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "secret": true,
+    "description": "Whitelist name (Nikrouz) kept; UUID still hashed"
+  },
+  {
+    "id": 31,
+    "category": "whitelist_keep",
+    "input": "Order created for samyar (test fixture)",
+    "must_not_appear_in_output": "__SAMYAR_KEPT__",
+    "secret": false,
+    "description": "Whitelist name samyar must be kept"
+  },
+  {
+    "id": 32,
+    "category": "stripe_in_msg",
+    "input": "ValueError: Customer cus_PaymentFailedABC1234 has no default source",
+    "must_not_appear_in_output": "cus_PaymentFailedABC1234",
+    "secret": true,
+    "description": "Stripe ID embedded in error message text"
+  }
+]

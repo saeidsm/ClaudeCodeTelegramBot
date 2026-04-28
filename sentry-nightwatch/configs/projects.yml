@@ -1,0 +1,18 @@
+organization: shahrzad        # placeholder; user will set actual slug
+projects:
+  - slug: shahrzad-backend
+    kind: backend
+    git_path: /opt/repos/ZigguratKids4
+    environment: production
+  - slug: shahrzad-frontend
+    kind: frontend
+    git_path: /opt/repos/ZigguratKids4
+    environment: production
+
+test_fixtures_whitelist:      # never redact these names
+  - nikrouz
+  - samyar
+  - gandom
+  - mamiga
+  - baba saeid
+  - jetpeyma

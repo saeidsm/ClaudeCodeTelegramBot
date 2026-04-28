@@ -1,0 +1,19 @@
+scoring:
+  weights:
+    level_fatal: 40
+    level_error: 20
+    level_warning: 5
+    is_new: 15
+    is_regression: 25
+    is_spike: 20
+    is_release_correlated: 10
+    is_user_impacting: 15
+    cross_project_member: 10
+  thresholds:
+    user_impacting_min_users: 5
+    spike_baseline_multiplier: 3.0
+    cluster_time_window_minutes: 5
+
+rate_limits:
+  sentry_max_req_per_min: 30
+  sentry_max_event_fetches_per_run: 20

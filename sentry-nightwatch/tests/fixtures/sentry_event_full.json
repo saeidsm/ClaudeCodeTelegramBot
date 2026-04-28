@@ -1,0 +1,95 @@
+{
+  "eventID": "ev_bb111aaa222ccc333ddd444eee555fff6",
+  "id": "ev_bb111aaa222ccc333ddd444eee555fff6",
+  "issueId": "5004",
+  "projectID": "shahrzad-backend",
+  "platform": "python",
+  "datetime": "2026-04-24T18:01:00Z",
+  "title": "StripeError: card_declined for cus_NeFG1RhZdkc4Yz",
+  "message": "Customer cus_NeFG1RhZdkc4Yz declined; user samyar reported via email user.bug@example.com",
+  "release": "backend@1.4.7",
+  "environment": "production",
+  "tags": [
+    {"key": "url", "value": "https://api.shahrzad.ai/api/payment/charge?email=admin@shahrzad.ai"},
+    {"key": "release", "value": "backend@1.4.7"},
+    {"key": "environment", "value": "production"},
+    {"key": "server_name", "value": "shahrzad-prod-1"},
+    {"key": "user", "value": "id:3fa85f64-5717-4562-b3fc-2c963f66afa6"}
+  ],
+  "user": {
+    "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "email": "billing-test@shahrzad.ai",
+    "ip_address": "8.8.8.8",
+    "username": "Nikrouz"
+  },
+  "request": {
+    "url": "https://api.shahrzad.ai/api/payment/charge",
+    "method": "POST",
+    "headers": [
+      ["Authorization", "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"],
+      ["Cookie", "session=abc123secret; csrf=xyzPRIVATE"],
+      ["X-Forwarded-For", "138.197.76.197"]
+    ],
+    "data": {
+      "stripe_customer": "cus_NeFG1RhZdkc4Yz",
+      "stripe_token": "pi_3OabcdEFG12HIJ34kl",
+      "amount": 4900,
+      "currency": "usd",
+      "phone": "+989121234567",
+      "national_id": "0012345679"
+    }
+  },
+  "exception": {
+    "values": [
+      {
+        "type": "StripeError",
+        "value": "card_declined for cus_NeFG1RhZdkc4Yz (key __FAKE_STRIPE_LIVE_KEY__)",
+        "stacktrace": {
+          "frames": [
+            {
+              "filename": "app/payments/stripe_handler.py",
+              "function": "charge_customer",
+              "lineno": 142,
+              "vars": {
+                "customer_id": "cus_NeFG1RhZdkc4Yz",
+                "auth_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL3NoYXJ6YWQuYWkifQ.AbCdEf1234567890XyZ_long-signature-here_qwerty"
+              }
+            },
+            {
+              "filename": "app/routers/payment.py",
+              "function": "charge",
+              "lineno": 67,
+              "vars": {
+                "user_email": "real.user@example.com",
+                "session_id": "8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e"
+              }
+            },
+            {
+              "filename": "app/middleware/auth.py",
+              "function": "verify_token",
+              "lineno": 34,
+              "vars": {
+                "test_user": "samyar",
+                "ip": "10.0.0.42"
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "breadcrumbs": {
+    "values": [
+      {
+        "category": "http",
+        "message": "GET https://s3.amazonaws.com/illustrations/foo.jpg?X-Amz-Signature=abc123def456SECRETSIGNATURE789xyz&X-Amz-Date=20260424T120000Z",
+        "level": "info"
+      },
+      {
+        "category": "auth",
+        "message": "User Nikrouz authenticated",
+        "level": "info"
+      }
+    ]
+  }
+}

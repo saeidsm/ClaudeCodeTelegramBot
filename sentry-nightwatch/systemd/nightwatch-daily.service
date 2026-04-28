@@ -1,0 +1,24 @@
+[Unit]
+Description=NightWatch — Sentry nightly analysis pipeline
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/sentry-nightwatch
+EnvironmentFile=/opt/sentry-nightwatch/.env
+ExecStart=/opt/sentry-nightwatch/venv/bin/python -m app.main run
+TimeoutStartSec=900
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nightwatch
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/sentry-nightwatch/snapshots /opt/sentry-nightwatch
+ProtectHome=true
