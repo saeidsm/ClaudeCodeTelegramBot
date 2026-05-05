@@ -39,12 +39,26 @@ except ImportError:
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS = [int(x) for x in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
 REPOS      = "/opt/shahrzad-devops/repos"
-REPORTS    = "/opt/shahrzad-devops/reports"
+
+# Reports are served behind an unguessable path token. Caddy 404s every
+# /reports/* path that doesn't begin with this token, so the bot must write
+# new reports under the token directory and emit URLs that include it.
+def _load_reports_token() -> str:
+    path = "/opt/shahrzad-devops/configs/reports-token.env"
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("REPORTS_PATH_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    raise RuntimeError(f"REPORTS_PATH_TOKEN not found in {path}")
+_REPORTS_TOKEN = _load_reports_token()
+
+REPORTS    = f"/opt/shahrzad-devops/reports/{_REPORTS_TOKEN}"
 LOGS       = "/opt/shahrzad-devops/logs"
 SCRIPTS    = "/opt/shahrzad-devops/scripts"
 UPLOADS    = "/opt/shahrzad-devops/uploads"
 PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
-REPORT_URL = os.environ.get("REPORTS_BASE_URL", "http://localhost:8080/reports")
+REPORT_URL = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
 MAX_SESSIONS  = 4
