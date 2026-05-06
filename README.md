@@ -1,5 +1,7 @@
 # Claude Code Telegram Bot
 
+👉 **Setup:** see [SETUP.md](SETUP.md) for installation, configuration, and multi-bot deployment.
+
 A Telegram bot that bridges [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) with Telegram, enabling you to run Claude Code commands, manage multi-session workflows, send voice commands, attach files, and deploy — all from your phone.
 
 Built for DevOps engineers and developers who want to interact with Claude Code on the go.
@@ -97,7 +99,7 @@ TELEGRAM_CHAT_ID=123456789
 GEMINI_API_KEY=your-gemini-api-key    # Optional, for voice
 ```
 
-See [docs/SETUP.md](docs/SETUP.md) for the full setup guide.
+See [SETUP.md](SETUP.md) for the full setup guide (single-bot, multi-bot, configuration reference).
 
 ## Usage
 
