@@ -38,13 +38,25 @@ except ImportError:
 # ── Config ──
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS = [int(x) for x in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
-REPOS      = "/opt/shahrzad-devops/repos"
+
+# ── Path roots — env-driven so multiple bot instances can isolate ──
+# All defaults preserve the historic /opt/shahrzad-devops layout for bot1.
+BOT_DATA_ROOT   = os.environ.get("BOT_DATA_ROOT", "/opt/shahrzad-devops")
+REPOS           = os.environ.get("BOT_REPOS",        f"{BOT_DATA_ROOT}/repos")
+LOGS            = os.environ.get("BOT_LOGS",         f"{BOT_DATA_ROOT}/logs")
+SCRIPTS         = os.environ.get("BOT_SCRIPTS",      f"{BOT_DATA_ROOT}/scripts")
+UPLOADS         = os.environ.get("BOT_UPLOADS",      f"{BOT_DATA_ROOT}/uploads")
+BOT_CONFIGS_DIR = os.environ.get("BOT_CONFIGS_DIR",  f"{BOT_DATA_ROOT}/configs")
+PROMPTS_FILE    = f"{BOT_CONFIGS_DIR}/gemini-prompts.json"
+USAGE_DB_PATH   = f"{BOT_CONFIGS_DIR}/usage_tracker.json"
+PROJECTS_FILE   = f"{BOT_CONFIGS_DIR}/projects.json"
+STATE_FILE      = f"{BOT_CONFIGS_DIR}/bot-state.json"
 
 # Reports are served behind an unguessable path token. Caddy 404s every
 # /reports/* path that doesn't begin with this token, so the bot must write
 # new reports under the token directory and emit URLs that include it.
 def _load_reports_token() -> str:
-    path = "/opt/shahrzad-devops/configs/reports-token.env"
+    path = f"{BOT_CONFIGS_DIR}/reports-token.env"
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -53,20 +65,25 @@ def _load_reports_token() -> str:
     raise RuntimeError(f"REPORTS_PATH_TOKEN not found in {path}")
 _REPORTS_TOKEN = _load_reports_token()
 
-REPORTS    = f"/opt/shahrzad-devops/reports/{_REPORTS_TOKEN}"
-LOGS       = "/opt/shahrzad-devops/logs"
-SCRIPTS    = "/opt/shahrzad-devops/scripts"
-UPLOADS    = "/opt/shahrzad-devops/uploads"
-PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
-REPORT_URL = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
+_REPORTS_BASE = os.environ.get("BOT_REPORTS", f"{BOT_DATA_ROOT}/reports")
+REPORTS       = f"{_REPORTS_BASE}/{_REPORTS_TOKEN}"
+REPORT_URL    = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
+
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
-MAX_SESSIONS  = 4
 SESSION_TIMEOUT_MINUTES = 72 * 60  # 72 hours for most sessions
 PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
-USAGE_DB_PATH = "/opt/shahrzad-devops/configs/usage_tracker.json"
-PROJECTS_FILE = "/opt/shahrzad-devops/configs/projects.json"
-STATE_FILE    = "/opt/shahrzad-devops/configs/bot-state.json"
+
+# ── Feature flags + per-bot quotas (env-controllable) ──
+BOT_DEPLOY_ENABLED         = os.environ.get("BOT_DEPLOY_ENABLED",          "true").lower() == "true"
+BOT_NIGHTWATCH_IPC_ENABLED = os.environ.get("BOT_NIGHTWATCH_IPC_ENABLED",  "true").lower() == "true"
+BOT_GIT_REMOTE_TOKEN       = os.environ.get("BOT_GIT_REMOTE_TOKEN", "")
+MAX_SESSIONS               = int(os.environ.get("BOT_MAX_SESSIONS", "4"))
+
+# Default Claude Code model for new sessions — empty = CLI default,
+# "sonnet"/"opus" aliases, or full model name like "claude-sonnet-4-6".
+# Per-session overrides via /model (Session.claude_model).
+BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -189,8 +206,9 @@ class UsageTracker:
             emoji = "\u2705"
         return f"{bar} {int(pct * 100)}%  {emoji}"
 
-    def format_usage_message(self, active_sessions: int = 0) -> str:
+    def format_usage_message(self, active_sessions: int = 0, current_model: str = "") -> str:
         s = self.get_summary()
+        model_shown = current_model or BOT_DEFAULT_CLAUDE_MODEL or "default (CLI default)"
         return (
             "\U0001f4ca <b>Claude Code Usage</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -199,6 +217,7 @@ class UsageTracker:
             f"This week:  <code>{self.format_bar(s['weekly_pct'])}</code>\n\n"
             f"Sessions active: {active_sessions}\n"
             f"Tokens est. today: ~{s['daily_tokens']:,}\n"
+            f"Model: <code>{model_shown}</code>\n"
             f"Repo resets: {self.reset_successes}/{self.reset_attempts} ok (since boot)"
         )
 
@@ -445,6 +464,7 @@ class Session:
     paused: bool = False
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
+    claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
 
 
 class SessionManager:
@@ -875,7 +895,13 @@ async def run_claude(prompt, project, session, files=None):
 
     def build_cmd(mode, uuid_str):
         flag = "--resume" if mode == "resume" else "--session-id"
-        return ["claude", "--print", flag, uuid_str, full_prompt]
+        cmd = ["claude", "--print"]
+        # Resolve model: per-session override > bot default > CLI default
+        chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
+        if chosen_model:
+            cmd += ["--model", chosen_model]
+        cmd += [flag, uuid_str, full_prompt]
+        return cmd
 
     mode = "resume" if session.claude_created else "create"
     cmd = build_cmd(mode, session.session_uuid)
@@ -1342,8 +1368,11 @@ async def cmd_usage(u, c):
     """Show usage stats: /usage"""
     cid = u.effective_chat.id
     active = SM.active_for_chat(cid)
+    active_key = ACTIVE_SESSION.get(cid)
+    cur_session = SM.sessions.get(active_key) if active_key else None
+    cur_model = cur_session.claude_model if cur_session else ""
     await u.message.reply_text(
-        USAGE.format_usage_message(len(active)),
+        USAGE.format_usage_message(len(active), cur_model),
         parse_mode=ParseMode.HTML)
 
 @authorized
@@ -1483,39 +1512,70 @@ OPENROUTER_POPULAR = [
 
 @authorized
 async def cmd_model(u, c):
-    """Show/change active fallback model: /model"""
+    """Two-section model picker: Claude Code primary (per-session) + fallback chain.
+
+    Claude Code primary model is per-session (Session.claude_model). When no
+    session is active, the bot displays the bot-wide default
+    (BOT_DEFAULT_CLAUDE_MODEL) and disables ccmod: choices.
+    """
+    cid = u.effective_chat.id
+
+    # Active session (for per-session Claude Code model)
+    active_key = ACTIVE_SESSION.get(cid)
+    active_session = SM.sessions.get(active_key) if active_key else None
+    current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
+    cc_label = current_cc if current_cc else "default (CLI default — latest Sonnet/Opus)"
+
+    # Fallback chain
     prov = ACTIVE_FALLBACK["provider"]
     model = ACTIVE_FALLBACK.get("model", "")
-
-    # Get Gemini models from config
     prompts_cfg = load_prompts()
     gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-2.5-flash")
     gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-2.5-flash")
+    current_fb = f"{prov}" + (f" ({model or gemini_refine})" if prov == "gemini" else f" ({model})" if model else "")
 
-    current = f"{prov}" + (f" ({model or gemini_refine})" if prov == "gemini" else f" ({model})" if model else "")
+    rows = []
 
-    rows = [
-        [InlineKeyboardButton(
-            ("✅ " if prov == "gemini" else "🔹 ") + f"Gemini — {gemini_refine} (primary)",
-            callback_data=_cb(f"mdl:gemini:{gemini_refine}"))],
-        [InlineKeyboardButton(
-            ("✅ " if prov == "openai" else "🔹 ") + "GPT-4o (OpenAI)",
-            callback_data="mdl:openai:gpt-4o")],
-    ]
+    # ── Claude Code (primary) ──
+    cc_match = (active_session.claude_model if active_session else "") if active_session else None
+    cc_options = [("",       "Default (CLI default)"),
+                  ("sonnet", "Sonnet"),
+                  ("opus",   "Opus")]
+    for val, lbl in cc_options:
+        is_active = (cc_match == val) if active_session else False
+        icon = "✅" if is_active else ("🔹" if active_session else "🔸")
+        cb_token = val if val else "default"
+        rows.append([InlineKeyboardButton(f"CC: {icon} {lbl}", callback_data=_cb(f"ccmod:{cb_token}"))])
+    rows.append([InlineKeyboardButton("CC: ✏️ Custom model name…", callback_data="ccmod:custom")])
+
+    # ── Fallback chain ──
+    rows.append([InlineKeyboardButton(
+        ("FB: ✅ " if prov == "gemini" else "FB: 🔹 ") + f"Gemini — {gemini_refine}",
+        callback_data=_cb(f"mdl:gemini:{gemini_refine}"))])
+    rows.append([InlineKeyboardButton(
+        ("FB: ✅ " if prov == "openai" else "FB: 🔹 ") + "GPT-4o (OpenAI)",
+        callback_data="mdl:openai:gpt-4o")])
     for model_id, label in OPENROUTER_POPULAR:
         is_active = prov == "openrouter" and model == model_id
         icon = "✅" if is_active else "🔸"
-        rows.append([InlineKeyboardButton(f"{icon} {label}", callback_data=_cb(f"mdl:openrouter:{model_id}"))])
+        rows.append([InlineKeyboardButton(f"FB: {icon} {label}", callback_data=_cb(f"mdl:openrouter:{model_id}"))])
+    rows.append([InlineKeyboardButton("FB: 🔍 Search OpenRouter…", callback_data="mdl:search")])
 
-    rows.append([InlineKeyboardButton("🔍 Search OpenRouter...", callback_data="mdl:search")])
+    sess_note = (
+        f"Active session: {active_session.color_emoji} <b>{esc(active_session.label)}</b>\n"
+        if active_session else
+        "<i>No active session — start one with /new before changing the Claude Code model.</i>\n"
+    )
 
     await u.message.reply_text(
-        f"🤖 <b>Fallback Model</b>\n"
-        f"Active: <code>{esc(current)}</code>\n\n"
+        f"🤖 <b>Model Settings</b>\n"
+        f"{sess_note}"
+        f"\n<b>Claude Code (primary)</b>: <code>{esc(cc_label)}</code>\n"
+        f"<b>Fallback chain</b>: <code>{esc(current_fb)}</code>\n\n"
         f"🎤 STT: <code>{gemini_transcribe}</code>\n"
         f"🧠 Refine: <code>{gemini_refine}</code>\n"
         f"<i>(STT/Refine always use Gemini from config)</i>\n\n"
-        f"Choose fallback for when Claude Code is rate-limited:",
+        f"<b>CC:</b> per-session Claude model · <b>FB:</b> when Claude is rate-limited",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1821,10 +1881,16 @@ async def on_callback(u, c):
         if session: await track_reply(sent, session)
 
     elif d == "do:deploy_ask":
+        if not BOT_DEPLOY_ENABLED:
+            await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
+            return
         proj = session.project if session else DEFAULT_PROJECT
         await c.bot.send_message(cid, f"🚀 <b>Deploy {proj}</b>\nSelect branch:", parse_mode=ParseMode.HTML, reply_markup=deploy_branch_kb(proj))
 
     elif d.startswith("dbr:"):
+        if not BOT_DEPLOY_ENABLED:
+            await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
+            return
         _, proj, br = d.split(":")
         if br == "claude_latest":
             r = subprocess.run(["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
@@ -1833,6 +1899,9 @@ async def on_callback(u, c):
         await q.edit_message_text(f"⚠️ <b>Deploy {proj}@{br}</b> → production?\n\nSure?", parse_mode=ParseMode.HTML, reply_markup=deploy_confirm_kb(proj, br))
 
     elif d.startswith("dpl:"):
+        if not BOT_DEPLOY_ENABLED:
+            await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
+            return
         _, proj, br = d.split(":")
         await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
         r = subprocess.run([f"{SCRIPTS}/deploy-to-prod.sh", proj, br], capture_output=True, text=True, timeout=120)
@@ -2156,7 +2225,10 @@ async def on_callback(u, c):
     # ── Menu inline buttons ──
     elif d == "menu:usage":
         active = SM.active_for_chat(cid)
-        await c.bot.send_message(cid, USAGE.format_usage_message(len(active)), parse_mode=ParseMode.HTML)
+        active_key = ACTIVE_SESSION.get(cid)
+        cur_session = SM.sessions.get(active_key) if active_key else None
+        cur_model = cur_session.claude_model if cur_session else ""
+        await c.bot.send_message(cid, USAGE.format_usage_message(len(active), cur_model), parse_mode=ParseMode.HTML)
 
     elif d == "menu:sessions":
         active = SM.active_for_chat(cid)
@@ -2193,6 +2265,34 @@ async def on_callback(u, c):
         await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     # ── Model selection ──
+    elif d.startswith("ccmod:"):
+        # Claude Code primary model — per-session.
+        choice = d.split(":", 1)[1]
+        active_key = ACTIVE_SESSION.get(cid)
+        target = SM.sessions.get(active_key) if active_key else None
+        if not target:
+            await q.edit_message_text(
+                "ℹ️ No active session. Start one with /new before changing the Claude Code model.",
+                parse_mode=ParseMode.HTML)
+            return
+        if choice == "custom":
+            CONV_STATE[cid] = {"state": "awaiting_claude_model_input", "session_key": target.id}
+            await q.edit_message_text(
+                f"✏️ Type the Claude model to use for session "
+                f"<b>{esc(target.label)}</b>.\n"
+                f"Examples: <code>sonnet</code>, <code>opus</code>, "
+                f"<code>claude-sonnet-4-6</code>.\n"
+                f"Send <code>cancel</code> to abort.",
+                parse_mode=ParseMode.HTML)
+            return
+        new_model = "" if choice == "default" else choice
+        target.claude_model = new_model
+        shown = new_model or "default (CLI default)"
+        await q.edit_message_text(
+            f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
+            f"set to: <code>{esc(shown)}</code>",
+            parse_mode=ParseMode.HTML)
+
     elif d.startswith("mdl:"):
         parts = d.split(":", 2)
         provider = parts[1] if len(parts) > 1 else "gemini"
@@ -2309,6 +2409,9 @@ async def on_voice(u, c):
     if cmd:
         await st.edit_text(f"🎤 <code>{esc(txt)}</code>\n⚡ <b>{cmd}</b>", parse_mode=ParseMode.HTML)
         if cmd == "deploy":
+            if not BOT_DEPLOY_ENABLED:
+                await c.bot.send_message(u.effective_chat.id, "🔒 Deploy is disabled for this bot instance.")
+                return
             proj = session.project if session else DEFAULT_PROJECT
             await c.bot.send_message(u.effective_chat.id, f"🚀 <b>Deploy {proj}</b>", parse_mode=ParseMode.HTML, reply_markup=deploy_branch_kb(proj))
         elif cmd == "health": await do_health(u, c)
@@ -2436,6 +2539,21 @@ async def on_text(u, c):
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{label}:{proj_name}"))]
                     ]))
+            return
+
+        if state == "awaiting_claude_model_input":
+            CONV_STATE.pop(cid, None)
+            target_key = conv.get("session_key")
+            target = SM.sessions.get(target_key) if target_key else None
+            entry = t.strip()
+            if entry.lower() == "cancel" or not target:
+                await u.message.reply_text("❌ Cancelled.")
+                return
+            target.claude_model = entry
+            await u.message.reply_text(
+                f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
+                f"set to: <code>{esc(entry)}</code>",
+                parse_mode=ParseMode.HTML)
             return
 
         if state == "awaiting_model_search":
@@ -2618,7 +2736,7 @@ async def _flush_buffer(cid: int, context):
 _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
-    "tasks", "claude_created",
+    "tasks", "claude_created", "claude_model",
 )
 
 
@@ -2679,6 +2797,7 @@ def load_state():
                 anchor_message_id=s.get("anchor_message_id"),
                 tasks=s.get("tasks", 0),
                 claude_created=s.get("claude_created", False),
+                claude_model=s.get("claude_model", ""),
             )
             SM.sessions[k] = session
             restored += 1
@@ -2766,13 +2885,19 @@ async def post_init(app):
     asyncio.create_task(state_autosave_task())
     # NightWatch IPC last: it returns 503 while the bot is still booting, so
     # any in-flight inject from a fast-firing nightwatch sees the bot ready.
-    await _nw_ipc_start(app)
+    # Gated by BOT_NIGHTWATCH_IPC_ENABLED so a second bot instance can run on
+    # the same host without port-9091 collision.
+    if BOT_NIGHTWATCH_IPC_ENABLED:
+        await _nw_ipc_start(app)
+    else:
+        log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
 
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
     log.info("SIGTERM received — starting graceful shutdown...")
-    await _nw_ipc_stop()
+    if BOT_NIGHTWATCH_IPC_ENABLED:
+        await _nw_ipc_stop()
     # Collect active sessions info before killing
     active = [(k, s) for k, s in SM.sessions.items() if s.status == "running"]
     # Kill all tracked claude subprocesses
