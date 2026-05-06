@@ -38,13 +38,25 @@ except ImportError:
 # ── Config ──
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS = [int(x) for x in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
-REPOS      = "/opt/shahrzad-devops/repos"
+
+# ── Path roots — env-driven so multiple bot instances can isolate ──
+# All defaults preserve the historic /opt/shahrzad-devops layout for bot1.
+BOT_DATA_ROOT   = os.environ.get("BOT_DATA_ROOT", "/opt/shahrzad-devops")
+REPOS           = os.environ.get("BOT_REPOS",        f"{BOT_DATA_ROOT}/repos")
+LOGS            = os.environ.get("BOT_LOGS",         f"{BOT_DATA_ROOT}/logs")
+SCRIPTS         = os.environ.get("BOT_SCRIPTS",      f"{BOT_DATA_ROOT}/scripts")
+UPLOADS         = os.environ.get("BOT_UPLOADS",      f"{BOT_DATA_ROOT}/uploads")
+BOT_CONFIGS_DIR = os.environ.get("BOT_CONFIGS_DIR",  f"{BOT_DATA_ROOT}/configs")
+PROMPTS_FILE    = f"{BOT_CONFIGS_DIR}/gemini-prompts.json"
+USAGE_DB_PATH   = f"{BOT_CONFIGS_DIR}/usage_tracker.json"
+PROJECTS_FILE   = f"{BOT_CONFIGS_DIR}/projects.json"
+STATE_FILE      = f"{BOT_CONFIGS_DIR}/bot-state.json"
 
 # Reports are served behind an unguessable path token. Caddy 404s every
 # /reports/* path that doesn't begin with this token, so the bot must write
 # new reports under the token directory and emit URLs that include it.
 def _load_reports_token() -> str:
-    path = "/opt/shahrzad-devops/configs/reports-token.env"
+    path = f"{BOT_CONFIGS_DIR}/reports-token.env"
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -53,20 +65,31 @@ def _load_reports_token() -> str:
     raise RuntimeError(f"REPORTS_PATH_TOKEN not found in {path}")
 _REPORTS_TOKEN = _load_reports_token()
 
-REPORTS    = f"/opt/shahrzad-devops/reports/{_REPORTS_TOKEN}"
-LOGS       = "/opt/shahrzad-devops/logs"
-SCRIPTS    = "/opt/shahrzad-devops/scripts"
-UPLOADS    = "/opt/shahrzad-devops/uploads"
-PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
-REPORT_URL = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
+_REPORTS_BASE = os.environ.get("BOT_REPORTS", f"{BOT_DATA_ROOT}/reports")
+REPORTS       = f"{_REPORTS_BASE}/{_REPORTS_TOKEN}"
+REPORT_URL    = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
+
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
-MAX_SESSIONS  = 4
 SESSION_TIMEOUT_MINUTES = 72 * 60  # 72 hours for most sessions
 PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
-USAGE_DB_PATH = "/opt/shahrzad-devops/configs/usage_tracker.json"
-PROJECTS_FILE = "/opt/shahrzad-devops/configs/projects.json"
-STATE_FILE    = "/opt/shahrzad-devops/configs/bot-state.json"
+
+# ── Feature flags + per-bot quotas (env-controllable) ──
+BOT_DEPLOY_ENABLED         = os.environ.get("BOT_DEPLOY_ENABLED",          "true").lower() == "true"
+BOT_NIGHTWATCH_IPC_ENABLED = os.environ.get("BOT_NIGHTWATCH_IPC_ENABLED",  "true").lower() == "true"
+BOT_GIT_REMOTE_TOKEN       = os.environ.get("BOT_GIT_REMOTE_TOKEN", "")
+MAX_SESSIONS               = int(os.environ.get("BOT_MAX_SESSIONS", "4"))
+
+# Default Claude Code model for new sessions — empty = CLI default,
+# "sonnet"/"opus" aliases, or full model name like "claude-sonnet-4-6".
+# Per-session overrides via /model (Session.claude_model).
+BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
+
+# Per-session ephemeral worktrees live here. Each spawn gets its own
+# subdir (<session_id>) so concurrent sessions on the same project don't
+# collide. Cleaned on session exit; orphans GC'd by claude-worktree-gc.timer.
+WORKTREE_ROOT = os.environ.get("BOT_WORKTREE_ROOT", "/tmp/claude-sessions")
+os.makedirs(WORKTREE_ROOT, exist_ok=True)
 
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -121,9 +144,6 @@ class UsageTracker:
         self.daily_limit  = 1_000_000
         self.weekly_limit = 5_000_000
         self.alert_threshold = 0.8    # 80%
-        # In-memory counters for reset_repo_to_main diagnostics (process-lifetime).
-        self.reset_attempts = 0
-        self.reset_successes = 0
         self._load()
 
     def _load(self):
@@ -189,8 +209,9 @@ class UsageTracker:
             emoji = "\u2705"
         return f"{bar} {int(pct * 100)}%  {emoji}"
 
-    def format_usage_message(self, active_sessions: int = 0) -> str:
+    def format_usage_message(self, active_sessions: int = 0, current_model: str = "") -> str:
         s = self.get_summary()
+        model_shown = current_model or BOT_DEFAULT_CLAUDE_MODEL or "default (CLI default)"
         return (
             "\U0001f4ca <b>Claude Code Usage</b>\n"
             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
@@ -199,7 +220,7 @@ class UsageTracker:
             f"This week:  <code>{self.format_bar(s['weekly_pct'])}</code>\n\n"
             f"Sessions active: {active_sessions}\n"
             f"Tokens est. today: ~{s['daily_tokens']:,}\n"
-            f"Repo resets: {self.reset_successes}/{self.reset_attempts} ok (since boot)"
+            f"Model: <code>{model_shown}</code>"
         )
 
 
@@ -445,6 +466,7 @@ class Session:
     paused: bool = False
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
+    claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
 
 
 class SessionManager:
@@ -743,74 +765,108 @@ def authorized(fn):
 # ═══════════════════════════════════════════
 #  Claude Code
 # ═══════════════════════════════════════════
-def reset_repo_to_main(repo: str) -> tuple[bool, str]:
-    """Bring the shared repo worktree to a clean state on origin/main.
+class WorktreeSession:
+    """Per-session ephemeral git worktree.
 
-    Phase A safety net for shared-worktree session contamination: every
-    Claude Code spawn first lands on a known-clean origin/main so a prior
-    session's checkout/uncommitted state does not leak into the next.
-    Sessions must NOT depend on uncommitted state from prior sessions.
+    Each Claude Code spawn runs inside its own worktree at
+    WORKTREE_ROOT/<session_id> with an independent .git/HEAD. Concurrent
+    sessions on the same project do not collide.
 
-    Returns (success, message). On failure returns (False, reason) and
-    the caller decides whether to abort or proceed. If repo is not a git
-    work tree, returns (True, "non-git") and skips everything.
+    Replaces Phase A's reset_repo_to_main pattern (which was destroying
+    in-progress work in a sibling session every time another session
+    spawned). Sessions still must not depend on uncommitted state across
+    spawns — each spawn re-creates the worktree from origin/<branch>.
+    To carry work forward, Claude Code must commit + push within a spawn;
+    the next spawn picks the change up via origin.
 
-    Each git operation has a 30-second timeout. clean -fd preserves
-    .claude-tasks/ (current-session uploads) and .env (not in git).
+    Non-git projects fall back to rsync of the project dir into the
+    worktree path (no isolation guarantees, but matches the spirit of
+    "fresh tree per spawn").
     """
-    if not os.path.isdir(os.path.join(repo, ".git")):
-        return True, "non-git"
+    def __init__(self, project_path: str, branch: str, session_id: str):
+        self.project_path = project_path
+        self.branch = branch
+        # Replace ":" (used in our session id format) with "_" for path safety
+        self.session_id = session_id
+        self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
+        self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
 
-    USAGE.reset_attempts += 1
+    def __enter__(self):
+        if not self.is_git:
+            os.makedirs(self.worktree_path, exist_ok=True)
+            subprocess.run(
+                ["rsync", "-a", "--exclude=.git",
+                 f"{self.project_path}/", f"{self.worktree_path}/"],
+                capture_output=True, timeout=60)
+            log.info(f"worktree.created project={os.path.basename(self.project_path)} "
+                     f"sid={self.session_id} type=non-git")
+            return self.worktree_path
 
-    steps = [
-        ("rev-parse", ["git", "-C", repo, "rev-parse", "--is-inside-work-tree"]),
-        ("fetch",     ["git", "-C", repo, "fetch", "origin", "--quiet", "--depth=50"]),
-        ("checkout",  ["git", "-C", repo, "checkout", "main"]),
-        ("reset",     ["git", "-C", repo, "reset", "--hard", "origin/main"]),
-        ("clean",     ["git", "-C", repo, "clean", "-fd", "-e", ".claude-tasks", "-e", ".env"]),
-    ]
-    for name, cmd in steps:
+        # Idempotent enter: clean up any stale dir from a previous crash
+        if os.path.exists(self.worktree_path):
+            log.warning(f"worktree.stale_cleanup path={self.worktree_path}")
+            subprocess.run(
+                ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
+                capture_output=True, timeout=30)
+            subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True)
+
+        # Fetch latest (best-effort — don't fail spawn on network blip)
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            subprocess.run(
+                ["git", "-C", self.project_path, "fetch", "origin", "--quiet", "--depth=50"],
+                capture_output=True, timeout=60, check=False)
         except subprocess.TimeoutExpired:
-            log.warning(f"reset_repo_to_main: {name} timed out for {repo}")
-            return False, f"{name} timeout"
-        except Exception as ex:
-            log.warning(f"reset_repo_to_main: {name} failed for {repo}: {ex}")
-            return False, f"{name} error: {ex}"
-        if r.returncode != 0:
-            stderr = (r.stderr or "").strip()[:200]
-            log.warning(f"reset_repo_to_main: {name} rc={r.returncode} for {repo}: {stderr}")
-            return False, f"{name} rc={r.returncode}: {stderr}"
+            log.warning(f"worktree.fetch_timeout project={os.path.basename(self.project_path)}")
 
-    USAGE.reset_successes += 1
-    return True, "ok"
+        # Validate branch exists on origin; fall back to main
+        check = subprocess.run(
+            ["git", "-C", self.project_path, "rev-parse", "--verify", f"origin/{self.branch}"],
+            capture_output=True, timeout=10)
+        if check.returncode != 0:
+            log.warning(f"worktree.branch_missing branch={self.branch} "
+                        f"project={os.path.basename(self.project_path)} fallback=main")
+            self.branch = "main"
+
+        # --detach: avoid "branch already checked out elsewhere" when two
+        # concurrent sessions ask for the same branch. Claude can `git
+        # checkout -b` inside the worktree if it wants to commit.
+        result = subprocess.run(
+            ["git", "-C", self.project_path, "worktree", "add", "--detach",
+             self.worktree_path, f"origin/{self.branch}"],
+            capture_output=True, text=True, timeout=60)
+
+        if result.returncode != 0:
+            # Hard failure — don't silently fall back to the shared worktree
+            # (that would re-introduce the bug Phase B fixes).
+            raise RuntimeError(
+                f"worktree.add_failed project={os.path.basename(self.project_path)} "
+                f"branch={self.branch} stderr={result.stderr.strip()[:200]}")
+
+        log.info(f"worktree.created project={os.path.basename(self.project_path)} "
+                 f"sid={self.session_id} branch={self.branch} path={self.worktree_path}")
+        return self.worktree_path
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if not os.path.exists(self.worktree_path):
+            return False
+
+        if self.is_git:
+            result = subprocess.run(
+                ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
+                capture_output=True, timeout=30)
+            if result.returncode != 0:
+                log.warning(f"worktree.remove_failed sid={self.session_id} "
+                            f"stderr={result.stderr.decode().strip()[:200]} fallback=rm-rf")
+
+        subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True, timeout=30)
+        log.info(f"worktree.removed sid={self.session_id}")
+        return False
 
 
-def repo_state_snapshot(repo: str) -> tuple[str, str, bool]:
-    """Return (branch, short_sha, is_clean) for spawn-time diagnostics."""
-    if not os.path.isdir(os.path.join(repo, ".git")):
-        return "non-git", "-", True
-    try:
-        b = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
-                           capture_output=True, text=True, timeout=5)
-        s = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
-                           capture_output=True, text=True, timeout=5)
-        st = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
-                            capture_output=True, text=True, timeout=5)
-        branch = (b.stdout or "").strip() or "?"
-        sha = (s.stdout or "").strip() or "?"
-        clean = not (st.stdout or "").strip()
-        return branch, sha, clean
-    except Exception:
-        return "?", "?", False
-
-
-async def _spawn_claude(cmd, repo):
-    """Spawn a `claude` subprocess and return (proc, stdout_str, stderr_str)."""
+async def _spawn_claude_in(cmd, cwd):
+    """Spawn a `claude` subprocess in `cwd` and return (proc, stdout_str, stderr_str)."""
     proc = await asyncio.create_subprocess_exec(
-        *cmd, cwd=repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
     ACTIVE_PROCS[proc.pid] = proc
     try:
@@ -823,13 +879,15 @@ async def _spawn_claude(cmd, repo):
 
 
 async def run_claude(prompt, project, session, files=None):
-    """Invoke Claude Code for a session.
+    """Invoke Claude Code for a session inside a per-session git worktree.
+
+    Phase B: each spawn runs in WORKTREE_ROOT/<session_id>, a fresh worktree
+    detached at origin/<branch>. The shared repo is never modified. Claude
+    Code's session-uuid persistence lives in ~/.claude/, not the project
+    dir, so --resume works regardless of cwd.
 
     First call uses --session-id (creates session with our UUID).
     Subsequent calls use --resume (preserves conversation context).
-    Previously used --session-id every time, which always failed with
-    "already in use" after the first call and silently rerolled the UUID
-    — losing all prior context on every message after the first.
     """
     repo = get_project_path(project)
     if not os.path.isdir(repo):
@@ -841,91 +899,94 @@ async def run_claude(prompt, project, session, files=None):
         except Exception as e:
             return f"❌ Not found: {project}\nCould not create: {e}"
 
-    # Phase A safety net: bring shared worktree to clean origin/main BEFORE
-    # we copy uploaded files to .claude-tasks/ (clean -fd preserves that
-    # directory) and BEFORE we spawn claude.
-    reset_ok, reset_msg = await asyncio.to_thread(reset_repo_to_main, repo)
-    if not reset_ok:
-        log.warning(f"reset_repo_to_main failed for {project} ({repo}): {reset_msg}")
-        try:
-            chat_id = int(session.id.split(":", 1)[0])
-        except (ValueError, IndexError):
-            chat_id = None
-        if chat_id is not None and BOT is not None:
-            try:
-                await BOT.send_message(
-                    chat_id,
-                    f"⚠️ Could not reset {project} to main: {reset_msg}. "
-                    f"Spawning anyway on whatever branch HEAD points to. "
-                    f"Run /sessions to verify.",
-                )
-            except Exception as send_ex:
-                log.warning(f"Failed to send reset-failure notice: {send_ex}")
-
-    fnote = ""
-    if files:
-        td = f"{repo}/.claude-tasks"; os.makedirs(td, exist_ok=True)
-        copied = []
-        for fp in files:
-            if os.path.isfile(fp):
-                d = f"{td}/{os.path.basename(fp)}"; subprocess.run(["cp", fp, d]); copied.append(d)
-        if copied:
-            fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-    full_prompt = prompt + fnote
-
-    def build_cmd(mode, uuid_str):
-        flag = "--resume" if mode == "resume" else "--session-id"
-        return ["claude", "--print", flag, uuid_str, full_prompt]
-
-    mode = "resume" if session.claude_created else "create"
-    cmd = build_cmd(mode, session.session_uuid)
-    log.info(f"Claude [{project}] {mode} session={session.session_uuid[:8]}: {prompt[:80]}... ({len(files or [])} files)")
+    starting_branch = getattr(session, 'starting_branch', 'main')
+    sid_safe = session.id.replace(':', '_')
 
     proc = None
     try:
-        branch, short_sha, is_clean = repo_state_snapshot(repo)
-        log.info(f"spawn.repo_state project={project} branch={branch} "
-                 f"head={short_sha} clean={is_clean}")
-        proc, r, e = await _spawn_claude(cmd, repo)
+        with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+            # Copy uploaded files INSIDE the worktree (not the shared repo)
+            fnote = ""
+            if files:
+                td = f"{wt_path}/.claude-tasks"
+                os.makedirs(td, exist_ok=True)
+                copied = []
+                for fp in files:
+                    if os.path.isfile(fp):
+                        d = f"{td}/{os.path.basename(fp)}"
+                        subprocess.run(["cp", fp, d])
+                        copied.append(d)
+                if copied:
+                    fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+            full_prompt = prompt + fnote
 
-        # Recovery paths
-        if proc.returncode != 0:
-            err_low = (r + e).lower()
-            session_missing = any(kw in err_low for kw in [
-                "no such session", "session not found", "session does not exist",
-                "could not find session", "no session with id"
-            ])
-            uuid_collision = "already in use" in err_low
+            def build_cmd(mode, uuid_str):
+                flag = "--resume" if mode == "resume" else "--session-id"
+                cmd = ["claude", "--print"]
+                chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
+                if chosen_model:
+                    cmd += ["--model", chosen_model]
+                cmd += [flag, uuid_str, full_prompt]
+                return cmd
 
-            if mode == "resume" and session_missing:
-                log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
-                session.session_uuid = str(uuid.uuid4())
-                session.claude_created = False
-                cmd = build_cmd("create", session.session_uuid)
-                proc, r, e = await _spawn_claude(cmd, repo)
-                mode = "create"
-            elif mode == "create" and uuid_collision:
-                log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
-                session.session_uuid = str(uuid.uuid4())
-                cmd = build_cmd("create", session.session_uuid)
-                proc, r, e = await _spawn_claude(cmd, repo)
+            mode = "resume" if session.claude_created else "create"
+            cmd = build_cmd(mode, session.session_uuid)
+            log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
+                     f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                     f"worktree={wt_path}")
 
-        # Mark session persisted on first successful create
-        if proc.returncode == 0 and not session.claude_created:
-            session.claude_created = True
+            proc, r, e = await _spawn_claude_in(cmd, wt_path)
 
-        USAGE.record(len(full_prompt), len(r), session.label)
+            # Recovery paths
+            if proc.returncode != 0:
+                err_low = (r + e).lower()
+                session_missing = any(kw in err_low for kw in [
+                    "no such session", "session not found", "session does not exist",
+                    "could not find session", "no session with id"
+                ])
+                uuid_collision = "already in use" in err_low
 
-        # Rate-limit fallback
-        if proc.returncode != 0:
-            combined = (r + e).lower()
-            if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
-                log.warning(f"Claude rate-limited for session {session.session_uuid[:8]}, falling back to GPT")
-                return await gpt_fallback(prompt, project)
+                if mode == "resume" and session_missing:
+                    log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
+                    session.session_uuid = str(uuid.uuid4())
+                    session.claude_created = False
+                    cmd = build_cmd("create", session.session_uuid)
+                    proc, r, e = await _spawn_claude_in(cmd, wt_path)
+                    mode = "create"
+                elif mode == "create" and uuid_collision:
+                    log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
+                    session.session_uuid = str(uuid.uuid4())
+                    cmd = build_cmd("create", session.session_uuid)
+                    proc, r, e = await _spawn_claude_in(cmd, wt_path)
 
-        if proc.returncode != 0 and e:
-            r += f"\n⚠️ {e[:500]}"
-        return r.strip() or "(no output)"
+            if proc.returncode == 0 and not session.claude_created:
+                session.claude_created = True
+
+            USAGE.record(len(full_prompt), len(r), session.label)
+
+            # Rate-limit fallback
+            if proc.returncode != 0:
+                combined = (r + e).lower()
+                if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
+                    log.warning(f"Claude rate-limited for session {session.session_uuid[:8]}, falling back to GPT")
+                    return await gpt_fallback(prompt, project)
+
+            if proc.returncode != 0 and e:
+                r += f"\n⚠️ {e[:500]}"
+            return r.strip() or "(no output)"
+    except RuntimeError as rt_err:
+        # WorktreeSession.__enter__ raised — worktree creation failed.
+        log.error(f"worktree.fatal sid={session.id} err={rt_err}")
+        try:
+            if BOT is not None:
+                chat_id = int(session.id.split(':', 1)[0])
+                await BOT.send_message(
+                    chat_id,
+                    f"❌ Could not create isolated worktree for {project}: {rt_err}\n"
+                    f"Session aborted. Try /new to retry.")
+        except Exception:
+            pass
+        return f"❌ Worktree creation failed: {rt_err}"
     except asyncio.TimeoutError:
         try:
             if proc: proc.kill()
@@ -1342,8 +1403,11 @@ async def cmd_usage(u, c):
     """Show usage stats: /usage"""
     cid = u.effective_chat.id
     active = SM.active_for_chat(cid)
+    active_key = ACTIVE_SESSION.get(cid)
+    cur_session = SM.sessions.get(active_key) if active_key else None
+    cur_model = cur_session.claude_model if cur_session else ""
     await u.message.reply_text(
-        USAGE.format_usage_message(len(active)),
+        USAGE.format_usage_message(len(active), cur_model),
         parse_mode=ParseMode.HTML)
 
 @authorized
@@ -1483,39 +1547,70 @@ OPENROUTER_POPULAR = [
 
 @authorized
 async def cmd_model(u, c):
-    """Show/change active fallback model: /model"""
+    """Two-section model picker: Claude Code primary (per-session) + fallback chain.
+
+    Claude Code primary model is per-session (Session.claude_model). When no
+    session is active, the bot displays the bot-wide default
+    (BOT_DEFAULT_CLAUDE_MODEL) and disables ccmod: choices.
+    """
+    cid = u.effective_chat.id
+
+    # Active session (for per-session Claude Code model)
+    active_key = ACTIVE_SESSION.get(cid)
+    active_session = SM.sessions.get(active_key) if active_key else None
+    current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
+    cc_label = current_cc if current_cc else "default (CLI default — latest Sonnet/Opus)"
+
+    # Fallback chain
     prov = ACTIVE_FALLBACK["provider"]
     model = ACTIVE_FALLBACK.get("model", "")
-
-    # Get Gemini models from config
     prompts_cfg = load_prompts()
     gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-2.5-flash")
     gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-2.5-flash")
+    current_fb = f"{prov}" + (f" ({model or gemini_refine})" if prov == "gemini" else f" ({model})" if model else "")
 
-    current = f"{prov}" + (f" ({model or gemini_refine})" if prov == "gemini" else f" ({model})" if model else "")
+    rows = []
 
-    rows = [
-        [InlineKeyboardButton(
-            ("✅ " if prov == "gemini" else "🔹 ") + f"Gemini — {gemini_refine} (primary)",
-            callback_data=_cb(f"mdl:gemini:{gemini_refine}"))],
-        [InlineKeyboardButton(
-            ("✅ " if prov == "openai" else "🔹 ") + "GPT-4o (OpenAI)",
-            callback_data="mdl:openai:gpt-4o")],
-    ]
+    # ── Claude Code (primary) ──
+    cc_match = (active_session.claude_model if active_session else "") if active_session else None
+    cc_options = [("",       "Default (CLI default)"),
+                  ("sonnet", "Sonnet"),
+                  ("opus",   "Opus")]
+    for val, lbl in cc_options:
+        is_active = (cc_match == val) if active_session else False
+        icon = "✅" if is_active else ("🔹" if active_session else "🔸")
+        cb_token = val if val else "default"
+        rows.append([InlineKeyboardButton(f"CC: {icon} {lbl}", callback_data=_cb(f"ccmod:{cb_token}"))])
+    rows.append([InlineKeyboardButton("CC: ✏️ Custom model name…", callback_data="ccmod:custom")])
+
+    # ── Fallback chain ──
+    rows.append([InlineKeyboardButton(
+        ("FB: ✅ " if prov == "gemini" else "FB: 🔹 ") + f"Gemini — {gemini_refine}",
+        callback_data=_cb(f"mdl:gemini:{gemini_refine}"))])
+    rows.append([InlineKeyboardButton(
+        ("FB: ✅ " if prov == "openai" else "FB: 🔹 ") + "GPT-4o (OpenAI)",
+        callback_data="mdl:openai:gpt-4o")])
     for model_id, label in OPENROUTER_POPULAR:
         is_active = prov == "openrouter" and model == model_id
         icon = "✅" if is_active else "🔸"
-        rows.append([InlineKeyboardButton(f"{icon} {label}", callback_data=_cb(f"mdl:openrouter:{model_id}"))])
+        rows.append([InlineKeyboardButton(f"FB: {icon} {label}", callback_data=_cb(f"mdl:openrouter:{model_id}"))])
+    rows.append([InlineKeyboardButton("FB: 🔍 Search OpenRouter…", callback_data="mdl:search")])
 
-    rows.append([InlineKeyboardButton("🔍 Search OpenRouter...", callback_data="mdl:search")])
+    sess_note = (
+        f"Active session: {active_session.color_emoji} <b>{esc(active_session.label)}</b>\n"
+        if active_session else
+        "<i>No active session — start one with /new before changing the Claude Code model.</i>\n"
+    )
 
     await u.message.reply_text(
-        f"🤖 <b>Fallback Model</b>\n"
-        f"Active: <code>{esc(current)}</code>\n\n"
+        f"🤖 <b>Model Settings</b>\n"
+        f"{sess_note}"
+        f"\n<b>Claude Code (primary)</b>: <code>{esc(cc_label)}</code>\n"
+        f"<b>Fallback chain</b>: <code>{esc(current_fb)}</code>\n\n"
         f"🎤 STT: <code>{gemini_transcribe}</code>\n"
         f"🧠 Refine: <code>{gemini_refine}</code>\n"
         f"<i>(STT/Refine always use Gemini from config)</i>\n\n"
-        f"Choose fallback for when Claude Code is rate-limited:",
+        f"<b>CC:</b> per-session Claude model · <b>FB:</b> when Claude is rate-limited",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1821,10 +1916,16 @@ async def on_callback(u, c):
         if session: await track_reply(sent, session)
 
     elif d == "do:deploy_ask":
+        if not BOT_DEPLOY_ENABLED:
+            await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
+            return
         proj = session.project if session else DEFAULT_PROJECT
         await c.bot.send_message(cid, f"🚀 <b>Deploy {proj}</b>\nSelect branch:", parse_mode=ParseMode.HTML, reply_markup=deploy_branch_kb(proj))
 
     elif d.startswith("dbr:"):
+        if not BOT_DEPLOY_ENABLED:
+            await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
+            return
         _, proj, br = d.split(":")
         if br == "claude_latest":
             r = subprocess.run(["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
@@ -1833,6 +1934,9 @@ async def on_callback(u, c):
         await q.edit_message_text(f"⚠️ <b>Deploy {proj}@{br}</b> → production?\n\nSure?", parse_mode=ParseMode.HTML, reply_markup=deploy_confirm_kb(proj, br))
 
     elif d.startswith("dpl:"):
+        if not BOT_DEPLOY_ENABLED:
+            await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
+            return
         _, proj, br = d.split(":")
         await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
         r = subprocess.run([f"{SCRIPTS}/deploy-to-prod.sh", proj, br], capture_output=True, text=True, timeout=120)
@@ -2156,7 +2260,10 @@ async def on_callback(u, c):
     # ── Menu inline buttons ──
     elif d == "menu:usage":
         active = SM.active_for_chat(cid)
-        await c.bot.send_message(cid, USAGE.format_usage_message(len(active)), parse_mode=ParseMode.HTML)
+        active_key = ACTIVE_SESSION.get(cid)
+        cur_session = SM.sessions.get(active_key) if active_key else None
+        cur_model = cur_session.claude_model if cur_session else ""
+        await c.bot.send_message(cid, USAGE.format_usage_message(len(active), cur_model), parse_mode=ParseMode.HTML)
 
     elif d == "menu:sessions":
         active = SM.active_for_chat(cid)
@@ -2193,6 +2300,34 @@ async def on_callback(u, c):
         await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     # ── Model selection ──
+    elif d.startswith("ccmod:"):
+        # Claude Code primary model — per-session.
+        choice = d.split(":", 1)[1]
+        active_key = ACTIVE_SESSION.get(cid)
+        target = SM.sessions.get(active_key) if active_key else None
+        if not target:
+            await q.edit_message_text(
+                "ℹ️ No active session. Start one with /new before changing the Claude Code model.",
+                parse_mode=ParseMode.HTML)
+            return
+        if choice == "custom":
+            CONV_STATE[cid] = {"state": "awaiting_claude_model_input", "session_key": target.id}
+            await q.edit_message_text(
+                f"✏️ Type the Claude model to use for session "
+                f"<b>{esc(target.label)}</b>.\n"
+                f"Examples: <code>sonnet</code>, <code>opus</code>, "
+                f"<code>claude-sonnet-4-6</code>.\n"
+                f"Send <code>cancel</code> to abort.",
+                parse_mode=ParseMode.HTML)
+            return
+        new_model = "" if choice == "default" else choice
+        target.claude_model = new_model
+        shown = new_model or "default (CLI default)"
+        await q.edit_message_text(
+            f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
+            f"set to: <code>{esc(shown)}</code>",
+            parse_mode=ParseMode.HTML)
+
     elif d.startswith("mdl:"):
         parts = d.split(":", 2)
         provider = parts[1] if len(parts) > 1 else "gemini"
@@ -2309,6 +2444,9 @@ async def on_voice(u, c):
     if cmd:
         await st.edit_text(f"🎤 <code>{esc(txt)}</code>\n⚡ <b>{cmd}</b>", parse_mode=ParseMode.HTML)
         if cmd == "deploy":
+            if not BOT_DEPLOY_ENABLED:
+                await c.bot.send_message(u.effective_chat.id, "🔒 Deploy is disabled for this bot instance.")
+                return
             proj = session.project if session else DEFAULT_PROJECT
             await c.bot.send_message(u.effective_chat.id, f"🚀 <b>Deploy {proj}</b>", parse_mode=ParseMode.HTML, reply_markup=deploy_branch_kb(proj))
         elif cmd == "health": await do_health(u, c)
@@ -2436,6 +2574,21 @@ async def on_text(u, c):
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{label}:{proj_name}"))]
                     ]))
+            return
+
+        if state == "awaiting_claude_model_input":
+            CONV_STATE.pop(cid, None)
+            target_key = conv.get("session_key")
+            target = SM.sessions.get(target_key) if target_key else None
+            entry = t.strip()
+            if entry.lower() == "cancel" or not target:
+                await u.message.reply_text("❌ Cancelled.")
+                return
+            target.claude_model = entry
+            await u.message.reply_text(
+                f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
+                f"set to: <code>{esc(entry)}</code>",
+                parse_mode=ParseMode.HTML)
             return
 
         if state == "awaiting_model_search":
@@ -2618,7 +2771,7 @@ async def _flush_buffer(cid: int, context):
 _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
-    "tasks", "claude_created",
+    "tasks", "claude_created", "claude_model",
 )
 
 
@@ -2679,6 +2832,7 @@ def load_state():
                 anchor_message_id=s.get("anchor_message_id"),
                 tasks=s.get("tasks", 0),
                 claude_created=s.get("claude_created", False),
+                claude_model=s.get("claude_model", ""),
             )
             SM.sessions[k] = session
             restored += 1
@@ -2766,13 +2920,19 @@ async def post_init(app):
     asyncio.create_task(state_autosave_task())
     # NightWatch IPC last: it returns 503 while the bot is still booting, so
     # any in-flight inject from a fast-firing nightwatch sees the bot ready.
-    await _nw_ipc_start(app)
+    # Gated by BOT_NIGHTWATCH_IPC_ENABLED so a second bot instance can run on
+    # the same host without port-9091 collision.
+    if BOT_NIGHTWATCH_IPC_ENABLED:
+        await _nw_ipc_start(app)
+    else:
+        log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
 
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
     log.info("SIGTERM received — starting graceful shutdown...")
-    await _nw_ipc_stop()
+    if BOT_NIGHTWATCH_IPC_ENABLED:
+        await _nw_ipc_stop()
     # Collect active sessions info before killing
     active = [(k, s) for k, s in SM.sessions.items() if s.status == "running"]
     # Kill all tracked claude subprocesses
@@ -2980,8 +3140,8 @@ def main():
         pool_timeout=30,
     )
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(graceful_shutdown).request(request).build()
-    # Expose bot reference module-wide so non-handler code paths (reset_repo_to_main
-    # failure notice from run_claude) can send Telegram messages.
+    # Expose bot reference module-wide so non-handler code paths (e.g. the
+    # worktree-creation failure notice from run_claude) can send Telegram messages.
     global BOT
     BOT = app.bot
     app.add_handler(CommandHandler("start", cmd_start))

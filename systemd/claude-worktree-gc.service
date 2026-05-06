@@ -1,0 +1,8 @@
+[Unit]
+Description=Claude worktree garbage collection (one-shot)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/shahrzad-devops/scripts/worktree-gc.py
+StandardOutput=journal
+StandardError=journal
