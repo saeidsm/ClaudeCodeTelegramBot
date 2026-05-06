@@ -39,12 +39,26 @@ except ImportError:
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_IDS = [int(x) for x in os.environ.get("TELEGRAM_CHAT_ID", "").split(",") if x.strip()]
 REPOS      = "/opt/shahrzad-devops/repos"
-REPORTS    = "/opt/shahrzad-devops/reports"
+
+# Reports are served behind an unguessable path token. Caddy 404s every
+# /reports/* path that doesn't begin with this token, so the bot must write
+# new reports under the token directory and emit URLs that include it.
+def _load_reports_token() -> str:
+    path = "/opt/shahrzad-devops/configs/reports-token.env"
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("REPORTS_PATH_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    raise RuntimeError(f"REPORTS_PATH_TOKEN not found in {path}")
+_REPORTS_TOKEN = _load_reports_token()
+
+REPORTS    = f"/opt/shahrzad-devops/reports/{_REPORTS_TOKEN}"
 LOGS       = "/opt/shahrzad-devops/logs"
 SCRIPTS    = "/opt/shahrzad-devops/scripts"
 UPLOADS    = "/opt/shahrzad-devops/uploads"
 PROMPTS_FILE = "/opt/shahrzad-devops/configs/gemini-prompts.json"
-REPORT_URL = os.environ.get("REPORTS_BASE_URL", "http://localhost:8080/reports")
+REPORT_URL = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
 MAX_SESSIONS  = 4
@@ -62,6 +76,10 @@ GPT_FALLBACK_MODEL = "gpt-4o"
 # Active fallback model (can be changed at runtime via /model)
 # "gemini" = use Gemini from gemini-prompts.json, "openai" = GPT-4o, "openrouter:<model>" = custom
 ACTIVE_FALLBACK = {"provider": "gemini", "model": ""}
+
+# Module-level Bot reference, populated in main() so non-handler code paths
+# (e.g. branch-reset failure notice from run_claude) can send Telegram messages.
+BOT = None
 
 # ── Logging ──
 for d in [LOGS, UPLOADS, os.path.dirname(PROMPTS_FILE)]:
@@ -103,6 +121,9 @@ class UsageTracker:
         self.daily_limit  = 1_000_000
         self.weekly_limit = 5_000_000
         self.alert_threshold = 0.8    # 80%
+        # In-memory counters for reset_repo_to_main diagnostics (process-lifetime).
+        self.reset_attempts = 0
+        self.reset_successes = 0
         self._load()
 
     def _load(self):
@@ -177,7 +198,8 @@ class UsageTracker:
             f"Today:      <code>{self.format_bar(s['daily_pct'])}</code>\n"
             f"This week:  <code>{self.format_bar(s['weekly_pct'])}</code>\n\n"
             f"Sessions active: {active_sessions}\n"
-            f"Tokens est. today: ~{s['daily_tokens']:,}"
+            f"Tokens est. today: ~{s['daily_tokens']:,}\n"
+            f"Repo resets: {self.reset_successes}/{self.reset_attempts} ok (since boot)"
         )
 
 
@@ -697,6 +719,14 @@ def elapsed_str(ts: float) -> str:
     if d < 3600: return f"{d // 60}m"
     return f"{d // 3600}h {(d % 3600) // 60}m"
 
+def format_ago(seconds: float) -> str:
+    """Compact 'time ago' string: '5s', '2m', '1h', '3d'. For /cont buttons."""
+    s = int(seconds)
+    if s < 60: return f"{s}s"
+    if s < 3600: return f"{s // 60}m"
+    if s < 86400: return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
 # ═══════════════════════════════════════════
 #  Auth
 # ═══════════════════════════════════════════
@@ -713,6 +743,70 @@ def authorized(fn):
 # ═══════════════════════════════════════════
 #  Claude Code
 # ═══════════════════════════════════════════
+def reset_repo_to_main(repo: str) -> tuple[bool, str]:
+    """Bring the shared repo worktree to a clean state on origin/main.
+
+    Phase A safety net for shared-worktree session contamination: every
+    Claude Code spawn first lands on a known-clean origin/main so a prior
+    session's checkout/uncommitted state does not leak into the next.
+    Sessions must NOT depend on uncommitted state from prior sessions.
+
+    Returns (success, message). On failure returns (False, reason) and
+    the caller decides whether to abort or proceed. If repo is not a git
+    work tree, returns (True, "non-git") and skips everything.
+
+    Each git operation has a 30-second timeout. clean -fd preserves
+    .claude-tasks/ (current-session uploads) and .env (not in git).
+    """
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return True, "non-git"
+
+    USAGE.reset_attempts += 1
+
+    steps = [
+        ("rev-parse", ["git", "-C", repo, "rev-parse", "--is-inside-work-tree"]),
+        ("fetch",     ["git", "-C", repo, "fetch", "origin", "--quiet", "--depth=50"]),
+        ("checkout",  ["git", "-C", repo, "checkout", "main"]),
+        ("reset",     ["git", "-C", repo, "reset", "--hard", "origin/main"]),
+        ("clean",     ["git", "-C", repo, "clean", "-fd", "-e", ".claude-tasks", "-e", ".env"]),
+    ]
+    for name, cmd in steps:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            log.warning(f"reset_repo_to_main: {name} timed out for {repo}")
+            return False, f"{name} timeout"
+        except Exception as ex:
+            log.warning(f"reset_repo_to_main: {name} failed for {repo}: {ex}")
+            return False, f"{name} error: {ex}"
+        if r.returncode != 0:
+            stderr = (r.stderr or "").strip()[:200]
+            log.warning(f"reset_repo_to_main: {name} rc={r.returncode} for {repo}: {stderr}")
+            return False, f"{name} rc={r.returncode}: {stderr}"
+
+    USAGE.reset_successes += 1
+    return True, "ok"
+
+
+def repo_state_snapshot(repo: str) -> tuple[str, str, bool]:
+    """Return (branch, short_sha, is_clean) for spawn-time diagnostics."""
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        return "non-git", "-", True
+    try:
+        b = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        s = subprocess.run(["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        st = subprocess.run(["git", "-C", repo, "status", "--porcelain"],
+                            capture_output=True, text=True, timeout=5)
+        branch = (b.stdout or "").strip() or "?"
+        sha = (s.stdout or "").strip() or "?"
+        clean = not (st.stdout or "").strip()
+        return branch, sha, clean
+    except Exception:
+        return "?", "?", False
+
+
 async def _spawn_claude(cmd, repo):
     """Spawn a `claude` subprocess and return (proc, stdout_str, stderr_str)."""
     proc = await asyncio.create_subprocess_exec(
@@ -746,6 +840,28 @@ async def run_claude(prompt, project, session, files=None):
             log.info(f"Created project directory: {repo}")
         except Exception as e:
             return f"❌ Not found: {project}\nCould not create: {e}"
+
+    # Phase A safety net: bring shared worktree to clean origin/main BEFORE
+    # we copy uploaded files to .claude-tasks/ (clean -fd preserves that
+    # directory) and BEFORE we spawn claude.
+    reset_ok, reset_msg = await asyncio.to_thread(reset_repo_to_main, repo)
+    if not reset_ok:
+        log.warning(f"reset_repo_to_main failed for {project} ({repo}): {reset_msg}")
+        try:
+            chat_id = int(session.id.split(":", 1)[0])
+        except (ValueError, IndexError):
+            chat_id = None
+        if chat_id is not None and BOT is not None:
+            try:
+                await BOT.send_message(
+                    chat_id,
+                    f"⚠️ Could not reset {project} to main: {reset_msg}. "
+                    f"Spawning anyway on whatever branch HEAD points to. "
+                    f"Run /sessions to verify.",
+                )
+            except Exception as send_ex:
+                log.warning(f"Failed to send reset-failure notice: {send_ex}")
+
     fnote = ""
     if files:
         td = f"{repo}/.claude-tasks"; os.makedirs(td, exist_ok=True)
@@ -767,6 +883,9 @@ async def run_claude(prompt, project, session, files=None):
 
     proc = None
     try:
+        branch, short_sha, is_clean = repo_state_snapshot(repo)
+        log.info(f"spawn.repo_state project={project} branch={branch} "
+                 f"head={short_sha} clean={is_clean}")
         proc, r, e = await _spawn_claude(cmd, repo)
 
         # Recovery paths
@@ -1194,6 +1313,7 @@ async def cmd_help(u, c):
         "<b>Sessions:</b>\n"
         "/new &lt;name&gt; \u2014 start a new session (max 3)\n"
         "/sessions \u2014 list all active sessions\n"
+        "/cont \u2014 pick an active session and continue it (no scrolling)\n"
         "/kill &lt;name&gt; \u2014 end a session\n"
         "/project &lt;name&gt; \u2014 change project for current session\n"
         "/usage \u2014 view token usage stats\n\n"
@@ -1264,6 +1384,35 @@ async def cmd_sessions(u, c):
     await u.message.reply_text(
         f"📋 <b>Active Sessions:</b>\n\n" + "\n\n".join(lines),
         parse_mode=ParseMode.HTML, reply_markup=sessions_kill_kb(active))
+
+@authorized
+async def cmd_cont(u, c):
+    """Pick an active session to continue without scrolling: /cont"""
+    cid = u.effective_chat.id
+    sessions = sorted(SM.active_for_chat(cid), key=lambda s: s.last_active, reverse=True)
+    if not sessions:
+        await u.effective_message.reply_text(
+            "No active sessions in this chat. Use /new to start one.")
+        return
+    now = time.time()
+    buttons = []
+    for s in sessions:
+        ago = format_ago(now - s.last_active)
+        label = f"{s.color_emoji} {s.label} ({s.project}) · {s.status} · {ago}"
+        # Telegram button text limit is 64 bytes; trim project segment if needed.
+        if len(label.encode("utf-8")) > 60:
+            label = f"{s.color_emoji} {s.label} · {s.status} · {ago}"
+        if len(label.encode("utf-8")) > 60:
+            # Last resort: truncate label segment
+            base = f"{s.color_emoji}  · {s.status} · {ago}"
+            room = 60 - len(base.encode("utf-8"))
+            trimmed = s.label.encode("utf-8")[:max(room, 4)].decode("utf-8", errors="ignore")
+            label = f"{s.color_emoji} {trimmed} · {s.status} · {ago}"
+        buttons.append([InlineKeyboardButton(label, callback_data=_cb(f"cont:{s.id}"))])
+    buttons.append([InlineKeyboardButton("✖️ Cancel", callback_data="cont:cancel")])
+    await u.effective_message.reply_text(
+        "Pick a session to continue:",
+        reply_markup=InlineKeyboardMarkup(buttons))
 
 @authorized
 async def cmd_kill(u, c):
@@ -1635,6 +1784,32 @@ async def on_callback(u, c):
                 parse_mode=ParseMode.HTML)
         else:
             await q.edit_message_text(f"📂 <b>{proj_name}</b> selected.\n💬 Create a session with /new to start.", parse_mode=ParseMode.HTML)
+
+    elif d.startswith("cont:"):
+        # cont:<session_id>  (session_id is "<chat_id>:<label>") or "cont:cancel"
+        payload = d[len("cont:"):]
+        if payload == "cancel":
+            await q.edit_message_text("Cancelled.")
+            return
+        chosen = SM.get_by_key(payload)
+        if not chosen:
+            await q.edit_message_text(
+                "Session no longer exists. Use /sessions to see what's active.")
+            return
+        await q.edit_message_text(
+            f"Selected: {chosen.color_emoji} {esc(chosen.label)} ({esc(chosen.project)})",
+            parse_mode=ParseMode.HTML)
+        anchor = await c.bot.send_message(
+            cid,
+            f"💬 <b>Reply to this message</b> to continue session "
+            f"<code>{esc(chosen.label)}</code> on <code>{esc(chosen.project)}</code>.\n\n"
+            f"Status: {chosen.status} · Last active: "
+            f"{format_ago(time.time() - chosen.last_active)} ago",
+            parse_mode=ParseMode.HTML)
+        # Anchor the reply chain to the chosen session so the user's reply
+        # routes via msg_to_session in find_by_message().
+        SM.register_message(anchor.message_id, chosen.id)
+        chosen.message_ids.append(anchor.message_id)
 
     elif d == "do:report":
         if not session or not session.out:
@@ -2574,6 +2749,7 @@ async def post_init(app):
         BotCommand("help", "\U0001f4d6 Help"),
         BotCommand("new", "\u2795 New session"),
         BotCommand("sessions", "\U0001f4cb List sessions"),
+        BotCommand("cont", "\U0001f4ac Continue a session"),
         BotCommand("kill", "\U0001f5d1 End session"),
         BotCommand("project", "\U0001f4c2 Change project"),
         BotCommand("model", "\U0001f916 Fallback model"),
@@ -2804,10 +2980,15 @@ def main():
         pool_timeout=30,
     )
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(graceful_shutdown).request(request).build()
+    # Expose bot reference module-wide so non-handler code paths (reset_repo_to_main
+    # failure notice from run_claude) can send Telegram messages.
+    global BOT
+    BOT = app.bot
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("sessions", cmd_sessions))
+    app.add_handler(CommandHandler("cont", cmd_cont))
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("usage", cmd_usage))
     app.add_handler(CommandHandler("project", cmd_project))
