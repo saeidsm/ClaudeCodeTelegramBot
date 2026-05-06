@@ -2,6 +2,31 @@
 
 All notable changes to the Shahrzad DevOps Telegram Bot.
 
+## [Unreleased] — 2026-05-06 — Phase B + Multi-bot + Model selection
+
+### Added
+- Per-session ephemeral git worktrees (eliminates cross-session contamination
+  on shared projects)
+- `BOT_DEFAULT_CLAUDE_MODEL` env var for per-bot default model
+- Per-session `claude_model` field; `/model` UI redesigned with two sections
+  (Claude Code primary | Fallback chain)
+- Multi-bot support: env-driven paths (`BOT_DATA_ROOT`, `BOT_REPOS`,
+  `BOT_REPORTS`, `BOT_LOGS`, `BOT_CONFIGS_DIR`, `BOT_UPLOADS`,
+  `BOT_WORKTREE_ROOT`) and feature flags (`BOT_DEPLOY_ENABLED`,
+  `BOT_NIGHTWATCH_IPC_ENABLED`, `BOT_MAX_SESSIONS`) so a second bot instance
+  can run isolated on the same host
+- `SETUP.md` at repo root: single-bot installation, multi-bot deployment,
+  configuration reference, operational tasks, troubleshooting,
+  architecture notes
+
+### Changed
+- `/cont` menu description tightened to `Continue session` (was
+  `Continue a session`); icon changed to ↩️
+- `/model` menu description updated to `Model settings` (was
+  `Fallback model`) to reflect the new two-section UI
+- `README.md` now points to `SETUP.md` at the repo root as the canonical
+  setup guide
+
 ## [Unreleased] — 2026-04-27 — NightWatch IPC integration
 
 Added optional localhost HTTP endpoint for external monitoring services to
