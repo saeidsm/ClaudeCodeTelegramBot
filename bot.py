@@ -572,6 +572,10 @@ class SessionManager:
 SM = SessionManager()
 # Track active claude subprocess PIDs for graceful shutdown
 ACTIVE_PROCS: dict[int, asyncio.subprocess.Process] = {}  # pid -> Process
+# Background task handles so graceful_shutdown can cancel them cleanly
+# (otherwise asyncio logs "Task was destroyed but it is pending!" on exit).
+_BG_TASK_CLEANUP: "asyncio.Task | None" = None
+_BG_TASK_AUTOSAVE: "asyncio.Task | None" = None
 # Store pending messages for multi-session routing: chat_id -> (text, files, message)
 PENDING_MESSAGES: dict[int, dict] = {}
 # Track which session is "focused" per chat — messages without reply go here
@@ -2915,9 +2919,12 @@ async def post_init(app):
     ])
     # Restore previous session state before starting handlers
     load_state()
-    # Start background cleanup + autosave tasks
-    asyncio.create_task(session_cleanup_task(app))
-    asyncio.create_task(state_autosave_task())
+    # Start background cleanup + autosave tasks (handles saved so
+    # graceful_shutdown can cancel them — otherwise asyncio prints
+    # "Task was destroyed but it is pending!" on every restart).
+    global _BG_TASK_CLEANUP, _BG_TASK_AUTOSAVE
+    _BG_TASK_CLEANUP = asyncio.create_task(session_cleanup_task(app))
+    _BG_TASK_AUTOSAVE = asyncio.create_task(state_autosave_task())
     # NightWatch IPC last: it returns 503 while the bot is still booting, so
     # any in-flight inject from a fast-firing nightwatch sees the bot ready.
     # Gated by BOT_NIGHTWATCH_IPC_ENABLED so a second bot instance can run on
@@ -2931,6 +2938,16 @@ async def post_init(app):
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
     log.info("SIGTERM received — starting graceful shutdown...")
+    # Cancel background tasks first so they don't fight shutdown and
+    # don't leave "Task destroyed but pending" warnings in the journal.
+    global _BG_TASK_CLEANUP, _BG_TASK_AUTOSAVE
+    for task_name, task in [("cleanup", _BG_TASK_CLEANUP), ("autosave", _BG_TASK_AUTOSAVE)]:
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception) as e:
+                log.info(f"bg_task.cancelled name={task_name} err={type(e).__name__}")
     if BOT_NIGHTWATCH_IPC_ENABLED:
         await _nw_ipc_stop()
     # Collect active sessions info before killing
