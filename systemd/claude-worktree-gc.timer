@@ -1,0 +1,10 @@
+[Unit]
+Description=Claude worktree garbage collection — orphans >24h, daily 02:00
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+Unit=claude-worktree-gc.service
+
+[Install]
+WantedBy=timers.target
