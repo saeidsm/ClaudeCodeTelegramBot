@@ -85,6 +85,13 @@ MAX_SESSIONS               = int(os.environ.get("BOT_MAX_SESSIONS", "4"))
 # Per-session overrides via /model (Session.claude_model).
 BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
+# Tool permission mode for Claude Code spawns:
+#   skip      → --dangerously-skip-permissions (trusted operator)
+#   allowlist → --allowedTools <BOT_ALLOWED_TOOLS> (collaborators)
+#   strict    → no flag; default Claude Code --print behavior denies non-approved tools
+BOT_TOOL_PERMISSION_MODE = os.environ.get("BOT_TOOL_PERMISSION_MODE", "strict").lower()
+BOT_ALLOWED_TOOLS = os.environ.get("BOT_ALLOWED_TOOLS", "")
+
 # Per-session ephemeral worktrees live here. Each spawn gets its own
 # subdir (<session_id>) so concurrent sessions on the same project don't
 # collide. Cleaned on session exit; orphans GC'd by claude-worktree-gc.timer.
@@ -930,6 +937,12 @@ async def run_claude(prompt, project, session, files=None):
                 chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
                 if chosen_model:
                     cmd += ["--model", chosen_model]
+                # Permission mode: skip / allowlist / strict
+                if BOT_TOOL_PERMISSION_MODE == "skip":
+                    cmd += ["--dangerously-skip-permissions"]
+                elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
+                    cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
+                # else strict: no flag (default Claude Code behavior in --print)
                 cmd += [flag, uuid_str, full_prompt]
                 return cmd
 
@@ -937,7 +950,7 @@ async def run_claude(prompt, project, session, files=None):
             cmd = build_cmd(mode, session.session_uuid)
             log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
                      f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
-                     f"worktree={wt_path}")
+                     f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
             proc, r, e = await _spawn_claude_in(cmd, wt_path)
 
