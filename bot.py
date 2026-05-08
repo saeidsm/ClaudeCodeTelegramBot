@@ -117,6 +117,12 @@ for d in [LOGS, UPLOADS, os.path.dirname(PROMPTS_FILE)]:
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO,
     handlers=[logging.FileHandler(f"{LOGS}/telegram-bot.log"), logging.StreamHandler()])
+# Redact /bot<TOKEN>/ → /bot<redacted>/ in every record passing through the
+# root handlers. python-telegram-bot + httpx log full request URLs at
+# INFO/DEBUG, which include the token. See log_filters.py.
+from log_filters import install_token_redact_filter  # noqa: E402
+
+install_token_redact_filter()
 log = logging.getLogger(__name__)
 
 # ── Load Gemini Prompts (editable file) ──
