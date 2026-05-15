@@ -542,6 +542,18 @@ class SessionManager:
         key = self._key(chat_id, label)
         session = self.sessions.pop(key, None)
         if session:
+            # Terminate the live claude subprocess if any. Without this the
+            # python process was leaked and stayed alive (and kept MCP children
+            # + worktree FDs) until the bot itself restarted.
+            proc = SESSION_PROCS.pop(key, None)
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    log.info(f"kill.session sid={key} pid={proc.pid} subprocess terminated")
+                except ProcessLookupError:
+                    pass
+                except Exception as ex:
+                    log.warning(f"kill.session sid={key} pid={proc.pid} kill failed: {ex}")
             # Clean up message mappings
             to_remove = [mid for mid, sk in self.msg_to_session.items() if sk == key]
             for mid in to_remove:
@@ -585,6 +597,9 @@ class SessionManager:
 SM = SessionManager()
 # Track active claude subprocess PIDs for graceful shutdown
 ACTIVE_PROCS: dict[int, asyncio.subprocess.Process] = {}  # pid -> Process
+# Map session_key -> currently running claude subprocess, so /kill can
+# terminate the child process (not just the in-memory session dict entry).
+SESSION_PROCS: dict[str, asyncio.subprocess.Process] = {}
 # Background task handles so graceful_shutdown can cancel them cleanly
 # (otherwise asyncio logs "Task was destroyed but it is pending!" on exit).
 _BG_TASK_CLEANUP: "asyncio.Task | None" = None
@@ -880,16 +895,39 @@ class WorktreeSession:
         return False
 
 
-async def _spawn_claude_in(cmd, cwd):
-    """Spawn a `claude` subprocess in `cwd` and return (proc, stdout_str, stderr_str)."""
+async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
+    """Spawn a `claude` subprocess in `cwd` and return (proc, stdout_str, stderr_str).
+
+    When `session_key` is provided, the subprocess is registered in SESSION_PROCS
+    so /kill can terminate it. On timeout or cancellation we explicitly kill the
+    child — `asyncio.wait_for` only cancels the wait coroutine, not the OS process,
+    which previously leaked claude + its MCP children for days.
+    """
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
     ACTIVE_PROCS[proc.pid] = proc
+    if session_key:
+        SESSION_PROCS[session_key] = proc
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except (ProcessLookupError, asyncio.TimeoutError):
+                    pass
+                except Exception as ex:
+                    log.warning(f"spawn.kill_on_timeout pid={proc.pid} failed: {ex}")
+            raise
     finally:
         ACTIVE_PROCS.pop(proc.pid, None)
+        if session_key:
+            # Only clear if it is still us — defensive against re-spawn replacing the entry.
+            if SESSION_PROCS.get(session_key) is proc:
+                SESSION_PROCS.pop(session_key, None)
     r = out.decode("utf-8", errors="replace")
     e = err.decode("utf-8", errors="replace") if err else ""
     return proc, r, e
@@ -958,7 +996,7 @@ async def run_claude(prompt, project, session, files=None):
                      f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
                      f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
-            proc, r, e = await _spawn_claude_in(cmd, wt_path)
+            proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
 
             # Recovery paths
             if proc.returncode != 0:
@@ -974,13 +1012,13 @@ async def run_claude(prompt, project, session, files=None):
                     session.session_uuid = str(uuid.uuid4())
                     session.claude_created = False
                     cmd = build_cmd("create", session.session_uuid)
-                    proc, r, e = await _spawn_claude_in(cmd, wt_path)
+                    proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
                     mode = "create"
                 elif mode == "create" and uuid_collision:
                     log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
                     session.session_uuid = str(uuid.uuid4())
                     cmd = build_cmd("create", session.session_uuid)
-                    proc, r, e = await _spawn_claude_in(cmd, wt_path)
+                    proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
 
             if proc.returncode == 0 and not session.claude_created:
                 session.claude_created = True
