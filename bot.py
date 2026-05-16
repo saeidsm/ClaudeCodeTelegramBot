@@ -247,7 +247,10 @@ def load_projects() -> list[dict]:
     """Load projects from JSON config. Auto-generate from REPOS if missing."""
     try:
         with open(PROJECTS_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            # Wrong format (e.g. {} instead of []) — fall through to auto-generate
     except Exception:
         pass
     # Auto-generate from repos directory
