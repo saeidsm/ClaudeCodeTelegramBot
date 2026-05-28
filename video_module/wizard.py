@@ -138,13 +138,15 @@ async def on_logo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_product(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    # Telegram lets each callback query be answered exactly once. So we
+    # branch on q.data first and call q.answer() at most once per call.
     q = update.callback_query
-    await q.answer()
     chosen = ctx.user_data["video_state"].setdefault("product_files", [])
     if q.data == "prod_done":
         if not chosen:
             await q.answer("حداقل یک محصول انتخاب کن.", show_alert=True)
             return S_PRODUCTS
+        await q.answer()
         await q.edit_message_text("تیتر اصلی را تایپ کن (≤۸۰ کاراکتر):")
         return S_HEADLINE
     filename = q.data.split(":", 1)[1]
