@@ -121,6 +121,7 @@ logging.basicConfig(
 # root handlers. python-telegram-bot + httpx log full request URLs at
 # INFO/DEBUG, which include the token. See log_filters.py.
 from log_filters import install_token_redact_filter  # noqa: E402
+from video_module.handlers import register as register_video_module
 
 install_token_redact_filter()
 log = logging.getLogger(__name__)
@@ -2976,6 +2977,10 @@ async def post_init(app):
         BotCommand("nightwatch_ping", "\U0001f319 NightWatch IPC healthz"),
         BotCommand("nightwatch_run", "\U0001f680 Run NightWatch now"),
         BotCommand("nightwatch_last", "\U0001f4e8 Re-send last digest"),
+        BotCommand("video",        "\U0001f3ac ساخت ویدئو"),
+        BotCommand("assets",       "\U0001f4c1 لیست asset برند"),
+        BotCommand("upload_music", "\U0001f3b5 آپلود موزیک"),
+        BotCommand("renders",      "\U0001f4fa آخرین render‌ها"),
     ])
     # Restore previous session state before starting handlers
     load_state()
@@ -3234,6 +3239,7 @@ def main():
     app.add_handler(CommandHandler("nightwatch_ping", cmd_nightwatch_ping))
     app.add_handler(CommandHandler("nightwatch_run", cmd_nightwatch_run))
     app.add_handler(CommandHandler("nightwatch_last", cmd_nightwatch_last))
+    register_video_module(app)
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
