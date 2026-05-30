@@ -5,6 +5,7 @@ all four sibling modules: assets, props, tts, renderer).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -22,6 +23,17 @@ from .renderer import RenderError, RenderJob, render
 
 log = logging.getLogger(__name__)
 _MAX_TG_BYTES = 50 * 1024 * 1024
+
+# Only one render at a time. Multiple renders would stomp public/ and
+# .video-props.json on each other (shared per-project staging area).
+_RENDER_LOCK = asyncio.Lock()
+
+# Required keys present in ctx.user_data["video_state"] before a render can
+# start. A stale inline-keyboard click after a bot restart or wizard reset
+# can land in on_confirm with an empty state; we error gracefully instead
+# of raising KeyError into a never-resolving spinner.
+_REQUIRED_STATE_KEYS = ("brand", "template", "aspect", "logo_file",
+                        "product_files", "headline", "cta", "duration")
 
 
 def _project_dir() -> Path:
@@ -51,6 +63,23 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return await wizard.cancel(update, ctx)
     chat_id = q.message.chat_id
     state = ctx.user_data.get("video_state") or {}
+
+    missing = [k for k in _REQUIRED_STATE_KEYS if not state.get(k)]
+    if missing:
+        await q.edit_message_text(
+            "⚠️ اطلاعات wizard ناقصه (احتمالاً ربات restart شده). "
+            "دوباره /video بزن."
+        )
+        wizard._wipe(ctx, chat_id)
+        return ConversationHandler.END
+
+    if _RENDER_LOCK.locked():
+        await q.edit_message_text(
+            "🎬 یک render دیگه در حال اجراست. وقتی تموم شد دوباره /video بزن."
+        )
+        wizard._wipe(ctx, chat_id)
+        return ConversationHandler.END
+
     try:
         brand_json = assets.load_brand(_assets_root(), state["brand"])
     except FileNotFoundError as e:
@@ -58,6 +87,17 @@ async def on_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     await q.edit_message_text("🎬 در حال render… (~۲ دقیقه)")
+
+    async with _RENDER_LOCK:
+        return await _render_and_deliver(ctx, chat_id, state, brand_json)
+
+
+async def _render_and_deliver(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    state: dict,
+    brand_json: dict,
+) -> int:
 
     # 1. TTS if narration requested
     narration_path = None
