@@ -1,0 +1,25 @@
+#!/bin/bash
+# ZK4 guardrailed deploy: delegates to /root/ZigguratKids4/deploy.sh on prod.
+#
+# This is the COMMITTED template. At rollout, copy it to the untracked live
+# location the bot runs from:
+#   cp scripts/deploy-zk4-prod.sh.example "$BOT_SCRIPTS"/deploy-zk4-prod.sh
+#   chmod +x "$BOT_SCRIPTS"/deploy-zk4-prod.sh
+# and set ZK4_PROD_HOST (and optionally ZK4_PROD_USER) in the bot env,
+# or edit the defaults in the untracked live copy. No real host is committed.
+#
+# Behavior: SSH to prod and run the guardrailed deploy.sh, which enforces
+# main-only, an exclusive flock, GIT_COMMIT stamping, an incremental
+# (no-downtime) rebuild, and a post-build healthcheck. The trailing 2>&1 on
+# the ssh call merges deploy.sh's stderr (abort() reasons, incl. exit 2 lock
+# message) into stdout so the bot can relay it. ssh propagates the remote
+# exit code unchanged, so deploy.sh's 0-6 codes reach the caller. deploy.sh
+# re-pulls and re-checks the branch itself; the checkout below is defensive
+# self-healing only (leaves the tree on main if a prior path left it elsewhere).
+set -euo pipefail
+
+HOST="${ZK4_PROD_HOST:?ZK4_PROD_HOST not set}"
+USER="${ZK4_PROD_USER:-root}"
+
+ssh -o StrictHostKeyChecking=no "${USER}@${HOST}" \
+  'set -o pipefail; cd /root/ZigguratKids4 && git fetch origin && git checkout main && git pull --ff-only && ./deploy.sh' 2>&1
