@@ -733,6 +733,12 @@ def after_kb():
         [InlineKeyboardButton("📊 Health", callback_data="do:health")]])
 
 def deploy_branch_kb(proj):
+    # ZK4 deploys go through the guardrailed deploy.sh, which is main-only.
+    # Offer only main so we never present a branch the deploy path will refuse.
+    if proj == "ZigguratKids4":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌿 main", callback_data=_cb(f"dbr:{proj}:main"))],
+            [InlineKeyboardButton("❌ Cancel", callback_data="do:cancel")]])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🌿 main", callback_data=_cb(f"dbr:{proj}:main"))],
         [InlineKeyboardButton("🔧 dev", callback_data=_cb(f"dbr:{proj}:dev"))],
@@ -2003,6 +2009,46 @@ async def on_callback(u, c):
             await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
             return
         _, proj, br = d.split(":")
+        if proj == "ZigguratKids4":
+            # Route ZK4 through the prod-side guardrailed deploy.sh (main-only,
+            # flock, GIT_COMMIT stamp, incremental no-downtime rebuild, healthcheck).
+            if br != "main":
+                await c.bot.send_message(cid,
+                    "🔒 ZK4 deploys are main-only (guardrailed deploy.sh). Pick 🌿 main.")
+                return
+            await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
+            try:
+                # Long timeout: a real build is 6-8 min (vs the old 120s that
+                # SIGKILLed mid-build → outage). Wrapper merges remote stderr.
+                r = subprocess.run([f"{SCRIPTS}/deploy-zk4-prod.sh"],
+                                   capture_output=True, text=True, timeout=900)
+            except subprocess.TimeoutExpired:
+                await c.bot.send_message(cid,
+                    "⏱ <b>Deploy exceeded 15 min.</b>\n\nThe build may still be "
+                    "running on prod — do NOT re-trigger. Check <code>docker compose "
+                    "ps</code> / /api/health before retrying.",
+                    parse_mode=ParseMode.HTML)
+                return
+            ok = r.returncode == 0
+            if ok:
+                head = "✅ <b>Done</b>"
+            else:
+                reason = {
+                    1: "wrong branch / bad arg",
+                    2: "⏳ another deploy holds the lock (concurrent deploy)",
+                    3: "git pull failed",
+                    4: "docker build/up failed",
+                    5: "healthcheck failed",
+                    6: "post-deploy checkout failed",
+                }.get(r.returncode, f"exit {r.returncode}")
+                head = f"❌ <b>Failed</b> — {esc(reason)}"
+            # Result lines (GIT_COMMIT=, health 200 OK, deploy complete, abort
+            # reasons) are at the END of the output → show the tail, not the head.
+            msg = head + f"\n\n<pre>{esc((r.stdout or '')[-3000:])}</pre>"
+            if r.stderr and r.stderr.strip():
+                msg += f"\n<pre>{esc(r.stderr[-800:])}</pre>"
+            await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
+            return
         await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
         r = subprocess.run([f"{SCRIPTS}/deploy-to-prod.sh", proj, br], capture_output=True, text=True, timeout=120)
         ok = r.returncode == 0
