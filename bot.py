@@ -72,6 +72,9 @@ REPORT_URL    = f"https://devops.shahrzad.ai/reports/{_REPORTS_TOKEN}"
 DEFAULT_PROJECT = "ZigguratKids4"
 PAUSE_SECONDS = 5
 SESSION_TIMEOUT_MINUTES = 72 * 60  # 72 hours for most sessions
+# Hard ceiling for a single `claude --print` run (was 3600; deploy-watch
+# prompts legitimately run >1h). Env-overridable for emergencies.
+SPAWN_TIMEOUT_SECONDS = int(os.environ.get("BOT_SPAWN_TIMEOUT_SECONDS", "7200"))
 PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
 
 # ── Feature flags + per-bot quotas (env-controllable) ──
@@ -552,8 +555,8 @@ class SessionManager:
             proc = SESSION_PROCS.pop(key, None)
             if proc is not None and proc.returncode is None:
                 try:
-                    proc.kill()
-                    log.info(f"kill.session sid={key} pid={proc.pid} subprocess terminated")
+                    _kill_tree(proc.pid)
+                    log.info(f"kill.session sid={key} pid={proc.pid} subprocess tree terminated")
                 except ProcessLookupError:
                     pass
                 except Exception as ex:
@@ -905,6 +908,41 @@ class WorktreeSession:
         return False
 
 
+def _collect_tree(pid: int) -> list[int]:
+    """Return pid + all /proc descendants (depth-first), even ones that
+    called setsid() — claude's Bash tool calls are their own session leaders,
+    so pgroup/session-based kills miss them (2026-06-05 regression)."""
+    pids = [pid]
+    try:
+        for tid in os.listdir(f"/proc/{pid}/task"):
+            try:
+                children = Path(f"/proc/{pid}/task/{tid}/children").read_text().split()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            for child in children:
+                pids.extend(_collect_tree(int(child)))
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        pass
+    return pids
+
+
+def _kill_tree(pid: int) -> None:
+    """SIGKILL `pid` and every descendant. Collect first, then kill — a child
+    spawned in the race window dies with its parent (orphaned sleep ≤20s).
+    Without this, `until pgrep ...` wait-loops survived the claude kill,
+    reparented to PID 1, and poisoned future pgrep-based loops forever."""
+    victims = _collect_tree(pid)
+    for p in victims:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as ex:
+            log.warning(f"kill_tree pid={p} failed: {ex}")
+    if len(victims) > 1:
+        log.info(f"kill_tree root={pid} killed {len(victims)} processes: {victims}")
+
+
 async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
     """Spawn a `claude` subprocess in `cwd` and return (proc, stdout_str, stderr_str).
 
@@ -921,11 +959,13 @@ async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
         SESSION_PROCS[session_key] = proc
     try:
         try:
-            out, err = await asyncio.wait_for(proc.communicate(), timeout=3600)
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=SPAWN_TIMEOUT_SECONDS)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             if proc.returncode is None:
                 try:
-                    proc.kill()
+                    # Kill the WHOLE tree, not just claude: Bash tool calls are
+                    # session leaders and used to survive as immortal orphans.
+                    _kill_tree(proc.pid)
                     await asyncio.wait_for(proc.wait(), timeout=10)
                 except (ProcessLookupError, asyncio.TimeoutError):
                     pass
@@ -1060,9 +1100,9 @@ async def run_claude(prompt, project, session, files=None):
         return f"❌ Worktree creation failed: {rt_err}"
     except asyncio.TimeoutError:
         try:
-            if proc: proc.kill()
+            if proc: _kill_tree(proc.pid)
         except: pass
-        return "⏰ Timeout (60 min)."
+        return f"⏰ Timeout ({SPAWN_TIMEOUT_SECONDS // 60} min)."
     except Exception as e:
         return f"❌ {e}"
 
