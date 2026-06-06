@@ -88,6 +88,16 @@ MAX_SESSIONS               = int(os.environ.get("BOT_MAX_SESSIONS", "4"))
 # Per-session overrides via /model (Session.claude_model).
 BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
+# Sonnet-1M model offered as an immediate switch when Claude (Opus) is
+# overloaded. The "[1m]" suffix selects the 1M-context variant (same syntax the
+# CLI uses for claude-opus-4-8[1m]). Override via env if the id ever changes.
+SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "claude-sonnet-4-6[1m]")
+# Seconds to wait before the single automatic retry on a Claude rate-limit.
+try:
+    RATE_LIMIT_RETRY_DELAY = int(os.environ.get("BOT_RATE_LIMIT_RETRY_DELAY", "60"))
+except ValueError:
+    RATE_LIMIT_RETRY_DELAY = 60
+
 # Tool permission mode for Claude Code spawns:
 #   skip      → --dangerously-skip-permissions (trusted operator)
 #   allowlist → --allowedTools <BOT_ALLOWED_TOOLS> (collaborators)
@@ -646,6 +656,14 @@ DELAYED_PROMPTS: dict[str, DelayedPrompt] = {}
 # Pending delay picks: chat_id -> delay info waiting for session selection
 PENDING_DELAYS: dict[int, dict] = {}
 
+# ── Rate-limit interactive flow ──
+# run_claude → caller: handled out-of-band (flow took over), don't post output.
+RL_ASK_SENTINEL     = "\x00__RL_ASK__\x00"
+# raw mode → caller: spawn finished but Claude is still rate-limited.
+RL_LIMITED_SENTINEL = "\x00__RL_LIMITED__\x00"
+# rl_id -> {prompt, project, session_key, files, chat_id} awaiting a button tap.
+PENDING_RATELIMITS: dict[str, dict] = {}
+
 
 def parse_delay(text: str) -> tuple[Optional[int], str, bool]:
     """Parse :DELAY=30M: or :DELAY=2H: or :DELAY=NEXT: prefix.
@@ -983,7 +1001,7 @@ async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
     return proc, r, e
 
 
-async def run_claude(prompt, project, session, files=None):
+async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
     """Invoke Claude Code for a session inside a per-session git worktree.
 
     Phase B: each spawn runs in WORKTREE_ROOT/<session_id>, a fresh worktree
@@ -1075,12 +1093,23 @@ async def run_claude(prompt, project, session, files=None):
 
             USAGE.record(len(full_prompt), len(r), session.label)
 
-            # Rate-limit fallback
+            # Rate-limit handling (auto-Gemini/GPT fallback removed — Gemini is
+            # now reachable only via the explicit Consult button)
             if proc.returncode != 0:
                 combined = (r + e).lower()
                 if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
-                    log.warning(f"Claude rate-limited for session {session.session_uuid[:8]}, falling back to GPT")
-                    return await gpt_fallback(prompt, project)
+                    raw = (e or r).strip()
+                    # Log the RAW CLI error so overload-vs-usage-cap is diagnosable.
+                    log.warning(
+                        f"Claude rate-limited sid={session.id} "
+                        f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                        f"rc={proc.returncode} raw_err={raw[:600]!r}")
+                    if _rl_mode == "raw":
+                        return RL_LIMITED_SENTINEL
+                    # Hand off to the interactive flow (auto-retry once, then ask)
+                    # as a background task so this serial handler stays responsive.
+                    asyncio.create_task(_rate_limit_flow(prompt, project, session, files))
+                    return RL_ASK_SENTINEL
 
             if proc.returncode != 0 and e:
                 r += f"\n⚠️ {e[:500]}"
@@ -1105,6 +1134,107 @@ async def run_claude(prompt, project, session, files=None):
         return f"⏰ Timeout ({SPAWN_TIMEOUT_SECONDS // 60} min)."
     except Exception as e:
         return f"❌ {e}"
+
+
+# ═══════════════════════════════════════════
+#  Rate-limit interactive flow
+# ═══════════════════════════════════════════
+def _rl_keyboard(rl_id: str, session) -> InlineKeyboardMarkup:
+    """Buttons offered when Claude stays overloaded after the auto-retry."""
+    cur_model = (session.claude_model if session else "") or BOT_DEFAULT_CLAUDE_MODEL
+    rows = [[
+        InlineKeyboardButton("⏱ 5 min",  callback_data=f"rl:defer:{rl_id}:300"),
+        InlineKeyboardButton("⏱ 20 min", callback_data=f"rl:defer:{rl_id}:1200"),
+        InlineKeyboardButton("⏱ 45 min", callback_data=f"rl:defer:{rl_id}:2700"),
+    ]]
+    # No point offering Sonnet if we're already on it.
+    if cur_model != SONNET_1M_MODEL:
+        rows.append([InlineKeyboardButton(
+            "⚡ Switch to Sonnet 1M now", callback_data=f"rl:sonnet:{rl_id}")])
+    prov = (ACTIVE_FALLBACK.get("provider") or "gemini").title()
+    rows.append([InlineKeyboardButton(
+        f"🔮 Consult {prov} (advice only)", callback_data=f"rl:consult:{rl_id}")])
+    rows.append([InlineKeyboardButton("✖ Cancel", callback_data=f"rl:cancel:{rl_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _rate_limit_flow(prompt, project, session, files=None):
+    """Claude was rate-limited. Inform the user, auto-retry once after a short
+    delay, and if still limited present defer / Sonnet-1M / consult options.
+
+    Runs as a background task (the bot processes updates serially, so we must
+    not block here). Gemini/GPT are NOT auto-invoked — only via the Consult
+    button the user can tap below.
+    """
+    try:
+        chat_id = int(session.id.split(":")[0])
+    except (ValueError, AttributeError, IndexError):
+        return
+
+    notice = None
+    try:
+        notice = await BOT.send_message(
+            chat_id,
+            f"⏳ <b>Claude is overloaded right now.</b>\n"
+            f"This is the servers being busy — not your daily/weekly limit.\n"
+            f"Auto-retrying once in {RATE_LIMIT_RETRY_DELAY}s…",
+            parse_mode=ParseMode.HTML)
+    except Exception as ex:
+        log.error(f"rate_limit_flow notice error: {ex}")
+
+    await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
+
+    session.status = "running"
+    output = await run_claude(prompt, project, session, files, _rl_mode="raw")
+    session.status = "idle"
+    session.last_active = time.time()
+
+    if output != RL_LIMITED_SENTINEL:
+        # Retry produced a real result (success or a normal error) — post it.
+        session.out = output
+        session.tasks += 1
+        try:
+            if notice:
+                try: await notice.delete()
+                except Exception: pass
+            sent = await BOT.send_message(
+                chat_id,
+                f"{session_prefix(session)} | 🤖 <code>{project}</code> (auto-retry)\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
+                parse_mode=ParseMode.HTML, reply_markup=after_kb())
+            await track_reply(sent, session)
+            if len(output) > 8000:
+                lnk = await make_report(f"{project}-retry", output)
+                await BOT.send_message(
+                    chat_id, f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
+                    parse_mode=ParseMode.HTML)
+        except Exception as ex:
+            log.error(f"rate_limit_flow post error: {ex}")
+        return
+
+    # Still overloaded → ask the user how to proceed.
+    rl_id = uuid.uuid4().hex[:8]
+    PENDING_RATELIMITS[rl_id] = {
+        "prompt": prompt, "project": project, "session_key": session.id,
+        "files": files or [], "chat_id": chat_id,
+    }
+    text = (
+        f"🚦 <b>Claude is still overloaded</b> after a retry.\n"
+        f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
+        f"<pre>{esc(prompt[:300])}</pre>\n\n"
+        f"How should I proceed?\n"
+        f"• <b>Defer</b> — I'll resend automatically later\n"
+        f"• <b>Sonnet 1M</b> — continue now on Sonnet, context kept\n"
+        f"• <b>Consult</b> — quick advice from the fallback model (no code execution)")
+    try:
+        kb = _rl_keyboard(rl_id, session)
+        if notice:
+            await notice.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        else:
+            await BOT.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+    except Exception as ex:
+        log.error(f"rate_limit_flow ask error: {ex}")
+
 
 # ═══════════════════════════════════════════
 #  Gemini: Transcribe + Refine
@@ -1365,6 +1495,11 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
     try: await cm.delete()
     except: pass
 
+    # Rate-limit flow took over (auto-retry + buttons sent separately) — done.
+    if output == RL_ASK_SENTINEL:
+        session.status = "idle"; session.last_active = time.time()
+        return
+
     session.out = output
     session.status = "idle"
     session.tasks += 1
@@ -1505,7 +1640,7 @@ async def cmd_help(u, c):
         "/delayed — view/cancel pending\n\n"
         "<b>Smart features:</b>\n"
         "\u2022 Sessions auto-close after 72h inactivity (ZigguratKids4: never)\n"
-        "\u2022 GPT fallback when Claude is rate-limited\n"
+        "\u2022 Rate-limit: auto-retry once, then defer / switch to Sonnet 1M / consult\n"
         "\u2022 Usage alerts at 80% hourly limit\n",
         parse_mode=ParseMode.HTML)
 
@@ -1721,7 +1856,7 @@ async def cmd_model(u, c):
         f"🎤 STT: <code>{gemini_transcribe}</code>\n"
         f"🧠 Refine: <code>{gemini_refine}</code>\n"
         f"<i>(STT/Refine always use Gemini from config)</i>\n\n"
-        f"<b>CC:</b> per-session Claude model · <b>FB:</b> when Claude is rate-limited",
+        f"<b>CC:</b> per-session Claude model · <b>FB:</b> manual 🔮 Consult only (no auto-fallback)",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1779,6 +1914,11 @@ async def schedule_delayed_prompt(dp: DelayedPrompt, app):
         output = await run_claude(dp.prompt, project, session, dp.files or None)
     except Exception as e:
         output = f"❌ Delayed execution error: {e}"
+
+    if output == RL_ASK_SENTINEL:
+        session.status = "idle"; session.last_active = time.time()
+        DELAYED_PROMPTS.pop(dp.id, None)
+        return
 
     session.out = output
     session.status = "idle"
@@ -1873,6 +2013,10 @@ async def schedule_next_delayed_prompt(dp: DelayedPrompt, app):
             output = await run_claude(dp.prompt, project, session, dp.files or None)
         except Exception as e:
             output = f"❌ Delayed execution error: {e}"
+
+        if output == RL_ASK_SENTINEL:
+            session.status = "idle"; session.last_active = time.time()
+            return  # finally-block pops DELAYED_PROMPTS
 
         session.out = output
         session.status = "idle"
@@ -2118,6 +2262,9 @@ async def on_callback(u, c):
         files = session.files; session.files = []
         session.status = "running"
         output = await run_claude(vt, session.project, session, files or None)
+        if output == RL_ASK_SENTINEL:
+            session.status = "idle"; session.last_active = time.time()
+            return
         session.out = output; session.status = "idle"
         session.tasks += 1; session.last_active = time.time()
         sent = await c.bot.send_message(cid,
@@ -2246,6 +2393,9 @@ async def on_callback(u, c):
                 # Fallback: run claude directly and send output
                 session.status = "running"
                 output = await run_claude(pending["text"], session.project, session, f or None)
+                if output == RL_ASK_SENTINEL:
+                    session.status = "idle"; session.last_active = time.time()
+                    return
                 session.out = output; session.status = "idle"
                 session.tasks += 1; session.last_active = time.time()
                 sent = await c.bot.send_message(cid,
@@ -2394,6 +2544,81 @@ async def on_callback(u, c):
                         [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{delay_id}")]
                     ]))
             log.info(f"Delayed prompt {delay_id[:8]} scheduled for session {session.label} ({'NEXT' if is_next else dp.delay_str})")
+
+    elif d.startswith("rl:"):
+        # Rate-limit options: rl:<action>:<rl_id>[:<secs>]
+        parts = d.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        rl_id = parts[2] if len(parts) > 2 else ""
+        pend = PENDING_RATELIMITS.get(rl_id)
+        if not pend:
+            await q.edit_message_text(
+                "⚠️ This rate-limit prompt expired (already handled or bot restarted).",
+                parse_mode=ParseMode.HTML)
+            return
+        if action == "cancel":
+            PENDING_RATELIMITS.pop(rl_id, None)
+            await q.edit_message_text("✖ Cancelled. Nothing was sent.", parse_mode=ParseMode.HTML)
+            return
+        target = SM.get_by_key(pend["session_key"])
+        if not target:
+            PENDING_RATELIMITS.pop(rl_id, None)
+            await q.edit_message_text("❌ Session no longer exists.", parse_mode=ParseMode.HTML)
+            return
+
+        if action == "defer":
+            secs = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1200
+            PENDING_RATELIMITS.pop(rl_id, None)
+            dp = DelayedPrompt(
+                id=uuid.uuid4().hex, chat_id=pend["chat_id"], prompt=pend["prompt"],
+                project=pend["project"], session_label=target.label,
+                session_key=target.id, scheduled_at=time.time(),
+                fire_at=time.time() + secs, delay_str=format_delay(secs),
+                files=pend["files"],
+            )
+            DELAYED_PROMPTS[dp.id] = dp
+            dp.task = asyncio.create_task(schedule_delayed_prompt(dp, c.application))
+            fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M:%S")
+            await q.edit_message_text(
+                f"⏰ <b>Scheduled.</b> I'll resend in <b>{dp.delay_str}</b> (at {fire_time}).\n"
+                f"{session_prefix(target)} | 📂 <code>{pend['project']}</code>\n\n"
+                f"<pre>{esc(pend['prompt'][:200])}</pre>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{dp.id}")]]))
+            log.info(f"Rate-limit defer {rl_id}: {dp.delay_str} for {target.label}")
+
+        elif action == "sonnet":
+            PENDING_RATELIMITS.pop(rl_id, None)
+            target.claude_model = SONNET_1M_MODEL
+            await q.edit_message_text(
+                f"⚡ Switched <b>{session_prefix(target)}</b> to <b>Sonnet 1M</b> "
+                f"(<code>{esc(SONNET_1M_MODEL)}</code>) and continuing — context is kept.\n"
+                f"Use /model to switch back to Opus later.",
+                parse_mode=ParseMode.HTML)
+            # Fire immediately via the delayed-prompt runner (handles worktree +
+            # output posting). The session model is now Sonnet 1M.
+            dp = DelayedPrompt(
+                id=uuid.uuid4().hex, chat_id=pend["chat_id"], prompt=pend["prompt"],
+                project=pend["project"], session_label=target.label,
+                session_key=target.id, scheduled_at=time.time(),
+                fire_at=time.time(), delay_str="now (Sonnet 1M)", files=pend["files"],
+            )
+            DELAYED_PROMPTS[dp.id] = dp
+            dp.task = asyncio.create_task(schedule_delayed_prompt(dp, c.application))
+            log.info(f"Rate-limit sonnet-switch {rl_id} for {target.label}")
+
+        elif action == "consult":
+            await q.edit_message_text("🔮 Consulting fallback model…", parse_mode=ParseMode.HTML)
+            advice = await gpt_fallback(pend["prompt"], pend["project"])
+            PENDING_RATELIMITS.pop(rl_id, None)
+            body = (f"{session_prefix(target)} | 🔮 <b>Consult</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(advice)}")
+            try:
+                await q.edit_message_text(body, parse_mode=ParseMode.HTML)
+            except Exception:
+                await send_long(q.message, body)
+            log.info(f"Rate-limit consult {rl_id} for {target.label}")
 
     elif d == "do:cancel":
         await q.edit_message_text("❌ Cancelled.")
@@ -3084,7 +3309,7 @@ async def post_init(app):
         await _nw_ipc_start(app)
     else:
         log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
-    log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | GPT fallback={'\u2705' if OPENAI_API_KEY else '\u274c'}")
+    log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | Consult(GPT)={'\u2705' if OPENAI_API_KEY else '\u274c'} | Sonnet1M={SONNET_1M_MODEL}")
 
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
