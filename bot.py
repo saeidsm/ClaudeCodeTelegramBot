@@ -4,7 +4,7 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -97,6 +97,15 @@ try:
     RATE_LIMIT_RETRY_DELAY = int(os.environ.get("BOT_RATE_LIMIT_RETRY_DELAY", "60"))
 except ValueError:
     RATE_LIMIT_RETRY_DELAY = 60
+# When Claude is still overloaded after the auto-retry, the bot auto-schedules a
+# resend at a RANDOM delay in this window (spreads load so we don't all hammer
+# the pool at the same minute). User can override to an urgent 5-min resend.
+try:
+    RL_DEFER_MIN_SECS = int(os.environ.get("BOT_RL_DEFER_MIN_SECS", "600"))   # 10 min
+    RL_DEFER_MAX_SECS = int(os.environ.get("BOT_RL_DEFER_MAX_SECS", "2100"))  # 35 min
+except ValueError:
+    RL_DEFER_MIN_SECS, RL_DEFER_MAX_SECS = 600, 2100
+RL_URGENT_SECS = 300  # the "urgent" override: resend in 5 min
 
 # Tool permission mode for Claude Code spawns:
 #   skip      → --dangerously-skip-permissions (trusted operator)
@@ -123,6 +132,7 @@ ACTIVE_FALLBACK = {"provider": "gemini", "model": ""}
 # Module-level Bot reference, populated in main() so non-handler code paths
 # (e.g. branch-reset failure notice from run_claude) can send Telegram messages.
 BOT = None
+APPLICATION = None  # telegram Application; set in main() so non-handler paths can schedule work
 
 # ── Logging ──
 for d in [LOGS, UPLOADS, os.path.dirname(PROMPTS_FILE)]:
@@ -1093,8 +1103,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
             USAGE.record(len(full_prompt), len(r), session.label)
 
-            # Rate-limit handling (auto-Gemini/GPT fallback removed — Gemini is
-            # now reachable only via the explicit Consult button)
+            # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
+            # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
             if proc.returncode != 0:
                 combined = (r + e).lower()
                 if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
@@ -1140,31 +1150,58 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 #  Rate-limit interactive flow
 # ═══════════════════════════════════════════
 def _rl_keyboard(rl_id: str, session) -> InlineKeyboardMarkup:
-    """Buttons offered when Claude stays overloaded after the auto-retry."""
+    """Buttons shown once we've AUTO-scheduled a resend (random 10–35 min).
+
+    The user doesn't have to tap anything — the resend is already queued. The
+    buttons only let them override: bring it forward to 5 min (urgent), switch
+    to Sonnet 1M and run now, or cancel the queued resend. (Gemini/GPT consult
+    was removed from this flow — use /model to switch models instead.)
+    """
     cur_model = (session.claude_model if session else "") or BOT_DEFAULT_CLAUDE_MODEL
-    rows = [[
-        InlineKeyboardButton("⏱ 5 min",  callback_data=f"rl:defer:{rl_id}:300"),
-        InlineKeyboardButton("⏱ 20 min", callback_data=f"rl:defer:{rl_id}:1200"),
-        InlineKeyboardButton("⏱ 45 min", callback_data=f"rl:defer:{rl_id}:2700"),
-    ]]
+    rows = [[InlineKeyboardButton(
+        "⚡ اورژانسی: الان ۵ دقیقه دیگه", callback_data=f"rl:urgent:{rl_id}")]]
     # No point offering Sonnet if we're already on it.
     if cur_model != SONNET_1M_MODEL:
         rows.append([InlineKeyboardButton(
             "⚡ Switch to Sonnet 1M now", callback_data=f"rl:sonnet:{rl_id}")])
-    prov = (ACTIVE_FALLBACK.get("provider") or "gemini").title()
-    rows.append([InlineKeyboardButton(
-        f"🔮 Consult {prov} (advice only)", callback_data=f"rl:consult:{rl_id}")])
-    rows.append([InlineKeyboardButton("✖ Cancel", callback_data=f"rl:cancel:{rl_id}")])
+    rows.append([InlineKeyboardButton("✖ Cancel resend", callback_data=f"rl:cancel:{rl_id}")])
     return InlineKeyboardMarkup(rows)
+
+
+def _queue_resend(pend: dict, secs: int, session_label: str) -> "DelayedPrompt":
+    """Create + start a DelayedPrompt that resends `pend`'s prompt after `secs`."""
+    dp = DelayedPrompt(
+        id=uuid.uuid4().hex, chat_id=pend["chat_id"], prompt=pend["prompt"],
+        project=pend["project"], session_label=session_label,
+        session_key=pend["session_key"], scheduled_at=time.time(),
+        fire_at=time.time() + secs, delay_str=format_delay(secs),
+        files=pend.get("files") or [],
+    )
+    DELAYED_PROMPTS[dp.id] = dp
+    dp.task = asyncio.create_task(schedule_delayed_prompt(dp, APPLICATION))
+    return dp
+
+
+def _cancel_resend(pend: dict):
+    """Cancel the auto-scheduled resend referenced by pend['dp_id'], if any."""
+    dp_id = (pend or {}).get("dp_id")
+    if not dp_id:
+        return
+    odp = DELAYED_PROMPTS.pop(dp_id, None)
+    if odp:
+        odp.cancelled = True
+        if odp.task:
+            odp.task.cancel()
 
 
 async def _rate_limit_flow(prompt, project, session, files=None):
     """Claude was rate-limited. Inform the user, auto-retry once after a short
-    delay, and if still limited present defer / Sonnet-1M / consult options.
+    delay, and if still overloaded AUTO-schedule a resend at a random 10–35 min
+    delay (with urgent-5min / Sonnet-1M / cancel overrides).
 
     Runs as a background task (the bot processes updates serially, so we must
-    not block here). Gemini/GPT are NOT auto-invoked — only via the Consult
-    button the user can tap below.
+    not block here). Gemini/GPT are never invoked here anymore — switch models
+    via /model if you want a different engine.
     """
     try:
         chat_id = int(session.id.split(":")[0])
@@ -1212,20 +1249,27 @@ async def _rate_limit_flow(prompt, project, session, files=None):
             log.error(f"rate_limit_flow post error: {ex}")
         return
 
-    # Still overloaded → ask the user how to proceed.
+    # Still overloaded → AUTO-schedule a resend at a random 10–35 min delay so
+    # requests naturally spread off the busy pool instead of all retrying at the
+    # same minute. The user doesn't have to do anything; buttons only let them
+    # bring it forward (urgent 5 min), switch to Sonnet 1M now, or cancel.
     rl_id = uuid.uuid4().hex[:8]
+    secs = random.randint(RL_DEFER_MIN_SECS, RL_DEFER_MAX_SECS)
     PENDING_RATELIMITS[rl_id] = {
         "prompt": prompt, "project": project, "session_key": session.id,
         "files": files or [], "chat_id": chat_id,
     }
+    dp = _queue_resend(PENDING_RATELIMITS[rl_id], secs, session.label)
+    PENDING_RATELIMITS[rl_id]["dp_id"] = dp.id
+    fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M")
+    log.info(f"Rate-limit auto-defer {rl_id}: {dp.delay_str} for {session.label}")
     text = (
-        f"🚦 <b>Claude is still overloaded</b> after a retry.\n"
+        f"🚦 <b>Claude هنوز شلوغه</b> — سرورها شلوغن، نه سقف روزانه/هفتگی تو.\n"
         f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
         f"<pre>{esc(prompt[:300])}</pre>\n\n"
-        f"How should I proceed?\n"
-        f"• <b>Defer</b> — I'll resend automatically later\n"
-        f"• <b>Sonnet 1M</b> — continue now on Sonnet, context kept\n"
-        f"• <b>Consult</b> — quick advice from the fallback model (no code execution)")
+        f"⏰ خودکار <b>{dp.delay_str}</b> دیگه (حدود ساعت {fire_time}) دوباره می‌فرستم — "
+        f"کاری لازم نیست بکنی.\n"
+        f"اگه عجله داری یا می‌خوای همین الان ادامه بدی، یکی از دکمه‌ها رو بزن:")
     try:
         kb = _rl_keyboard(rl_id, session)
         if notice:
@@ -1640,7 +1684,8 @@ async def cmd_help(u, c):
         "/delayed — view/cancel pending\n\n"
         "<b>Smart features:</b>\n"
         "\u2022 Sessions auto-close after 72h inactivity (ZigguratKids4: never)\n"
-        "\u2022 Rate-limit: auto-retry once, then defer / switch to Sonnet 1M / consult\n"
+        "\u2022 Rate-limit: auto-retry once, then auto-resend in 10\u201335 min "
+        "(urgent 5 min / Sonnet 1M override)\n"
         "\u2022 Usage alerts at 80% hourly limit\n",
         parse_mode=ParseMode.HTML)
 
@@ -1856,7 +1901,7 @@ async def cmd_model(u, c):
         f"🎤 STT: <code>{gemini_transcribe}</code>\n"
         f"🧠 Refine: <code>{gemini_refine}</code>\n"
         f"<i>(STT/Refine always use Gemini from config)</i>\n\n"
-        f"<b>CC:</b> per-session Claude model · <b>FB:</b> manual 🔮 Consult only (no auto-fallback)",
+        f"<b>CC:</b> per-session Claude model · <b>FB:</b> no auto-fallback; rate-limit → auto-resend / Sonnet 1M",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows))
 
@@ -2557,8 +2602,11 @@ async def on_callback(u, c):
                 parse_mode=ParseMode.HTML)
             return
         if action == "cancel":
+            _cancel_resend(pend)
             PENDING_RATELIMITS.pop(rl_id, None)
-            await q.edit_message_text("✖ Cancelled. Nothing was sent.", parse_mode=ParseMode.HTML)
+            await q.edit_message_text(
+                "✖ لغو شد. resend زمان‌بندی‌شده حذف شد و چیزی فرستاده نمی‌شه.",
+                parse_mode=ParseMode.HTML)
             return
         target = SM.get_by_key(pend["session_key"])
         if not target:
@@ -2566,29 +2614,28 @@ async def on_callback(u, c):
             await q.edit_message_text("❌ Session no longer exists.", parse_mode=ParseMode.HTML)
             return
 
-        if action == "defer":
-            secs = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1200
+        if action in ("urgent", "defer"):
+            # urgent = override the auto-scheduled resend to fire in 5 min.
+            # (defer kept for backward-compat with pre-restart inline buttons that
+            #  carried an explicit :<secs>.)
+            _cancel_resend(pend)
+            secs = (int(parts[3]) if action == "defer" and len(parts) > 3
+                    and parts[3].isdigit() else RL_URGENT_SECS)
+            dp = _queue_resend(pend, secs, target.label)
             PENDING_RATELIMITS.pop(rl_id, None)
-            dp = DelayedPrompt(
-                id=uuid.uuid4().hex, chat_id=pend["chat_id"], prompt=pend["prompt"],
-                project=pend["project"], session_label=target.label,
-                session_key=target.id, scheduled_at=time.time(),
-                fire_at=time.time() + secs, delay_str=format_delay(secs),
-                files=pend["files"],
-            )
-            DELAYED_PROMPTS[dp.id] = dp
-            dp.task = asyncio.create_task(schedule_delayed_prompt(dp, c.application))
-            fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M:%S")
+            fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M")
             await q.edit_message_text(
-                f"⏰ <b>Scheduled.</b> I'll resend in <b>{dp.delay_str}</b> (at {fire_time}).\n"
+                f"⚡ <b>اورژانسی.</b> سر ساعت <b>{fire_time}</b> "
+                f"(<b>{dp.delay_str}</b> دیگه) دوباره می‌فرستم.\n"
                 f"{session_prefix(target)} | 📂 <code>{pend['project']}</code>\n\n"
                 f"<pre>{esc(pend['prompt'][:200])}</pre>",
                 parse_mode=ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("❌ Cancel", callback_data=f"delaycancel:{dp.id}")]]))
-            log.info(f"Rate-limit defer {rl_id}: {dp.delay_str} for {target.label}")
+            log.info(f"Rate-limit urgent-resend {rl_id}: {dp.delay_str} for {target.label}")
 
         elif action == "sonnet":
+            _cancel_resend(pend)
             PENDING_RATELIMITS.pop(rl_id, None)
             target.claude_model = SONNET_1M_MODEL
             await q.edit_message_text(
@@ -3535,8 +3582,9 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(graceful_shutdown).request(request).build()
     # Expose bot reference module-wide so non-handler code paths (e.g. the
     # worktree-creation failure notice from run_claude) can send Telegram messages.
-    global BOT
+    global BOT, APPLICATION
     BOT = app.bot
+    APPLICATION = app
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
