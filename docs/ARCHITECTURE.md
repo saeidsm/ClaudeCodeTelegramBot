@@ -2,7 +2,7 @@
 
 ## Overview
 
-The bot is a single-file Python application (~1700 lines) that bridges Telegram's Bot API with the Claude Code CLI. It runs Claude Code as an async subprocess and manages multiple concurrent sessions per chat.
+The bot is a single-file Python application (~3,600 lines) that bridges Telegram's Bot API with the Claude Code CLI. It runs Claude Code as an async subprocess and manages multiple logical sessions per chat, with a bounded number executing at once.
 
 ## Flow
 
@@ -28,13 +28,36 @@ Telegram Message
 
 ### SessionManager
 
-Manages up to `MAX_SESSIONS` concurrent sessions per chat.
+Manages up to `MAX_SESSIONS` **logical** sessions per chat (default 9 in prod).
 
 - Each session has: label, color emoji, project, status, UUID, file queue, output history
 - Sessions are keyed by `chat_id:label`
 - Message IDs are mapped to sessions for reply-based routing
 - Auto-cleanup removes idle sessions after configurable timeout
 - Permanent projects can be excluded from auto-cleanup
+
+### Execution concurrency (logical sessions vs running agents)
+
+Two independent limits, deliberately separate:
+
+- **`MAX_SESSIONS`** — how many logical/restorable sessions may exist per chat
+  (cheap: dict entries). Default 9.
+- **`MAX_RUNNING_AGENTS`** — how many heavy Claude executions run *simultaneously*
+  across the whole bot process (expensive: RAM/CPU). Default 2. Enforced by a
+  process-wide `asyncio.Semaphore` (`CONC` / `execution_slot`).
+
+A turn acquires, in order: its **per-session lock** (FIFO — two turns in one
+session never overlap, protecting the worktree and `--resume` state) then a
+**global permit**. While waiting it shows status `queued`; once admitted,
+`running`. Permits/locks release on success, non-zero exit, exception, timeout,
+or cancellation. `/kill` and graceful shutdown cancel a session's queued/in-flight
+run tasks, so a queued turn for a killed session never starts later.
+
+Blocking subprocess work (worktree git/rsync, report archiving, health/log/deploy
+scripts, remote-branch listing) runs via `asyncio.to_thread` so one session's I/O
+never freezes the event loop for the others. A process-local deploy lock prevents
+overlapping deploy handlers on this bot (the prod-side `deploy.sh` flock remains
+the authoritative cross-process guard).
 
 ### UsageTracker
 
