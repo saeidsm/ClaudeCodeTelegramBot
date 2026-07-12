@@ -58,6 +58,9 @@ cd /root/retention-backup-$(date +%Y%m%d)
 cp -a /etc/cron.d/cleanup-reports            ./cleanup-reports.cron            2>/dev/null || true
 cp -a /etc/cron.d/nightwatch-reports-cleanup ./nightwatch-reports-cleanup.cron 2>/dev/null || true
 cp -a /opt/shahrzad-devops/scripts/nightly-cleanup.sh ./nightly-cleanup.sh.bak 2>/dev/null || true
+# also back up any existing live cleanup script + dedicated config (if present)
+cp -a /opt/shahrzad-devops/scripts/cleanup-reports.sh       ./cleanup-reports.sh.bak       2>/dev/null || true
+cp -a /opt/shahrzad-devops/configs/reports-cleanup.env      ./reports-cleanup.env.bak      2>/dev/null || true
 ```
 
 ### 2. Disable/remove ONLY the report-related conflicting cron entries
@@ -72,29 +75,46 @@ Edit `/opt/shahrzad-devops/scripts/nightly-cleanup.sh` and delete just the two
 report `find … reports …` lines in step `[6/6]` (leave the rest of the script —
 apt cleanup, etc. — intact). Retention is now owned by the timer.
 
-### 4. Install and enable the canonical timer
+### 4. Create the dedicated non-secret cleanup config
+The service loads only this file — **never** the full bot `.env`. It holds no
+secrets (the path token is read by the script from `reports-token.env`).
 ```bash
-install -m 0755 /opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/scripts/cleanup-reports.sh \
-                /opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/scripts/cleanup-reports.sh
-cp /opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/systemd/reports-cleanup.service /etc/systemd/system/
-cp /opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/systemd/reports-cleanup.timer   /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now reports-cleanup.timer
+cat > /opt/shahrzad-devops/configs/reports-cleanup.env <<'EOF'
+BOT_REPORT_RETENTION_DAYS=15
+EOF
+chmod 0644 /opt/shahrzad-devops/configs/reports-cleanup.env
 ```
 
-### 5. Dry-run once
+### 5. Install the script to the STABLE live path, then the timer
+Install from the immutable deploy worktree (`$DEPLOY_WT`, see
+`PHASE1_DEPLOY_RUNBOOK.md`) — **not** from the repo checkout, which may be stale.
+The systemd unit executes the stable live path, so the running timer never
+depends on the checkout.
 ```bash
-/opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/scripts/cleanup-reports.sh --dry-run
+install -m 0755 "$DEPLOY_WT/scripts/cleanup-reports.sh" \
+                /opt/shahrzad-devops/scripts/cleanup-reports.sh
+cp "$DEPLOY_WT/systemd/reports-cleanup.service" /etc/systemd/system/
+cp "$DEPLOY_WT/systemd/reports-cleanup.timer"   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now reports-cleanup.timer
+# Confirm the unit resolves the stable live script:
+systemctl show reports-cleanup.service -p ExecStart | grep -q /opt/shahrzad-devops/scripts/cleanup-reports.sh \
+  && echo "ExecStart OK (stable live path)"
+```
+
+### 6. Dry-run once
+```bash
+/opt/shahrzad-devops/scripts/cleanup-reports.sh --dry-run
 ```
 Confirm the printed counts look sane (removed_* small, retained_intact > 0).
 
-### 6. Run once for real
+### 7. Run once for real
 ```bash
 systemctl start reports-cleanup.service
 journalctl -u reports-cleanup.service -n 20 --no-pager
 ```
 
-### 7. Verify an intact recent Summary/Browse/ZIP triplet
+### 8. Verify an intact recent Summary/Browse/ZIP triplet
 Pick a report dir created in the last day and confirm all three URLs return 200:
 ```bash
 TOKEN=$(grep -E '^REPORTS_PATH_TOKEN=' /opt/shahrzad-devops/configs/reports-token.env | cut -d= -f2)
@@ -104,12 +124,12 @@ for p in "$SLUG/summary.txt" "$SLUG/" "$SLUG.zip"; do
 done
 ```
 
-### 8. Verify expired hollow directories are removed
+### 9. Verify expired hollow directories are removed
 ```bash
 find /opt/shahrzad-devops/reports/$TOKEN -mindepth 1 -maxdepth 1 -type d -empty | wc -l   # expect 0
 ```
 
-### 9. Rollback if validation fails
+### 10. Rollback if validation fails
 ```bash
 systemctl disable --now reports-cleanup.timer
 rm -f /etc/systemd/system/reports-cleanup.timer /etc/systemd/system/reports-cleanup.service
@@ -118,6 +138,17 @@ systemctl daemon-reload
 cp /root/retention-backup-*/cleanup-reports.cron            /etc/cron.d/cleanup-reports            2>/dev/null || true
 cp /root/retention-backup-*/nightwatch-reports-cleanup.cron /etc/cron.d/nightwatch-reports-cleanup 2>/dev/null || true
 cp /root/retention-backup-*/nightly-cleanup.sh.bak          /opt/shahrzad-devops/scripts/nightly-cleanup.sh 2>/dev/null || true
+# restore/remove the installed live cleanup script + dedicated config:
+if [ -f /root/retention-backup-*/cleanup-reports.sh.bak ]; then
+  cp /root/retention-backup-*/cleanup-reports.sh.bak /opt/shahrzad-devops/scripts/cleanup-reports.sh
+else
+  rm -f /opt/shahrzad-devops/scripts/cleanup-reports.sh   # was newly installed
+fi
+if [ -f /root/retention-backup-*/reports-cleanup.env.bak ]; then
+  cp /root/retention-backup-*/reports-cleanup.env.bak /opt/shahrzad-devops/configs/reports-cleanup.env
+else
+  rm -f /opt/shahrzad-devops/configs/reports-cleanup.env  # was newly created
+fi
 ```
 
 ## Note

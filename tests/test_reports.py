@@ -7,6 +7,7 @@ output, and every-caller tolerance of partial/error results.
 
 from __future__ import annotations
 
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -113,8 +114,14 @@ def test_fmt_links_partial_notes_missing_zip(tmp_path):
     res = bot.ReportResult("partial", bot.OrderedDict(
         [("Summary", f"{URL}/s/summary.txt"), ("Browse", f"{URL}/s/")]), "s", "zip error")
     out = bot.fmt_links(res)
+    # partial warning present
     assert "ZIP unavailable" in out
-    assert "ZIP" not in {"Z", "I", "P"} or "s.zip" not in out  # no phantom zip url
+    # Summary + Browse present (link + anchor)
+    assert f"{URL}/s/summary.txt" in out and f"{URL}/s/" in out
+    assert out.count("<a href=") == 2                 # exactly Summary + Browse anchors
+    # NO phantom ZIP url and NO ZIP anchor
+    assert ".zip" not in out
+    assert ">ZIP:" not in out and "ZIP:</b>" not in out
 
 
 def test_fmt_links_error_is_safe():
@@ -136,3 +143,54 @@ async def test_make_report_never_raises(tmp_path, monkeypatch):
     res = await bot.make_report("proj-auto", "big output")
     assert res.status == "ok"
     assert (tmp_path / res.slug / "summary.txt").is_file()
+
+
+# ── Section 9: slug sanitization / path-traversal safety ──────────────────────
+
+@pytest.mark.parametrize("name", [
+    "../../outside",
+    "/absolute/path",
+    "a\\b",
+    "...",
+    "..",
+    ".",
+    "with\nnewline\tand\x00control",
+    "پروژه-فارسی",                     # readable Persian must survive
+    "x" * 500,                          # very long
+    "",                                 # empty
+])
+def test_slug_is_single_safe_segment(name):
+    slug = bot._report_slug(name)
+    # never a traversal or separator; never empty; bounded
+    assert "/" not in slug and "\\" not in slug
+    assert ".." not in slug
+    assert not slug.startswith(".")
+    assert "\n" not in slug and "\t" not in slug and "\x00" not in slug
+    assert slug and len(slug) < 200
+    # os.path.basename round-trips → it IS a single path segment
+    assert os.path.basename(slug) == slug
+
+
+def test_persian_name_preserved():
+    slug = bot._report_slug("پروژه")
+    assert "پروژه" in slug             # readable Unicode retained
+
+
+@pytest.mark.parametrize("evil", ["../../etc/passwd", "/abs/x", "a\\b\\c", "..", "."])
+def test_report_dir_and_zip_are_immediate_children(tmp_path, evil):
+    res = bot._build_report(str(tmp_path), URL, evil, "payload")
+    # whatever the name, the dir + zip are direct children of tmp_path
+    assert (tmp_path / res.slug).parent == tmp_path
+    assert (tmp_path / res.slug / "summary.txt").is_file()
+    if res.status == "ok":
+        zp = tmp_path / f"{res.slug}.zip"
+        assert zp.parent == tmp_path and zp.is_file()
+    # nothing escaped tmp_path
+    for child in tmp_path.iterdir():
+        assert tmp_path in child.resolve().parents or child.resolve() == tmp_path or child.parent == tmp_path
+
+
+def test_build_report_rejects_direct_traversal_slug(tmp_path):
+    # even if a caller passes an explicit unsafe slug, it is replaced
+    res = bot._build_report(str(tmp_path), URL, "x", "data", slug="..")
+    assert res.slug != ".." and (tmp_path / res.slug).parent == tmp_path

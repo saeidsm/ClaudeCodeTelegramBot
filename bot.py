@@ -765,45 +765,77 @@ class execution_slot:
     Acquires (in order) the per-session lock then a global permit, so a run
     waiting for a permit never holds a permit while blocked on its own lock.
     While waiting, the session shows status 'queued'; once admitted, 'running'.
-    Releases everything on success, error, timeout, or cancellation.
+
+    Cancellation-safe: Python does NOT call ``__aexit__`` when ``__aenter__``
+    is cancelled or raises, so ``__aenter__`` rolls back its own partial
+    acquisition on any BaseException. All release bookkeeping goes through a
+    single synchronous, idempotent ``_cleanup`` used by both the rollback and
+    ``__aexit__`` — so they can never double-release.
     """
 
     def __init__(self, session_id: str, session=None):
         self.session_id = session_id
         self.session = session
         self._lock = None
+        self._task = None
+        # each of these is released/undone exactly once by _cleanup
         self._have_lock = False
         self._have_permit = False
-        self._task = None
+        self._lockref_taken = False
+        self._lockref_released = False
+        self._task_registered = False
+        self._task_discarded = False
+
+    def _cleanup(self, restore_status: bool):
+        """Synchronous, idempotent teardown. No awaits → cannot be interrupted
+        by cancellation partway through."""
+        if self._have_permit:
+            self._have_permit = False
+            CONC.running -= 1
+            CONC.semaphore.release()
+        if self._have_lock:
+            self._have_lock = False
+            self._lock.release()
+        if self._lockref_taken and not self._lockref_released:
+            self._lockref_released = True
+            CONC._put_lock(self.session_id)          # decrement/remove exactly once
+        if self._task_registered and not self._task_discarded:
+            self._task_discarded = True
+            CONC.discard_task(self.session_id, self._task)
+        if restore_status and self.session is not None:
+            # Only touch status if the session still exists AND we left it
+            # 'queued' (never clobber a status another turn already advanced).
+            if self.session.id in SM.sessions and getattr(self.session, "status", None) == "queued":
+                self.session.status = "idle"
 
     async def __aenter__(self):
         CONC._ensure()
         self._task = asyncio.current_task()
-        CONC.register_task(self.session_id, self._task)
-        if self.session is not None and getattr(self.session, "status", None) != "completed":
-            self.session.status = "queued"
-        # 1) per-session FIFO lock
-        self._lock = CONC._get_lock(self.session_id)
-        await self._lock.acquire()
-        self._have_lock = True
-        # 2) global concurrency permit
-        await CONC.semaphore.acquire()
-        self._have_permit = True
-        CONC.running += 1
-        if self.session is not None:
-            self.session.status = "running"
-        return self
+        try:
+            CONC.register_task(self.session_id, self._task)
+            self._task_registered = True
+            if self.session is not None and getattr(self.session, "status", None) != "completed":
+                self.session.status = "queued"
+            # 1) per-session FIFO lock (ref taken now; released once in _cleanup)
+            self._lock = CONC._get_lock(self.session_id)
+            self._lockref_taken = True
+            await self._lock.acquire()
+            self._have_lock = True
+            # 2) global concurrency permit
+            await CONC.semaphore.acquire()
+            self._have_permit = True
+            CONC.running += 1
+            if self.session is not None:
+                self.session.status = "running"
+            return self
+        except BaseException:
+            # Cancelled/failed mid-acquisition — roll back whatever we took and
+            # re-raise (including CancelledError). __aexit__ will NOT run.
+            self._cleanup(restore_status=True)
+            raise
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self._have_permit:
-            CONC.running -= 1
-            CONC.semaphore.release()
-            self._have_permit = False
-        if self._have_lock:
-            self._lock.release()
-            self._have_lock = False
-        CONC._put_lock(self.session_id)
-        CONC.discard_task(self.session_id, self._task)
+        self._cleanup(restore_status=False)
         return False  # never suppress exceptions (incl. CancelledError)
 
 # ═══════════════════════════════════════════
@@ -1054,6 +1086,8 @@ class WorktreeSession:
         self.session_id = session_id
         self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
         self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
+        self._enter_task = None
+        self._orphan_cleanup_scheduled = False
 
     def _enter_sync(self):
         if not self.is_git:
@@ -1129,11 +1163,67 @@ class WorktreeSession:
     # Async wrappers: the git/rsync/rm work is blocking, so offload it to a
     # thread — otherwise every worktree create/remove froze the whole Telegram
     # event loop (and thus every other session) for the duration.
+    #
+    # Cancellation caveat: asyncio.to_thread CANNOT stop the underlying thread.
+    # If the awaiter is cancelled while _enter_sync runs, the thread may still
+    # finish and leave a worktree behind after the coroutine has unwound. We
+    # bound this: on cancellation we let the enter thread run to completion under
+    # a done-callback that removes whatever it created EXACTLY ONCE (or, if the
+    # loop is gone during shutdown, leaves the on-disk tree for
+    # claude-worktree-gc.timer to sweep — never an unbounded wait).
     async def __aenter__(self):
-        return await asyncio.to_thread(self._enter_sync)
+        self._enter_task = asyncio.ensure_future(asyncio.to_thread(self._enter_sync))
+        try:
+            return await asyncio.shield(self._enter_task)
+        except asyncio.CancelledError:
+            self._schedule_orphan_cleanup()
+            raise
+
+    def _schedule_orphan_cleanup(self):
+        """Called when __aenter__ is cancelled. Ensures the worktree the enter
+        thread is (or finished) creating gets removed exactly once."""
+        if self._orphan_cleanup_scheduled or self._enter_task is None:
+            return
+        self._orphan_cleanup_scheduled = True
+
+        def _on_done(task):
+            if task.cancelled():
+                return
+            # Retrieve any enter exception so it isn't logged as "never retrieved"
+            # (the awaiter already received CancelledError). Nothing to clean if
+            # the enter itself failed before creating the tree.
+            exc = task.exception()
+            if exc is not None:
+                log.info(f"worktree.enter_after_cancel_failed sid={self.session_id} "
+                         f"err={type(exc).__name__} (no tree to clean)")
+                return
+            try:
+                loop = asyncio.get_event_loop()
+            except RuntimeError:
+                loop = None
+
+            async def _cleanup():
+                try:
+                    await asyncio.to_thread(self._exit_sync, None, None, None)
+                    log.info(f"worktree.orphan_cleaned sid={self.session_id}")
+                except Exception as ex:
+                    log.warning(f"worktree.orphan_cleanup_failed sid={self.session_id}: "
+                                f"{ex} (claude-worktree-gc will sweep)")
+
+            if loop is not None and loop.is_running():
+                loop.create_task(_cleanup())
+            else:
+                # Loop gone (shutdown) — leave the on-disk tree for the GC timer.
+                log.info(f"worktree.orphan_left_for_gc sid={self.session_id}")
+
+        self._enter_task.add_done_callback(_on_done)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return await asyncio.to_thread(self._exit_sync, exc_type, exc_val, exc_tb)
+        # Shield removal so a cancellation delivered during exit doesn't abandon
+        # the worktree half-removed — the thread runs to completion regardless.
+        exit_task = asyncio.ensure_future(
+            asyncio.to_thread(self._exit_sync, exc_type, exc_val, exc_tb))
+        return await asyncio.shield(exit_task)
 
 
 def _collect_tree(pid: int) -> list[int]:
@@ -1416,79 +1506,85 @@ async def _rate_limit_flow(prompt, project, session, files=None):
         return
 
     # Track this task under the session so /kill during the auto-retry wait
-    # cancels the pending resend (the retry's execution_slot later discards it).
-    CONC.register_task(session.id, asyncio.current_task())
-
-    notice = None
+    # cancels the pending resend. try/finally guarantees the registration is
+    # removed on normal completion, error, OR cancellation. The nested
+    # run_claude execution_slot registers/discards the SAME task idempotently,
+    # so a double-discard here is a harmless no-op.
+    task = asyncio.current_task()
+    CONC.register_task(session.id, task)
     try:
-        notice = await BOT.send_message(
-            chat_id,
-            f"⏳ <b>Claude is overloaded right now.</b>\n"
-            f"This is the servers being busy — not your daily/weekly limit.\n"
-            f"Auto-retrying once in {RATE_LIMIT_RETRY_DELAY}s…",
-            parse_mode=ParseMode.HTML)
-    except Exception as ex:
-        log.error(f"rate_limit_flow notice error: {ex}")
-
-    await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
-
-    session.status = "running"
-    output = await run_claude(prompt, project, session, files, _rl_mode="raw")
-    session.status = "idle"
-    session.last_active = time.time()
-
-    if output != RL_LIMITED_SENTINEL:
-        # Retry produced a real result (success or a normal error) — post it.
-        session.out = output
-        session.tasks += 1
+        notice = None
         try:
-            if notice:
-                try: await notice.delete()
-                except Exception: pass
-            sent = await BOT.send_message(
+            notice = await BOT.send_message(
                 chat_id,
-                f"{session_prefix(session)} | 🤖 <code>{project}</code> (auto-retry)\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
-                parse_mode=ParseMode.HTML, reply_markup=after_kb())
-            await track_reply(sent, session)
-            if len(output) > 8000:
-                lnk = await make_report(f"{project}-retry", output)
-                await BOT.send_message(
-                    chat_id, f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
-                    parse_mode=ParseMode.HTML)
+                f"⏳ <b>Claude is overloaded right now.</b>\n"
+                f"This is the servers being busy — not your daily/weekly limit.\n"
+                f"Auto-retrying once in {RATE_LIMIT_RETRY_DELAY}s…",
+                parse_mode=ParseMode.HTML)
         except Exception as ex:
-            log.error(f"rate_limit_flow post error: {ex}")
-        return
+            log.error(f"rate_limit_flow notice error: {ex}")
 
-    # Still overloaded → AUTO-schedule a resend at a random 10–35 min delay so
-    # requests naturally spread off the busy pool instead of all retrying at the
-    # same minute. The user doesn't have to do anything; buttons only let them
-    # bring it forward (urgent 5 min), switch to Sonnet 1M now, or cancel.
-    rl_id = uuid.uuid4().hex[:8]
-    secs = random.randint(RL_DEFER_MIN_SECS, RL_DEFER_MAX_SECS)
-    PENDING_RATELIMITS[rl_id] = {
-        "prompt": prompt, "project": project, "session_key": session.id,
-        "files": files or [], "chat_id": chat_id,
-    }
-    dp = _queue_resend(PENDING_RATELIMITS[rl_id], secs, session.label)
-    PENDING_RATELIMITS[rl_id]["dp_id"] = dp.id
-    fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M")
-    log.info(f"Rate-limit auto-defer {rl_id}: {dp.delay_str} for {session.label}")
-    text = (
-        f"🚦 <b>Claude هنوز شلوغه</b> — سرورها شلوغن، نه سقف روزانه/هفتگی تو.\n"
-        f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
-        f"<pre>{esc(prompt[:300])}</pre>\n\n"
-        f"⏰ خودکار <b>{dp.delay_str}</b> دیگه (حدود ساعت {fire_time}) دوباره می‌فرستم — "
-        f"کاری لازم نیست بکنی.\n"
-        f"اگه عجله داری یا می‌خوای همین الان ادامه بدی، یکی از دکمه‌ها رو بزن:")
-    try:
-        kb = _rl_keyboard(rl_id, session)
-        if notice:
-            await notice.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        else:
-            await BOT.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as ex:
-        log.error(f"rate_limit_flow ask error: {ex}")
+        await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
+
+        session.status = "running"
+        output = await run_claude(prompt, project, session, files, _rl_mode="raw")
+        session.status = "idle"
+        session.last_active = time.time()
+
+        if output != RL_LIMITED_SENTINEL:
+            # Retry produced a real result (success or a normal error) — post it.
+            session.out = output
+            session.tasks += 1
+            try:
+                if notice:
+                    try: await notice.delete()
+                    except Exception: pass
+                sent = await BOT.send_message(
+                    chat_id,
+                    f"{session_prefix(session)} | 🤖 <code>{project}</code> (auto-retry)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
+                    parse_mode=ParseMode.HTML, reply_markup=after_kb())
+                await track_reply(sent, session)
+                if len(output) > 8000:
+                    lnk = await make_report(f"{project}-retry", output)
+                    await BOT.send_message(
+                        chat_id, f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
+                        parse_mode=ParseMode.HTML)
+            except Exception as ex:
+                log.error(f"rate_limit_flow post error: {ex}")
+            return
+
+        # Still overloaded → AUTO-schedule a resend at a random 10–35 min delay so
+        # requests naturally spread off the busy pool instead of all retrying at the
+        # same minute. The user doesn't have to do anything; buttons only let them
+        # bring it forward (urgent 5 min), switch to Sonnet 1M now, or cancel.
+        rl_id = uuid.uuid4().hex[:8]
+        secs = random.randint(RL_DEFER_MIN_SECS, RL_DEFER_MAX_SECS)
+        PENDING_RATELIMITS[rl_id] = {
+            "prompt": prompt, "project": project, "session_key": session.id,
+            "files": files or [], "chat_id": chat_id,
+        }
+        dp = _queue_resend(PENDING_RATELIMITS[rl_id], secs, session.label)
+        PENDING_RATELIMITS[rl_id]["dp_id"] = dp.id
+        fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M")
+        log.info(f"Rate-limit auto-defer {rl_id}: {dp.delay_str} for {session.label}")
+        text = (
+            f"🚦 <b>Claude هنوز شلوغه</b> — سرورها شلوغن، نه سقف روزانه/هفتگی تو.\n"
+            f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
+            f"<pre>{esc(prompt[:300])}</pre>\n\n"
+            f"⏰ خودکار <b>{dp.delay_str}</b> دیگه (حدود ساعت {fire_time}) دوباره می‌فرستم — "
+            f"کاری لازم نیست بکنی.\n"
+            f"اگه عجله داری یا می‌خوای همین الان ادامه بدی، یکی از دکمه‌ها رو بزن:")
+        try:
+            kb = _rl_keyboard(rl_id, session)
+            if notice:
+                await notice.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                await BOT.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as ex:
+            log.error(f"rate_limit_flow ask error: {ex}")
+    finally:
+        CONC.discard_task(session.id, task)
 
 
 # ═══════════════════════════════════════════
@@ -1553,12 +1649,37 @@ class ReportResult:
         return self.status == "ok"
 
 
+_SLUG_MAX_NAME = 60
+
+
+def _sanitize_slug_name(name: str) -> str:
+    """Make a caller-supplied report name safe as a SINGLE path segment.
+
+    Strips path separators and any path components (so `../../x` → `x`,
+    `/abs/path` → `path`, `a\\b` → `b`), removes traversal, leading dots,
+    control chars, newlines/tabs, and length-bounds the result. Never returns
+    empty. Preserves readable Unicode (e.g. Persian project names)."""
+    if not name:
+        return "report"
+    name = str(name).replace("\\", "/")
+    name = name.split("/")[-1]                       # drop path components (incl. absolute)
+    name = "".join(ch for ch in name if ch >= " " and ch != "\x7f")  # strip control chars
+    name = re.sub(r"\s+", "-", name).strip()          # collapse whitespace → hyphen
+    name = name.replace("..", "")                      # kill traversal remnants
+    name = re.sub(r'[<>:"|?*]', "", name)              # FS-hostile chars
+    name = name.strip("-. ")                           # no leading/trailing dots/hyphens/space
+    if len(name) > _SLUG_MAX_NAME:
+        name = name[:_SLUG_MAX_NAME].strip("-. ")
+    return name or "report"
+
+
 def _report_slug(name: str) -> str:
-    """Readable, collision-safe slug: project + timestamp + short random suffix.
-    The random suffix guarantees uniqueness even for calls within the same
-    second (the old second-granularity slug could collide and overwrite)."""
+    """Readable, collision-safe, path-safe slug: sanitized name + timestamp +
+    short random suffix. The random suffix guarantees uniqueness even for calls
+    within the same second; the sanitizer + always-appended suffix guarantee the
+    slug is a single, non-empty path segment (no traversal)."""
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return f"{name}-{ts}-{uuid.uuid4().hex[:6]}"
+    return f"{_sanitize_slug_name(name)}-{ts}-{uuid.uuid4().hex[:6]}"
 
 
 def _build_report(reports_dir: str, report_url: str, name: str, content: str,
@@ -1571,6 +1692,10 @@ def _build_report(reports_dir: str, report_url: str, name: str, content: str,
     or 'error' — it never raises and never returns a ZIP link for a ZIP that
     isn't there. Runs off-thread from make_report."""
     slug = slug or _report_slug(name)
+    # Defense in depth: if a slug is passed directly, guarantee it stays a single
+    # child segment of reports_dir (never `.`/`..`/a separator that could escape).
+    if slug in (".", "..") or "/" in slug or "\\" in slug or os.sep in slug:
+        slug = _report_slug(name)
     rd = os.path.join(reports_dir, slug)
     links = OrderedDict()
     links["Summary"] = f"{report_url}/{slug}/summary.txt"
@@ -3677,6 +3802,70 @@ async def post_init(app):
         log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | Consult(GPT)={'\u2705' if OPENAI_API_KEY else '\u274c'} | Sonnet1M={SONNET_1M_MODEL}")
 
+# Bounded deadline for awaiting cancelled run tasks during shutdown. Kept well
+# under the systemd TimeoutStopSec so the unit never gets SIGKILLed mid-cleanup.
+SHUTDOWN_TASK_TIMEOUT = float(os.environ.get("BOT_SHUTDOWN_TASK_TIMEOUT", "10"))
+
+
+async def _cancel_and_await_run_tasks(timeout: float = SHUTDOWN_TASK_TIMEOUT) -> dict:
+    """Snapshot all tracked run tasks (excluding the caller), cancel them, and
+    await their completion under a bounded timeout.
+
+    Each cancelled task's execution_slot rolls back its own lock/permit/registry
+    bookkeeping, so after this returns (within the timeout) no stale slot state
+    remains. Returns a summary dict. Testable in isolation — no app/bot needed.
+    """
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    tasks = []
+    for sid in list(CONC.session_tasks.keys()):
+        for t in list(CONC.session_tasks.get(sid, ())):
+            if t is current or t.done():
+                continue
+            tasks.append(t)
+    for t in tasks:
+        t.cancel()
+    awaited = 0
+    timed_out = False
+    if tasks:
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
+            awaited = len(tasks)
+        except asyncio.TimeoutError:
+            timed_out = True
+            awaited = sum(1 for t in tasks if t.done())
+            log.warning(f"shutdown.run_tasks_timeout cancelled={len(tasks)} "
+                        f"finished={awaited} timeout_s={timeout}")
+    summary = {"cancelled": len(tasks), "awaited": awaited, "timed_out": timed_out}
+    if tasks:
+        log.info(f"shutdown.run_tasks {summary}")
+    return summary
+
+
+async def _reap_active_procs(timeout: float = 5.0):
+    """Terminate any still-tracked Claude process trees and await their reaping
+    (best-effort, bounded). Most are already gone via each run task's own
+    cancellation handler; this covers stragglers."""
+    procs = list(ACTIVE_PROCS.items())
+    for pid, proc in procs:
+        try:
+            _kill_tree(pid)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    for pid, proc in procs:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            pass
+    ACTIVE_PROCS.clear()
+
+
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
     log.info("SIGTERM received — starting graceful shutdown...")
@@ -3694,24 +3883,11 @@ async def graceful_shutdown(app):
         await _nw_ipc_stop()
     # Collect active sessions info before killing (running OR queued/waiting).
     active = [(k, s) for k, s in SM.sessions.items() if s.status in ("running", "queued")]
-    # Cancel queued/in-flight execution tasks so a waiting turn never starts (or
-    # continues) after shutdown. Running process trees are terminated below.
-    cancelled_tasks = 0
-    for sid in list(CONC.session_tasks.keys()):
-        cancelled_tasks += CONC.cancel_session_tasks(sid)
-    if cancelled_tasks:
-        log.info(f"shutdown.cancelled_run_tasks n={cancelled_tasks}")
-    # Kill all tracked claude subprocesses
-    for pid, proc in list(ACTIVE_PROCS.items()):
-        try:
-            proc.terminate()
-            log.info(f"Terminated claude process PID {pid}")
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    ACTIVE_PROCS.clear()
+    # Cancel queued/in-flight execution tasks AND await their real cleanup under
+    # a bounded timeout, so no stale lock/permit/registry state survives.
+    await _cancel_and_await_run_tasks()
+    # Terminate any straggler Claude process trees and await reaping (bounded).
+    await _reap_active_procs()
     # Notify each chat with active sessions
     notified_chats = set()
     for key, session in active:

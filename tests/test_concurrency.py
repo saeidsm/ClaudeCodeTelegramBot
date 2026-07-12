@@ -36,6 +36,29 @@ class Counter:
         self.cur -= 1
 
 
+def assert_bookkeeping_empty(session_id=None):
+    """Assert no stale execution-slot bookkeeping remains.
+
+    With a session_id: checks only THAT session's task registration + lock ref +
+    lock state (safe to call while OTHER sessions are still active).
+    Without one: also asserts global state — running counter at 0 and the
+    semaphore restored to full capacity (call only when nothing else runs).
+    """
+    if session_id is not None:
+        assert session_id not in bot.CONC.session_tasks, "stale task registration"
+        assert bot.CONC.session_lock_refs.get(session_id, 0) == 0, "stale lock ref"
+        lk = bot.CONC.session_locks.get(session_id)
+        assert lk is None or not lk.locked(), "session lock left locked"
+        return
+    assert not bot.CONC.session_tasks, "stale task registrations remain"
+    assert not any(v for v in bot.CONC.session_lock_refs.values()), "stale lock refs"
+    assert all(not lk.locked() for lk in bot.CONC.session_locks.values()), "a lock left locked"
+    assert bot.CONC.running == 0, f"running counter not restored: {bot.CONC.running}"
+    # semaphore restored to full capacity (no permits still held)
+    assert bot.CONC.semaphore._value == bot.CONC.max_running, \
+        f"semaphore capacity not restored: {bot.CONC.semaphore._value}/{bot.CONC.max_running}"
+
+
 @pytest.mark.asyncio
 async def test_global_cap_two():
     bot.CONC.init(max_running=2)
@@ -183,6 +206,17 @@ async def test_kill_queued_prevents_later_run():
     await asyncio.wait_for(th, timeout=2)
     await asyncio.sleep(0.05)
     assert not victim_entered.is_set()                    # queued task never began
+    # complete cleanup: no stale victim bookkeeping, and a NEW victim turn runs
+    assert_bookkeeping_empty("victim:1")
+    ran_again = asyncio.Event()
+
+    async def victim2():
+        async with bot.execution_slot("victim:1", FakeSession("victim:1")):
+            ran_again.set()
+
+    await asyncio.wait_for(asyncio.create_task(victim2()), timeout=2)
+    assert ran_again.is_set()
+    assert_bookkeeping_empty("victim:1")
 
 
 @pytest.mark.asyncio
@@ -228,31 +262,256 @@ async def test_sm_kill_cancels_registered_task():
     assert bot.CONC.running == 0
 
 
+# ══════════════════════════════════════════════════════════════════════════
+#  Section 1 — cancellation DURING execution_slot.__aenter__ rolls back cleanly
+# ══════════════════════════════════════════════════════════════════════════
+
 @pytest.mark.asyncio
-async def test_shutdown_cancels_queued():
+async def test_cancel_while_waiting_for_session_lock():
+    """(1) A second same-session turn cancelled while blocked on the per-session
+    lock must not leak a lock ref / task / status."""
+    bot.CONC.init(max_running=2)
+    in1 = asyncio.Event(); gate1 = asyncio.Event()
+    sess = FakeSession("s:1")
+
+    async def holder():
+        async with bot.execution_slot("s:1", sess):
+            in1.set(); await gate1.wait()
+
+    t1 = asyncio.create_task(holder())
+    await asyncio.wait_for(in1.wait(), timeout=2)
+    waiter_sess = FakeSession("s:1")
+
+    async def waiter():
+        async with bot.execution_slot("s:1", waiter_sess):
+            pass
+
+    t2 = asyncio.create_task(waiter())
+    await asyncio.sleep(0.05)                 # t2 now blocked on the session lock
+    assert waiter_sess.status == "queued"
+    t2.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t2
+    # holder still holds its lock/permit; but the waiter left NO residue
+    assert bot.CONC.session_lock_refs.get("s:1", 0) == 1   # only the holder's ref
+    gate1.set()
+    await asyncio.wait_for(t1, timeout=2)
+    assert_bookkeeping_empty("s:1")
+
+
+@pytest.mark.asyncio
+async def test_cancel_while_waiting_for_semaphore():
+    """(2) Cancelled after acquiring the session lock but while waiting on the
+    global semaphore — must release the lock and roll back."""
     bot.CONC.init(max_running=1)
-    holder_in = asyncio.Event(); holder_gate = asyncio.Event()
+    hin = asyncio.Event(); hgate = asyncio.Event()
 
     async def holder():
         async with bot.execution_slot("h:1", FakeSession("h:1")):
-            holder_in.set(); await holder_gate.wait()
+            hin.set(); await hgate.wait()
+
+    th = asyncio.create_task(holder())
+    await asyncio.wait_for(hin.wait(), timeout=2)   # single permit taken by holder
+    victim_sess = FakeSession("v:1")
+
+    async def victim():
+        async with bot.execution_slot("v:1", victim_sess):
+            pass
+
+    tv = asyncio.create_task(victim())
+    await asyncio.sleep(0.05)     # v:1 holds its own session lock, waits on semaphore
+    assert bot.CONC.session_locks["v:1"].locked() is True
+    tv.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tv
+    assert_bookkeeping_empty("v:1")               # its lock was released, ref dropped
+    hgate.set()
+    await asyncio.wait_for(th, timeout=2)
+    assert_bookkeeping_empty()
+
+
+@pytest.mark.asyncio
+async def test_cancel_immediately_after_admission():
+    """(3) Cancellation right after admission still releases the permit+lock."""
+    bot.CONC.init(max_running=1)
+    admitted = asyncio.Event(); gate = asyncio.Event()
+
+    async def run():
+        async with bot.execution_slot("a:1", FakeSession("a:1")):
+            admitted.set(); await gate.wait()
+
+    t = asyncio.create_task(run())
+    await asyncio.wait_for(admitted.wait(), timeout=2)
+    assert bot.CONC.running == 1
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    assert_bookkeeping_empty("a:1")
+
+
+@pytest.mark.asyncio
+async def test_cancel_several_queued_for_one_session():
+    """(4) Several queued turns for one session all cancel with no residue."""
+    bot.CONC.init(max_running=1)
+    hin = asyncio.Event(); hgate = asyncio.Event()
+
+    async def holder():
+        async with bot.execution_slot("m:1", FakeSession("m:1")):
+            hin.set(); await hgate.wait()
+
+    th = asyncio.create_task(holder())
+    await asyncio.wait_for(hin.wait(), timeout=2)
+    waiters = [asyncio.create_task(_queued_waiter("m:1")) for _ in range(3)]
+    await asyncio.sleep(0.05)
+    assert len(bot.CONC.session_tasks["m:1"]) == 4          # holder + 3 waiters
+    for w in waiters:
+        w.cancel()
+    for w in waiters:
+        with pytest.raises(asyncio.CancelledError):
+            await w
+    hgate.set()
+    await asyncio.wait_for(th, timeout=2)
+    assert_bookkeeping_empty("m:1")                         # (5) full registry cleanup
+    # (6) a fresh turn for the same session runs afterward
+    ran = asyncio.Event()
+
+    async def again():
+        async with bot.execution_slot("m:1", FakeSession("m:1")):
+            ran.set()
+    await asyncio.wait_for(asyncio.create_task(again()), timeout=2)
+    assert ran.is_set()
+    assert_bookkeeping_empty("m:1")
+
+
+async def _queued_waiter(sid):
+    async with bot.execution_slot(sid, FakeSession(sid)):
+        await asyncio.sleep(0.2)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Section 3 — the real shutdown helper _cancel_and_await_run_tasks
+# ══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.asyncio
+async def test_shutdown_helper_queued_task():
+    bot.CONC.init(max_running=1)
+    hin = asyncio.Event(); hgate = asyncio.Event()
+
+    async def holder():
+        async with bot.execution_slot("h:1", FakeSession("h:1")):
+            hin.set(); await hgate.wait()
 
     async def queued():
         async with bot.execution_slot("q:1", FakeSession("q:1")):
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(5)
 
     th = asyncio.create_task(holder())
-    await asyncio.wait_for(holder_in.wait(), timeout=2)
+    await asyncio.wait_for(hin.wait(), timeout=2)
     tq = asyncio.create_task(queued())
     await asyncio.sleep(0.05)
-    # emulate graceful_shutdown's cancellation sweep
-    cancelled = 0
-    for sid in list(bot.CONC.session_tasks.keys()):
-        cancelled += bot.CONC.cancel_session_tasks(sid)
-    assert cancelled >= 1
-    holder_gate.set()
+    hgate.set()                                 # let the holder finish naturally
+    summary = await bot._cancel_and_await_run_tasks(timeout=2)
+    assert summary["cancelled"] >= 1 and summary["timed_out"] is False
     for t in (th, tq):
+        try: await asyncio.wait_for(t, timeout=2)
+        except asyncio.CancelledError: pass
+    assert_bookkeeping_empty()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_helper_running_task():
+    bot.CONC.init(max_running=2)
+    rin = asyncio.Event()
+
+    async def running():
+        async with bot.execution_slot("r:1", FakeSession("r:1")):
+            rin.set(); await asyncio.sleep(5)
+
+    tr = asyncio.create_task(running())
+    await asyncio.wait_for(rin.wait(), timeout=2)
+    summary = await bot._cancel_and_await_run_tasks(timeout=2)
+    assert summary["cancelled"] == 1 and summary["awaited"] == 1
+    try: await asyncio.wait_for(tr, timeout=2)
+    except asyncio.CancelledError: pass
+    assert_bookkeeping_empty()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_helper_mixed():
+    bot.CONC.init(max_running=1)
+    rin = asyncio.Event()
+
+    async def running():
+        async with bot.execution_slot("r:1", FakeSession("r:1")):
+            rin.set(); await asyncio.sleep(5)
+
+    async def queued():
+        async with bot.execution_slot("q:1", FakeSession("q:1")):
+            await asyncio.sleep(5)
+
+    tr = asyncio.create_task(running())
+    await asyncio.wait_for(rin.wait(), timeout=2)
+    tq = asyncio.create_task(queued())
+    await asyncio.sleep(0.05)
+    summary = await bot._cancel_and_await_run_tasks(timeout=2)
+    assert summary["cancelled"] == 2
+    for t in (tr, tq):
+        try: await asyncio.wait_for(t, timeout=2)
+        except asyncio.CancelledError: pass
+    assert_bookkeeping_empty()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_helper_timeout():
+    """A misbehaving task that swallows cancellation → helper reports timed_out
+    without hanging."""
+    bot.CONC.init(max_running=1)
+    started = asyncio.Event()
+
+    async def stubborn():
         try:
-            await asyncio.wait_for(t, timeout=2)
+            async with bot.execution_slot("s:1", FakeSession("s:1")):
+                started.set(); await asyncio.sleep(5)
         except asyncio.CancelledError:
-            pass
+            await asyncio.sleep(0.5)            # ignores cancel briefly
+            raise
+
+    t = asyncio.create_task(stubborn())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    summary = await bot._cancel_and_await_run_tasks(timeout=0.1)
+    assert summary["timed_out"] is True
+    try: await asyncio.wait_for(t, timeout=2)
+    except asyncio.CancelledError: pass
+
+
+@pytest.mark.asyncio
+async def test_shutdown_helper_isolates_unrelated_task():
+    bot.CONC.init(max_running=2)
+    unrelated_done = asyncio.Event()
+
+    async def unrelated():                       # NOT registered in session_tasks
+        await asyncio.sleep(0.2)
+        unrelated_done.set()
+
+    tu = asyncio.create_task(unrelated())
+    rin = asyncio.Event()
+
+    async def running():
+        async with bot.execution_slot("r:1", FakeSession("r:1")):
+            rin.set(); await asyncio.sleep(5)
+
+    tr = asyncio.create_task(running())
+    await asyncio.wait_for(rin.wait(), timeout=2)
+    summary = await bot._cancel_and_await_run_tasks(timeout=2)
+    assert summary["cancelled"] == 1
+    await asyncio.wait_for(tu, timeout=2)        # unrelated task ran to completion
+    assert unrelated_done.is_set()
+    try: await asyncio.wait_for(tr, timeout=2)
+    except asyncio.CancelledError: pass
+
+
+@pytest.mark.asyncio
+async def test_shutdown_helper_empty():
+    bot.CONC.init(max_running=2)
+    summary = await bot._cancel_and_await_run_tasks(timeout=1)
+    assert summary == {"cancelled": 0, "awaited": 0, "timed_out": False}

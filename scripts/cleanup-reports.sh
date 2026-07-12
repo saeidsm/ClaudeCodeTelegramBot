@@ -12,13 +12,20 @@
 # their sibling .zip are removed as a unit; already-hollow historical dirs are
 # swept regardless of age. Reports within the TTL are preserved intact.
 #
-# Usage:  cleanup-reports.sh [--dry-run]
+# Usage:  cleanup-reports.sh [--dry-run] [--test-root <DIR under /tmp>]
 # Env:
 #   BOT_REPORT_RETENTION_DAYS  retention in days (default 15; must be >= 1)
 #   BOT_DATA_ROOT              default /opt/shahrzad-devops
 #   BOT_REPORTS               reports base   (default $BOT_DATA_ROOT/reports)
 #   BOT_CONFIGS_DIR           configs dir    (default $BOT_DATA_ROOT/configs)
 #   REPORTS_TOKEN_FILE        token env file (default $BOT_CONFIGS_DIR/reports-token.env)
+#   REPORTS_ROOT_GUARD        OPTIONAL cross-check only; if set it MUST equal the
+#                             pinned production guard (systemd pins it). It can
+#                             confirm the scope but never redefine it.
+#
+# The production deletion scope is HARDCODED to /opt/shahrzad-devops/reports and
+# is NOT freely redefinable by ordinary configuration. Tests may retarget it ONLY
+# via the explicit --test-root flag AND only to a path beneath /tmp.
 #
 # The path token is READ from the token file (key REPORTS_PATH_TOKEN); it is
 # never embedded in this script. Exits non-zero on unsafe config or on any
@@ -26,50 +33,84 @@
 
 set -euo pipefail
 
+die() { echo "cleanup-reports: ERROR: $*" >&2; exit 2; }
+
+# Hardcoded production deletion scope. Never redefined by normal config.
+PROD_GUARD="/opt/shahrzad-devops/reports"
+GUARD="$PROD_GUARD"
+
+# ── Parse args (order-independent): --dry-run, --test-root <dir> ──
+DRY_RUN=0
+TEST_ROOT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --test-root)
+      shift
+      [[ $# -gt 0 ]] || die "--test-root requires a path"
+      TEST_ROOT="$1"; shift ;;
+    *) die "unknown argument '$1' (only --dry-run / --test-root <dir>)" ;;
+  esac
+done
+
 RETENTION_DAYS="${BOT_REPORT_RETENTION_DAYS:-15}"
 DATA_ROOT="${BOT_DATA_ROOT:-/opt/shahrzad-devops}"
 REPORTS_BASE="${BOT_REPORTS:-$DATA_ROOT/reports}"
 CONFIGS_DIR="${BOT_CONFIGS_DIR:-$DATA_ROOT/configs}"
 TOKEN_FILE="${REPORTS_TOKEN_FILE:-$CONFIGS_DIR/reports-token.env}"
 
-# Hard guard: we will only ever delete UNDER this root, never at/above it.
-# Overridable ONLY so the test suite can point at a throwaway tree; production
-# never sets it, so the default keeps the guard pinned to the real reports root.
-REPORTS_ROOT_GUARD="${REPORTS_ROOT_GUARD:-/opt/shahrzad-devops/reports}"
-
-DRY_RUN=0
-if [[ "${1:-}" == "--dry-run" ]]; then
-  DRY_RUN=1
-elif [[ -n "${1:-}" ]]; then
-  echo "cleanup-reports: ERROR: unknown argument '$1' (only --dry-run)" >&2
-  exit 2
+# ── Test-root mode: explicit flag, and ONLY beneath /tmp ──
+if [[ -n "$TEST_ROOT" ]]; then
+  case "$TEST_ROOT" in
+    /tmp/*) : ;;
+    *) die "--test-root must be an absolute path beneath /tmp (got '$TEST_ROOT')" ;;
+  esac
+  GUARD="$TEST_ROOT"
+  REPORTS_BASE="$TEST_ROOT"
+  CONFIGS_DIR="${BOT_CONFIGS_DIR:-$TEST_ROOT/configs}"
+  TOKEN_FILE="${REPORTS_TOKEN_FILE:-$CONFIGS_DIR/reports-token.env}"
 fi
 
-die() { echo "cleanup-reports: ERROR: $*" >&2; exit 2; }
+# ── If REPORTS_ROOT_GUARD env is set (systemd pins it), it must MATCH the guard.
+# It can confirm the scope; it can never redefine it to something else. ──
+if [[ -n "${REPORTS_ROOT_GUARD:-}" && "$REPORTS_ROOT_GUARD" != "$GUARD" ]]; then
+  die "REPORTS_ROOT_GUARD='$REPORTS_ROOT_GUARD' does not match pinned guard '$GUARD'"
+fi
 
 # ── Validate retention ──
 [[ "$RETENTION_DAYS" =~ ^[0-9]+$ ]] && (( RETENTION_DAYS >= 1 )) \
   || die "invalid BOT_REPORT_RETENTION_DAYS='$RETENTION_DAYS' (need integer >= 1)"
 
-# ── Load the path token (never embedded) ──
+# ── Load the path token (never embedded). Controlled errors for missing line /
+# empty / malformed — the grep must not trip an uncontrolled pipefail exit. ──
 [[ -f "$TOKEN_FILE" ]] || die "token file not found: $TOKEN_FILE"
-TOKEN="$(grep -E '^REPORTS_PATH_TOKEN=' "$TOKEN_FILE" | head -n1 | cut -d= -f2- | tr -d ' \t\r\n')"
-[[ -n "$TOKEN" ]] || die "REPORTS_PATH_TOKEN missing/empty in $TOKEN_FILE"
+TOKEN_LINE="$(grep -E '^REPORTS_PATH_TOKEN=' "$TOKEN_FILE" | head -n1 || true)"
+[[ -n "$TOKEN_LINE" ]] || die "REPORTS_PATH_TOKEN line not found in $TOKEN_FILE"
+TOKEN="$(printf '%s' "$TOKEN_LINE" | cut -d= -f2- | tr -d ' \t\r\n')"
+[[ -n "$TOKEN" ]] || die "REPORTS_PATH_TOKEN is empty in $TOKEN_FILE"
 [[ "$TOKEN" =~ ^[A-Za-z0-9_-]{16,}$ ]] || die "REPORTS_PATH_TOKEN has unexpected format"
 
 REPORT_DIR="$REPORTS_BASE/$TOKEN"
 
-# ── Path safety: never operate on /, empty, the reports root, or outside it ──
-case "$REPORTS_BASE" in
-  ""|"/") die "unsafe reports base '$REPORTS_BASE'" ;;
+# ── Path safety ──
+case "$GUARD" in
+  ""|"/"|"/opt"|"/opt/shahrzad-devops") die "unsafe guard '$GUARD'" ;;
 esac
+case "$REPORTS_BASE" in
+  ""|"/"|"/opt"|"/opt/shahrzad-devops") die "unsafe reports base '$REPORTS_BASE'" ;;
+esac
+real_guard="$(readlink -f "$GUARD" 2>/dev/null || echo "$GUARD")"
 real_base="$(readlink -f "$REPORTS_BASE" 2>/dev/null || echo "$REPORTS_BASE")"
 real_dir="$(readlink -f "$REPORT_DIR" 2>/dev/null || echo "$REPORT_DIR")"
-[[ "$real_base" == "$REPORTS_ROOT_GUARD" || "$real_base" == "$REPORTS_ROOT_GUARD"/* ]] \
-  || die "reports base '$real_base' is outside $REPORTS_ROOT_GUARD"
-[[ "$real_dir" == "$REPORTS_ROOT_GUARD"/* ]] \
-  || die "report dir '$real_dir' is outside $REPORTS_ROOT_GUARD"
-[[ "$real_dir" != "/" && "$real_dir" != "$real_base" && "$real_dir" != "$REPORTS_ROOT_GUARD" ]] \
+# Reject the canonical dangerous roots outright.
+case "$real_dir" in
+  ""|"/"|"/opt"|"/opt/shahrzad-devops") die "refusing unsafe target '$real_dir'" ;;
+esac
+[[ "$real_base" == "$real_guard" || "$real_base" == "$real_guard"/* ]] \
+  || die "reports base '$real_base' is outside guard '$real_guard'"
+[[ "$real_dir" == "$real_guard"/* ]] \
+  || die "report dir '$real_dir' is outside guard '$real_guard'"
+[[ "$real_dir" != "$real_base" && "$real_dir" != "$real_guard" ]] \
   || die "refusing to operate on the reports root itself ('$real_dir')"
 [[ -d "$real_dir" ]] || die "token report dir not found: $real_dir"
 
