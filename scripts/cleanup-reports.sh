@@ -61,10 +61,34 @@ TOKEN_FILE="${REPORTS_TOKEN_FILE:-$CONFIGS_DIR/reports-token.env}"
 
 # ── Test-root mode: explicit flag, and ONLY beneath /tmp ──
 if [[ -n "$TEST_ROOT" ]]; then
+  # 1) Cheap raw-string gate first (unchanged behavior/message): reject
+  #    anything that isn't even written as a /tmp path.
   case "$TEST_ROOT" in
     /tmp/*) : ;;
     *) die "--test-root must be an absolute path beneath /tmp (got '$TEST_ROOT')" ;;
   esac
+  # 2) Canonicalize BEFORE trusting that raw /tmp prefix. A /tmp/... symlink
+  #    can resolve OUTSIDE /tmp entirely (e.g. /tmp/link ->
+  #    /opt/shahrzad-devops/reports); readlink -f later would then make
+  #    guard==base==the escaped path and every downstream "outside guard"
+  #    check would pass. `realpath -m` resolves all symlinks (incl. the final
+  #    component) and does not require the leaf to exist, so a not-yet-created
+  #    test dir still validates; when unavailable, fall back to canonicalizing
+  #    the nearest existing parent so a nonexistent-but-safe path still works.
+  canon_root="$(realpath -m -- "$TEST_ROOT" 2>/dev/null || true)"
+  if [[ -z "$canon_root" ]]; then
+    parent="$(dirname -- "$TEST_ROOT")"
+    while [[ ! -e "$parent" && "$parent" != "/" ]]; do parent="$(dirname -- "$parent")"; done
+    real_parent="$(readlink -f -- "$parent" 2>/dev/null || echo "$parent")"
+    canon_root="${real_parent%/}/${TEST_ROOT#"$parent"/}"
+  fi
+  [[ -n "$canon_root" ]] || die "--test-root could not be canonicalized ('$TEST_ROOT')"
+  case "$canon_root" in
+    /tmp)   die "--test-root canonical path is /tmp itself ('$TEST_ROOT' -> '$canon_root')" ;;
+    /tmp/*) : ;;
+    *)      die "--test-root canonical path escapes /tmp ('$TEST_ROOT' -> '$canon_root')" ;;
+  esac
+  TEST_ROOT="$canon_root"
   GUARD="$TEST_ROOT"
   REPORTS_BASE="$TEST_ROOT"
   CONFIGS_DIR="${BOT_CONFIGS_DIR:-$TEST_ROOT/configs}"

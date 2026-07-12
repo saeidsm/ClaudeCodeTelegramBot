@@ -514,4 +514,6 @@ async def test_shutdown_helper_isolates_unrelated_task():
 async def test_shutdown_helper_empty():
     bot.CONC.init(max_running=2)
     summary = await bot._cancel_and_await_run_tasks(timeout=1)
-    assert summary == {"cancelled": 0, "awaited": 0, "timed_out": False}
+    # Phase 2 (post-merge safety fix) added "non_cooperative" to the summary —
+    # the count of tasks still pending at the hard deadline.
+    assert summary == {"cancelled": 0, "awaited": 0, "timed_out": False, "non_cooperative": 0}
