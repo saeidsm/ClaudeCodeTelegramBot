@@ -2,6 +2,52 @@
 
 All notable changes to the Shahrzad DevOps Telegram Bot.
 
+## [Unreleased] — 2026-07-12 — Phase 1: Stability Foundation
+
+Production remains **Claude-only** after this phase. Codex, OpenRouter Chat mode,
+engine selection, cross-agent coordination, persistent checkpoints, memory
+migration, Graphify integration, and resource footers are deferred to later phases.
+
+### Added
+- **Bounded execution concurrency.** Two distinct limits:
+  `BOT_MAX_SESSIONS` (logical/restorable sessions per chat, default now 9 in prod)
+  vs `BOT_MAX_RUNNING_AGENTS` (simultaneous heavy Claude runs bot-wide, default 2).
+  A process-wide semaphore caps concurrent executions; the rest show **`queued`**
+  with a "waiting for a free slot (N/max)" progress line.
+- **Per-session serialization.** One async lock per session — two turns for the
+  same session never run concurrently (protects the worktree and `--resume`
+  state); different sessions still overlap up to the global limit.
+- **Cancellable queued work.** `/kill` (and graceful shutdown) now cancel a
+  session's queued/in-flight execution tasks — a queued turn for a killed session
+  never starts later. Locks/permits always release on success, error, timeout, or
+  cancellation.
+- **`BOT_NIGHTWATCH_IPC_BIND2`** — optional, validated second NightWatch IPC
+  listener (loopback/private only; wildcard/public/multicast/invalid rejected).
+  Empty by default. Backports a live-only prod capability into Git.
+- **Canonical 15-day report retention** — `scripts/cleanup-reports.sh` +
+  `systemd/reports-cleanup.{service,timer}`, replacing three conflicting cleanup
+  jobs. See `docs/REPORT_RETENTION_MIGRATION.md`. Override via
+  `BOT_REPORT_RETENTION_DAYS`.
+- Focused test suites for reports, concurrency, NightWatch bind, session config,
+  the cleanup script, and non-blocking behavior.
+
+### Changed
+- **Report generation** rewritten: Python `zipfile` (no unchecked `zip`
+  subprocess), UTF-8 summary, collision-safe slug (`name-timestamp-rand`), ZIP
+  built to a temp path and atomically renamed only after it verifies non-empty +
+  openable + containing `summary.txt`. Never returns a phantom ZIP link. `fmt_links`
+  now renders deliberate clickable HTML anchors (with the raw URL as fallback).
+- **Event-loop unblocking**: report archiving, health/log scripts, deploy scripts
+  (incl. the 15-min ZK4 path), remote-branch listing, worktree create/fetch/remove,
+  and attachment copy now run off-loop (`asyncio.to_thread`), so one session's I/O
+  no longer freezes the whole bot. Timeouts, capture, return codes, and
+  process-tree cleanup are preserved.
+- Added a process-local async deploy lock (prod-side `deploy.sh` flock remains
+  authoritative). Deploy auth/confirmation behavior unchanged.
+- Stale "max 3" help text now derives from `MAX_SESSIONS`.
+- Config parsing for the limits is defensive (invalid/non-positive → safe default;
+  effective values logged at startup).
+
 ## [Unreleased] — 2026-05-06 — Phase B + Multi-bot + Model selection
 
 ### Added

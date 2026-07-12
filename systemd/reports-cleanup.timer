@@ -1,0 +1,16 @@
+# Runs the canonical report cleanup once daily.
+# Install: copy to /etc/systemd/system/, `systemctl daemon-reload`,
+#          `systemctl enable --now reports-cleanup.timer`.
+[Unit]
+Description=Daily Shahrzad bot report retention cleanup
+Documentation=file:///opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/docs/REPORT_RETENTION_MIGRATION.md
+
+[Timer]
+# Daily, shortly after midnight; catch up if the machine was off (Persistent).
+OnCalendar=*-*-* 00:20:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=reports-cleanup.service
+
+[Install]
+WantedBy=timers.target

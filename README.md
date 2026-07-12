@@ -26,7 +26,7 @@ This is async DevOps — send your coding task, go about your day, get the resul
 
 ## Features
 
-- **Multi-Session Management** — Run up to 4 concurrent Claude Code sessions, each with its own project context
+- **Multi-Session Management** — Hold up to 9 logical Claude Code sessions per chat, each with its own project context; a bounded number (default 2) execute at once while the rest queue
 - **Voice Commands** — Speak in Farsi or English; Gemini transcribes and refines your voice into structured prompts
 - **File Attachments** — Send documents/photos with instructions; they're passed to Claude Code automatically
 - **Smart Fallback Chain** — When Claude is rate-limited, falls back to Gemini → GPT-4o → OpenRouter (configurable)
@@ -38,7 +38,7 @@ This is async DevOps — send your coding task, go about your day, get the resul
 - **Graceful Shutdown** — On SIGTERM, notifies active chats and cleanly terminates Claude processes
 - **OOM Protection** — Systemd memory limits prevent the OS from killing the bot
 - **Pause Window** — 5-second countdown before execution lets you cancel or edit
-- **Report Generation** — Save full outputs as browsable reports with shareable links
+- **Report Generation** — Save full outputs as browsable reports (verified Summary + ZIP, clickable links) retained for 15 days via a single canonical cleanup timer
 
 ## Optional: NightWatch IPC integration
 

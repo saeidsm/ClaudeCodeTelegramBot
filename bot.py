@@ -4,7 +4,7 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, shutil, ipaddress, zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -81,7 +81,28 @@ PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
 BOT_DEPLOY_ENABLED         = os.environ.get("BOT_DEPLOY_ENABLED",          "true").lower() == "true"
 BOT_NIGHTWATCH_IPC_ENABLED = os.environ.get("BOT_NIGHTWATCH_IPC_ENABLED",  "true").lower() == "true"
 BOT_GIT_REMOTE_TOKEN       = os.environ.get("BOT_GIT_REMOTE_TOKEN", "")
-MAX_SESSIONS               = int(os.environ.get("BOT_MAX_SESSIONS", "4"))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a strictly-positive int from env, falling back safely on any
+    invalid/non-positive value. (Logging happens at startup once `log` exists —
+    see post_init, which prints the effective values.)"""
+    raw = os.environ.get(name, "")
+    try:
+        val = int(raw)
+        if val > 0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return default
+
+
+# Two DISTINCT limits (do not conflate):
+#   MAX_SESSIONS       = logical/restorable sessions per chat (cheap: dict entries)
+#   MAX_RUNNING_AGENTS = simultaneous heavy Claude executions across the whole bot
+#                        process (expensive: RAM/CPU). Bounded by RUN_SEMAPHORE.
+MAX_SESSIONS               = _positive_int_env("BOT_MAX_SESSIONS", 4)
+MAX_RUNNING_AGENTS         = _positive_int_env("BOT_MAX_RUNNING_AGENTS", 2)
 
 # Default Claude Code model for new sessions — empty = CLI default,
 # "sonnet"/"opus" aliases, or full model name like "claude-sonnet-4-6".
@@ -569,6 +590,13 @@ class SessionManager:
         key = self._key(chat_id, label)
         session = self.sessions.pop(key, None)
         if session:
+            # Cancel any queued/in-flight execution tasks for this session so a
+            # queued turn belonging to a killed session can never begin later,
+            # and a running one is interrupted (the slot releases its permit +
+            # lock in finally). Never cancels the caller's own task.
+            cancelled = CONC.cancel_session_tasks(key)
+            if cancelled:
+                log.info(f"kill.session sid={key} cancelled {cancelled} run task(s)")
             # Terminate the live claude subprocess if any. Without this the
             # python process was leaked and stayed alive (and kept MCP children
             # + worktree FDs) until the bot itself restarted.
@@ -605,7 +633,7 @@ class SessionManager:
             # Never auto-close sessions on permanent projects
             if session.project in PERMANENT_PROJECTS:
                 continue
-            if session.status != "running" and session.last_active < cutoff:
+            if session.status not in ("running", "queued") and session.last_active < cutoff:
                 timed_out.append(session)
                 keys_to_remove.append(key)
         for key in keys_to_remove:
@@ -637,6 +665,146 @@ PENDING_MESSAGES: dict[int, dict] = {}
 ACTIVE_SESSION: dict[int, str] = {}  # chat_id -> session_key
 # Buffer for multi-message concatenation (Telegram splits long text)
 MESSAGE_BUFFER: dict[int, dict] = {}  # chat_id -> {"texts": [], "timer": task, "update": update, "time": float}
+
+
+# ═══════════════════════════════════════════
+#  Execution concurrency
+#  ──────────────────────────────────────────
+#  Two independent controls:
+#    • RUN_SEMAPHORE — process-wide cap on simultaneous heavy Claude runs
+#      (MAX_RUNNING_AGENTS). 9 logical sessions can exist, but only N execute.
+#    • per-session asyncio.Lock — turns in ONE session run FIFO; two turns for
+#      the same session never overlap (protects the worktree + resume state).
+#  A run task is registered per session so /kill (SM.kill) and graceful
+#  shutdown can cancel queued or in-flight executions.
+# ═══════════════════════════════════════════
+class _Concurrency:
+    """Holds the async primitives. They are (re)created inside the running loop
+    via init() — asyncio.Semaphore/Lock bind to a loop, so init() is called from
+    post_init in prod and from each concurrency test in its own loop."""
+
+    def __init__(self):
+        self.semaphore: "asyncio.Semaphore | None" = None
+        self.max_running: int = MAX_RUNNING_AGENTS
+        self.running: int = 0                                   # cosmetic: admitted heavy runs
+        self.session_locks: dict[str, asyncio.Lock] = {}
+        self.session_lock_refs: dict[str, int] = defaultdict(int)
+        self.session_tasks: dict[str, set] = defaultdict(set)   # session_id -> {asyncio.Task}
+
+    def init(self, max_running: "int | None" = None):
+        if max_running is not None and max_running > 0:
+            self.max_running = max_running
+        self.semaphore = asyncio.Semaphore(self.max_running)
+        self.running = 0
+        self.session_locks.clear()
+        self.session_lock_refs.clear()
+        # session_tasks intentionally not cleared: live registrations survive re-init.
+
+    def _ensure(self):
+        if self.semaphore is None:
+            self.init()
+
+    def _get_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        self.session_lock_refs[session_id] += 1
+        return lock
+
+    def _put_lock(self, session_id: str):
+        self.session_lock_refs[session_id] -= 1
+        if self.session_lock_refs[session_id] <= 0:
+            self.session_lock_refs.pop(session_id, None)
+            lock = self.session_locks.get(session_id)
+            # Only drop the lock object when nobody holds or awaits it — never
+            # remove a lock while waiters still reference it.
+            if lock is not None and not lock.locked():
+                self.session_locks.pop(session_id, None)
+
+    def register_task(self, session_id: str, task):
+        if task is not None:
+            self.session_tasks[session_id].add(task)
+
+    def discard_task(self, session_id: str, task):
+        s = self.session_tasks.get(session_id)
+        if s is not None:
+            s.discard(task)
+            if not s:
+                self.session_tasks.pop(session_id, None)
+
+    def cancel_session_tasks(self, session_id: str) -> int:
+        """Cancel every run task tracked for a session (queued or running),
+        except the caller's own task (so a /kill callback never cancels itself).
+        Returns the number cancelled."""
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        n = 0
+        for task in list(self.session_tasks.get(session_id, ())):
+            if task is current or task.done():
+                continue
+            task.cancel()
+            n += 1
+        return n
+
+
+CONC = _Concurrency()
+
+# Process-local deploy lock: prevents two Telegram callbacks/users from starting
+# overlapping deploy handlers on THIS bot. The prod-side deploy.sh flock remains
+# the authoritative cross-process guard (exit 2 = concurrent) — this is only a
+# fast local guard so we don't even launch a second overlapping handler.
+_DEPLOY_LOCK = asyncio.Lock()
+
+
+class execution_slot:
+    """Async context manager guarding one heavy Claude execution.
+
+    Acquires (in order) the per-session lock then a global permit, so a run
+    waiting for a permit never holds a permit while blocked on its own lock.
+    While waiting, the session shows status 'queued'; once admitted, 'running'.
+    Releases everything on success, error, timeout, or cancellation.
+    """
+
+    def __init__(self, session_id: str, session=None):
+        self.session_id = session_id
+        self.session = session
+        self._lock = None
+        self._have_lock = False
+        self._have_permit = False
+        self._task = None
+
+    async def __aenter__(self):
+        CONC._ensure()
+        self._task = asyncio.current_task()
+        CONC.register_task(self.session_id, self._task)
+        if self.session is not None and getattr(self.session, "status", None) != "completed":
+            self.session.status = "queued"
+        # 1) per-session FIFO lock
+        self._lock = CONC._get_lock(self.session_id)
+        await self._lock.acquire()
+        self._have_lock = True
+        # 2) global concurrency permit
+        await CONC.semaphore.acquire()
+        self._have_permit = True
+        CONC.running += 1
+        if self.session is not None:
+            self.session.status = "running"
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._have_permit:
+            CONC.running -= 1
+            CONC.semaphore.release()
+            self._have_permit = False
+        if self._have_lock:
+            self._lock.release()
+            self._have_lock = False
+        CONC._put_lock(self.session_id)
+        CONC.discard_task(self.session_id, self._task)
+        return False  # never suppress exceptions (incl. CancelledError)
 
 # ═══════════════════════════════════════════
 #  Delayed Prompts
@@ -802,8 +970,31 @@ def fmt_out(text, mx=3800):
     if t: r += "\n\n✂️ <i>Truncated. Tap 📦 Save Report for full.</i>"
     return r
 
-def fmt_links(links):
-    return "\n\n".join(f"🔗 <b>{k}:</b>\n<code>{v}</code>" for k, v in links.items())
+def fmt_links(result):
+    """Render a report's links as deliberate, clickable Telegram HTML anchors.
+
+    Accepts a ReportResult (preferred) or a plain {label: url} mapping
+    (backward-compatible). URLs and labels are HTML-escaped. The raw URL is kept
+    visible under the anchor as a copy/paste fallback — but never wrapped only in
+    <code> (the old behavior, which rendered nothing clickable). On a partial or
+    failed report we say so plainly and never emit a phantom ZIP link.
+    """
+    if isinstance(result, ReportResult):
+        links = result.links
+        note = ""
+        if result.status == "error":
+            return ("⚠️ <b>Report generation failed.</b>\n"
+                    f"<i>{esc(result.error or 'unknown error')}</i>")
+        if result.status == "partial":
+            note = "\n\n⚠️ <i>ZIP unavailable (archive step failed) — Summary/Browse still work.</i>"
+    else:
+        links = result or {}
+        note = ""
+    parts = []
+    for label, url in links.items():
+        u = html.escape(url, quote=True)
+        parts.append(f"🔗 <b>{esc(label)}:</b> <a href=\"{u}\">open</a>\n<code>{esc(url)}</code>")
+    return "\n\n".join(parts) + note
 
 def session_prefix(session: Session) -> str:
     return f"{session.color_emoji} <b>{esc(session.label)}</b>"
@@ -864,7 +1055,7 @@ class WorktreeSession:
         self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
         self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
 
-    def __enter__(self):
+    def _enter_sync(self):
         if not self.is_git:
             os.makedirs(self.worktree_path, exist_ok=True)
             subprocess.run(
@@ -919,7 +1110,7 @@ class WorktreeSession:
                  f"sid={self.session_id} branch={self.branch} path={self.worktree_path}")
         return self.worktree_path
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def _exit_sync(self, exc_type, exc_val, exc_tb):
         if not os.path.exists(self.worktree_path):
             return False
 
@@ -934,6 +1125,15 @@ class WorktreeSession:
         subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True, timeout=30)
         log.info(f"worktree.removed sid={self.session_id}")
         return False
+
+    # Async wrappers: the git/rsync/rm work is blocking, so offload it to a
+    # thread — otherwise every worktree create/remove froze the whole Telegram
+    # event loop (and thus every other session) for the duration.
+    async def __aenter__(self):
+        return await asyncio.to_thread(self._enter_sync)
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return await asyncio.to_thread(self._exit_sync, exc_type, exc_val, exc_tb)
 
 
 def _collect_tree(pid: int) -> list[int]:
@@ -1037,95 +1237,102 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
     proc = None
     try:
-        with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
-            # Copy uploaded files INSIDE the worktree (not the shared repo)
-            fnote = ""
-            if files:
-                td = f"{wt_path}/.claude-tasks"
-                os.makedirs(td, exist_ok=True)
-                copied = []
-                for fp in files:
-                    if os.path.isfile(fp):
-                        d = f"{td}/{os.path.basename(fp)}"
-                        subprocess.run(["cp", fp, d])
-                        copied.append(d)
-                if copied:
-                    fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-            full_prompt = prompt + fnote
+        # Bounded concurrency: hold the per-session lock (FIFO within a session)
+        # + one global permit (≤ MAX_RUNNING_AGENTS heavy runs bot-wide) for the
+        # whole worktree+spawn. Releases on success/error/timeout/cancel. All
+        # run_claude callers (normal, delayed, rate-limit retry, voice) inherit
+        # this; the rate-limit retry re-enters run_claude as a fresh, non-nested
+        # acquisition after the first run already released its permit.
+        async with execution_slot(session.id, session):
+            async with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+                # Copy uploaded files INSIDE the worktree (not the shared repo)
+                fnote = ""
+                if files:
+                    td = f"{wt_path}/.claude-tasks"
+                    os.makedirs(td, exist_ok=True)
+                    copied = []
+                    for fp in files:
+                        if os.path.isfile(fp):
+                            d = f"{td}/{os.path.basename(fp)}"
+                            await asyncio.to_thread(shutil.copy2, fp, d)
+                            copied.append(d)
+                    if copied:
+                        fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+                full_prompt = prompt + fnote
 
-            def build_cmd(mode, uuid_str):
-                flag = "--resume" if mode == "resume" else "--session-id"
-                cmd = ["claude", "--print"]
-                chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
-                if chosen_model:
-                    cmd += ["--model", chosen_model]
-                # Permission mode: skip / allowlist / strict
-                if BOT_TOOL_PERMISSION_MODE == "skip":
-                    cmd += ["--dangerously-skip-permissions"]
-                elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
-                    cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
-                # else strict: no flag (default Claude Code behavior in --print)
-                cmd += [flag, uuid_str, full_prompt]
-                return cmd
+                def build_cmd(mode, uuid_str):
+                    flag = "--resume" if mode == "resume" else "--session-id"
+                    cmd = ["claude", "--print"]
+                    chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
+                    if chosen_model:
+                        cmd += ["--model", chosen_model]
+                    # Permission mode: skip / allowlist / strict
+                    if BOT_TOOL_PERMISSION_MODE == "skip":
+                        cmd += ["--dangerously-skip-permissions"]
+                    elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
+                        cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
+                    # else strict: no flag (default Claude Code behavior in --print)
+                    cmd += [flag, uuid_str, full_prompt]
+                    return cmd
 
-            mode = "resume" if session.claude_created else "create"
-            cmd = build_cmd(mode, session.session_uuid)
-            log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
-                     f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
-                     f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
+                mode = "resume" if session.claude_created else "create"
+                cmd = build_cmd(mode, session.session_uuid)
+                log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
+                         f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                         f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
-            proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
+                proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
 
-            # Recovery paths
-            if proc.returncode != 0:
-                err_low = (r + e).lower()
-                session_missing = any(kw in err_low for kw in [
-                    "no such session", "session not found", "session does not exist",
-                    "could not find session", "no session with id"
-                ])
-                uuid_collision = "already in use" in err_low
+                # Recovery paths
+                if proc.returncode != 0:
+                    err_low = (r + e).lower()
+                    session_missing = any(kw in err_low for kw in [
+                        "no such session", "session not found", "session does not exist",
+                        "could not find session", "no session with id"
+                    ])
+                    uuid_collision = "already in use" in err_low
 
-                if mode == "resume" and session_missing:
-                    log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
-                    session.session_uuid = str(uuid.uuid4())
-                    session.claude_created = False
-                    cmd = build_cmd("create", session.session_uuid)
-                    proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
-                    mode = "create"
-                elif mode == "create" and uuid_collision:
-                    log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
-                    session.session_uuid = str(uuid.uuid4())
-                    cmd = build_cmd("create", session.session_uuid)
-                    proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
+                    if mode == "resume" and session_missing:
+                        log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
+                        session.session_uuid = str(uuid.uuid4())
+                        session.claude_created = False
+                        cmd = build_cmd("create", session.session_uuid)
+                        proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
+                        mode = "create"
+                    elif mode == "create" and uuid_collision:
+                        log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
+                        session.session_uuid = str(uuid.uuid4())
+                        cmd = build_cmd("create", session.session_uuid)
+                        proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
 
-            if proc.returncode == 0 and not session.claude_created:
-                session.claude_created = True
+                if proc.returncode == 0 and not session.claude_created:
+                    session.claude_created = True
 
-            USAGE.record(len(full_prompt), len(r), session.label)
+                USAGE.record(len(full_prompt), len(r), session.label)
 
-            # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
-            # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
-            if proc.returncode != 0:
-                combined = (r + e).lower()
-                if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
-                    raw = (e or r).strip()
-                    # Log the RAW CLI error so overload-vs-usage-cap is diagnosable.
-                    log.warning(
-                        f"Claude rate-limited sid={session.id} "
-                        f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
-                        f"rc={proc.returncode} raw_err={raw[:600]!r}")
-                    if _rl_mode == "raw":
-                        return RL_LIMITED_SENTINEL
-                    # Hand off to the interactive flow (auto-retry once, then ask)
-                    # as a background task so this serial handler stays responsive.
-                    asyncio.create_task(_rate_limit_flow(prompt, project, session, files))
-                    return RL_ASK_SENTINEL
+                # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
+                # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
+                if proc.returncode != 0:
+                    combined = (r + e).lower()
+                    if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
+                        raw = (e or r).strip()
+                        # Log the RAW CLI error so overload-vs-usage-cap is diagnosable.
+                        log.warning(
+                            f"Claude rate-limited sid={session.id} "
+                            f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                            f"rc={proc.returncode} raw_err={raw[:600]!r}")
+                        if _rl_mode == "raw":
+                            return RL_LIMITED_SENTINEL
+                        # Hand off to the interactive flow (auto-retry once, then ask)
+                        # as a background task so this serial handler stays responsive.
+                        asyncio.create_task(_rate_limit_flow(prompt, project, session, files))
+                        return RL_ASK_SENTINEL
 
-            if proc.returncode != 0 and e:
-                r += f"\n⚠️ {e[:500]}"
-            return r.strip() or "(no output)"
+                if proc.returncode != 0 and e:
+                    r += f"\n⚠️ {e[:500]}"
+                return r.strip() or "(no output)"
     except RuntimeError as rt_err:
-        # WorktreeSession.__enter__ raised — worktree creation failed.
+        # WorktreeSession._enter_sync raised — worktree creation failed.
         log.error(f"worktree.fatal sid={session.id} err={rt_err}")
         try:
             if BOT is not None:
@@ -1207,6 +1414,10 @@ async def _rate_limit_flow(prompt, project, session, files=None):
         chat_id = int(session.id.split(":")[0])
     except (ValueError, AttributeError, IndexError):
         return
+
+    # Track this task under the session so /kill during the auto-retry wait
+    # cancels the pending resend (the retry's execution_slot later discards it).
+    CONC.register_task(session.id, asyncio.current_task())
 
     notice = None
     try:
@@ -1327,13 +1538,98 @@ def match_cmd(text):
 # ═══════════════════════════════════════════
 #  Reports
 # ═══════════════════════════════════════════
-async def make_report(name, content):
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S"); slug = f"{name}-{ts}"
-    rd = f"{REPORTS}/{slug}"; os.makedirs(rd, exist_ok=True)
-    with open(f"{rd}/summary.txt", "w") as f: f.write(content)
-    subprocess.run(["zip", "-r", f"{REPORTS}/{slug}.zip", slug], cwd=REPORTS, capture_output=True)
-    return {"Summary": f"{REPORT_URL}/{slug}/summary.txt",
-            "Browse": f"{REPORT_URL}/{slug}/", "ZIP": f"{REPORT_URL}/{slug}.zip"}
+@dataclass
+class ReportResult:
+    """Outcome of make_report. `links` is an ordered {label: url} mapping the
+    UI renders. On success it has Summary/Browse/ZIP; on partial failure the ZIP
+    is omitted (never a phantom link); on error it is empty and `error` is set."""
+    status: str                    # "ok" | "partial" | "error"
+    links: dict                    # {label: url}
+    slug: str = ""
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+def _report_slug(name: str) -> str:
+    """Readable, collision-safe slug: project + timestamp + short random suffix.
+    The random suffix guarantees uniqueness even for calls within the same
+    second (the old second-granularity slug could collide and overwrite)."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{name}-{ts}-{uuid.uuid4().hex[:6]}"
+
+
+def _build_report(reports_dir: str, report_url: str, name: str, content: str,
+                  slug: "str | None" = None) -> ReportResult:
+    """Pure, synchronous report builder (no event loop, no external `zip`).
+
+    Writes summary.txt (UTF-8), builds the ZIP to a temp path via zipfile and
+    atomically renames it only after it verifies non-empty and openable with the
+    expected entries. Any failure downgrades to 'partial' (Summary/Browse only)
+    or 'error' — it never raises and never returns a ZIP link for a ZIP that
+    isn't there. Runs off-thread from make_report."""
+    slug = slug or _report_slug(name)
+    rd = os.path.join(reports_dir, slug)
+    links = OrderedDict()
+    links["Summary"] = f"{report_url}/{slug}/summary.txt"
+    links["Browse"] = f"{report_url}/{slug}/"
+    try:
+        os.makedirs(rd, exist_ok=True)
+        summary_path = os.path.join(rd, "summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(content if content is not None else "")
+        if not os.path.isfile(summary_path):
+            return ReportResult("error", OrderedDict(), slug, "summary write failed")
+    except Exception as ex:
+        log.error(f"make_report.summary_failed slug={slug}: {ex}")
+        return ReportResult("error", OrderedDict(), slug, f"summary error: {ex}")
+
+    # Build ZIP to a temp path, verify, then atomically move into place.
+    final_zip = os.path.join(reports_dir, f"{slug}.zip")
+    tmp_zip = os.path.join(reports_dir, f".{slug}.{uuid.uuid4().hex[:8]}.zip.tmp")
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, fnames in os.walk(rd):
+                for fn in fnames:
+                    fp = os.path.join(root, fn)
+                    arcname = os.path.relpath(fp, reports_dir)  # -> "<slug>/summary.txt"
+                    zf.write(fp, arcname)
+        # Verify: non-empty and contains the expected summary entry.
+        if os.path.getsize(tmp_zip) <= 0:
+            raise RuntimeError("empty archive")
+        with zipfile.ZipFile(tmp_zip) as zf:
+            if zf.testzip() is not None:
+                raise RuntimeError("archive CRC check failed")
+            names = zf.namelist()
+            if f"{slug}/summary.txt" not in names:
+                raise RuntimeError(f"summary missing from archive ({names[:3]})")
+        os.replace(tmp_zip, final_zip)
+    except Exception as ex:
+        log.error(f"make_report.zip_failed slug={slug}: {ex}")
+        try:
+            if os.path.exists(tmp_zip):
+                os.remove(tmp_zip)
+        except OSError:
+            pass
+        return ReportResult("partial", links, slug, f"zip error: {ex}")
+
+    links["ZIP"] = f"{report_url}/{slug}.zip"
+    return ReportResult("ok", links, slug)
+
+
+async def make_report(name, content) -> ReportResult:
+    """Create a report (summary + verified ZIP) and return a ReportResult.
+
+    Never raises: on failure the caller still sends a message (via fmt_links),
+    just without a ZIP link. The filesystem/zip work runs in a worker thread so
+    the Telegram event loop is never blocked."""
+    try:
+        return await asyncio.to_thread(_build_report, REPORTS, REPORT_URL, name, content)
+    except Exception as ex:
+        log.error(f"make_report.error name={name}: {ex}")
+        return ReportResult("error", OrderedDict(), "", str(ex))
 
 # ═══════════════════════════════════════════
 #  Send
@@ -1510,25 +1806,30 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
             await track_reply(r, session)
 
     # ── Run Claude with progress indicator ──
-    session.status = "running"
-    await cm.edit_text(f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n⏳ Working...", parse_mode=ParseMode.HTML)
+    # run_claude (via execution_slot) sets session.status to "queued" while it
+    # waits for a free global slot, then "running" once admitted — surface both.
+    await cm.edit_text(f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n⏳ Starting…", parse_mode=ParseMode.HTML)
 
     start_time = datetime.now()
 
+    def _progress_text():
+        elapsed = (datetime.now() - start_time).seconds
+        mins, secs = elapsed // 60, elapsed % 60
+        if session.status == "queued":
+            return (f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n"
+                    f"⏳ Queued — waiting for a free slot "
+                    f"({CONC.running}/{CONC.max_running} running) · {mins}m {secs}s")
+        return (f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n"
+                f"⏳ Working ({mins}m {secs}s)")
+
     async def progress_updater():
-        dots = 0
+        # Render immediately (queued shows without a 30s wait), then poll faster
+        # while queued (responsive) and slower while running (low edit spam).
         while True:
-            await asyncio.sleep(30)
-            dots = (dots + 1) % 4
-            elapsed = (datetime.now() - start_time).seconds
-            mins = elapsed // 60
-            secs = elapsed % 60
             try:
-                await cm.edit_text(
-                    f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n"
-                    f"⏳ Working{'.' * (dots + 1)} ({mins}m {secs}s)",
-                    parse_mode=ParseMode.HTML)
+                await cm.edit_text(_progress_text(), parse_mode=ParseMode.HTML)
             except: pass
+            await asyncio.sleep(6 if session.status == "queued" else 30)
 
     progress_task = asyncio.create_task(progress_updater())
     try:
@@ -1591,13 +1892,13 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 # ═══════════════════════════════════════════
 async def do_health(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
-    r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+    r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_logs(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
     prod_host = os.environ.get("PROD_HOST", "127.0.0.1")
-    r = subprocess.run([f"{SCRIPTS}/collect-logs.sh", prod_host, "30"], capture_output=True, text=True, timeout=30)
+    r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/collect-logs.sh", prod_host, "30"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📋 <b>Logs</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_projects(u, c):
@@ -1662,7 +1963,7 @@ async def cmd_help(u, c):
     await u.message.reply_text(
         "\U0001f4d6 <b>How to use \u2014 v4 Multi-Session</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "<b>Sessions:</b>\n"
-        "/new &lt;name&gt; \u2014 start a new session (max 3)\n"
+        f"/new &lt;name&gt; \u2014 start a new session (max {MAX_SESSIONS})\n"
         "/sessions \u2014 list all active sessions\n"
         "/cont \u2014 pick an active session and continue it (no scrolling)\n"
         "/kill &lt;name&gt; \u2014 end a session\n"
@@ -2228,7 +2529,7 @@ async def on_callback(u, c):
             return
         _, proj, br = d.split(":")
         if br == "claude_latest":
-            r = subprocess.run(["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
+            r = await asyncio.to_thread(subprocess.run, ["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
             cbs = [b.strip().replace("origin/","") for b in r.stdout.splitlines() if "claude/" in b]
             br = cbs[0] if cbs else "main"
         await q.edit_message_text(f"⚠️ <b>Deploy {proj}@{br}</b> → production?\n\nSure?", parse_mode=ParseMode.HTML, reply_markup=deploy_confirm_kb(proj, br))
@@ -2238,54 +2539,67 @@ async def on_callback(u, c):
             await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
             return
         _, proj, br = d.split(":")
-        if proj == "ZigguratKids4":
-            # Route ZK4 through the prod-side guardrailed deploy.sh (main-only,
-            # flock, GIT_COMMIT stamp, incremental no-downtime rebuild, healthcheck).
-            if br != "main":
-                await c.bot.send_message(cid,
-                    "🔒 ZK4 deploys are main-only (guardrailed deploy.sh). Pick 🌿 main.")
+        # Local guard: don't even launch a second overlapping deploy handler.
+        # (Auth + the ⚠️ confirmation step above are unchanged; prod deploy.sh
+        # flock stays authoritative across processes.)
+        if _DEPLOY_LOCK.locked():
+            await c.bot.send_message(cid,
+                "⏳ A deploy is already running on this bot — wait for it to finish "
+                "before starting another.")
+            return
+        async with _DEPLOY_LOCK:
+            if proj == "ZigguratKids4":
+                # Route ZK4 through the prod-side guardrailed deploy.sh (main-only,
+                # flock, GIT_COMMIT stamp, incremental no-downtime rebuild, healthcheck).
+                if br != "main":
+                    await c.bot.send_message(cid,
+                        "🔒 ZK4 deploys are main-only (guardrailed deploy.sh). Pick 🌿 main.")
+                    return
+                await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
+                try:
+                    # Long timeout: a real build is 6-8 min (vs the old 120s that
+                    # SIGKILLed mid-build → outage). Wrapper merges remote stderr.
+                    # to_thread: don't freeze the event loop for the whole build.
+                    r = await asyncio.to_thread(
+                        subprocess.run, [f"{SCRIPTS}/deploy-zk4-prod.sh"],
+                        capture_output=True, text=True, timeout=900)
+                except subprocess.TimeoutExpired:
+                    await c.bot.send_message(cid,
+                        "⏱ <b>Deploy exceeded 15 min.</b>\n\nThe build may still be "
+                        "running on prod — do NOT re-trigger. Check <code>docker compose "
+                        "ps</code> / /api/health before retrying.",
+                        parse_mode=ParseMode.HTML)
+                    return
+                ok = r.returncode == 0
+                if ok:
+                    head = "✅ <b>Done</b>"
+                else:
+                    reason = {
+                        1: "wrong branch / bad arg",
+                        2: "⏳ another deploy holds the lock (concurrent deploy)",
+                        3: "git pull failed",
+                        4: "docker build/up failed",
+                        5: "healthcheck failed",
+                        6: "post-deploy checkout failed",
+                    }.get(r.returncode, f"exit {r.returncode}")
+                    head = f"❌ <b>Failed</b> — {esc(reason)}"
+                # Result lines (GIT_COMMIT=, health 200 OK, deploy complete, abort
+                # reasons) are at the END of the output → show the tail, not the head.
+                msg = head + f"\n\n<pre>{esc((r.stdout or '')[-3000:])}</pre>"
+                if r.stderr and r.stderr.strip():
+                    msg += f"\n<pre>{esc(r.stderr[-800:])}</pre>"
+                await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
                 return
             await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
-            try:
-                # Long timeout: a real build is 6-8 min (vs the old 120s that
-                # SIGKILLed mid-build → outage). Wrapper merges remote stderr.
-                r = subprocess.run([f"{SCRIPTS}/deploy-zk4-prod.sh"],
-                                   capture_output=True, text=True, timeout=900)
-            except subprocess.TimeoutExpired:
-                await c.bot.send_message(cid,
-                    "⏱ <b>Deploy exceeded 15 min.</b>\n\nThe build may still be "
-                    "running on prod — do NOT re-trigger. Check <code>docker compose "
-                    "ps</code> / /api/health before retrying.",
-                    parse_mode=ParseMode.HTML)
-                return
+            r = await asyncio.to_thread(
+                subprocess.run, [f"{SCRIPTS}/deploy-to-prod.sh", proj, br],
+                capture_output=True, text=True, timeout=120)
             ok = r.returncode == 0
-            if ok:
-                head = "✅ <b>Done</b>"
-            else:
-                reason = {
-                    1: "wrong branch / bad arg",
-                    2: "⏳ another deploy holds the lock (concurrent deploy)",
-                    3: "git pull failed",
-                    4: "docker build/up failed",
-                    5: "healthcheck failed",
-                    6: "post-deploy checkout failed",
-                }.get(r.returncode, f"exit {r.returncode}")
-                head = f"❌ <b>Failed</b> — {esc(reason)}"
-            # Result lines (GIT_COMMIT=, health 200 OK, deploy complete, abort
-            # reasons) are at the END of the output → show the tail, not the head.
-            msg = head + f"\n\n<pre>{esc((r.stdout or '')[-3000:])}</pre>"
-            if r.stderr and r.stderr.strip():
-                msg += f"\n<pre>{esc(r.stderr[-800:])}</pre>"
-            await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
-            return
-        await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
-        r = subprocess.run([f"{SCRIPTS}/deploy-to-prod.sh", proj, br], capture_output=True, text=True, timeout=120)
-        ok = r.returncode == 0
-        await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
+            await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
 
     elif d == "do:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
-        r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+        r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
         await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     elif d == "do:pause":
@@ -2719,7 +3033,7 @@ async def on_callback(u, c):
 
     elif d == "menu:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
-        r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+        r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
         await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     # ── Model selection ──
@@ -3237,10 +3551,10 @@ def load_state():
     try:
         restored = 0
         for k, s in state.get("sessions", {}).items():
-            # Skip sessions left in "running" — their subprocess is dead.
-            # Mark them "error" so users know to re-send.
+            # Sessions left "running" or "queued" have a dead subprocess/slot
+            # after a restart — mark them "error" so users know to re-send.
             status = s.get("status", "idle")
-            if status == "running":
+            if status in ("running", "queued"):
                 status = "error"
             session = Session(
                 id=s["id"],
@@ -3340,6 +3654,11 @@ async def post_init(app):
         BotCommand("upload_music", "\U0001f3b5 آپلود موزیک"),
         BotCommand("renders",      "\U0001f4fa آخرین render‌ها"),
     ])
+    # Initialize execution-concurrency primitives inside the running loop and
+    # log the effective (defensively-parsed) limits so misconfiguration is
+    # visible in the journal.
+    CONC.init(MAX_RUNNING_AGENTS)
+    log.info(f"limits.effective max_sessions={MAX_SESSIONS} max_running_agents={MAX_RUNNING_AGENTS}")
     # Restore previous session state before starting handlers
     load_state()
     # Start background cleanup + autosave tasks (handles saved so
@@ -3373,8 +3692,15 @@ async def graceful_shutdown(app):
                 log.info(f"bg_task.cancelled name={task_name} err={type(e).__name__}")
     if BOT_NIGHTWATCH_IPC_ENABLED:
         await _nw_ipc_stop()
-    # Collect active sessions info before killing
-    active = [(k, s) for k, s in SM.sessions.items() if s.status == "running"]
+    # Collect active sessions info before killing (running OR queued/waiting).
+    active = [(k, s) for k, s in SM.sessions.items() if s.status in ("running", "queued")]
+    # Cancel queued/in-flight execution tasks so a waiting turn never starts (or
+    # continues) after shutdown. Running process trees are terminated below.
+    cancelled_tasks = 0
+    for sid in list(CONC.session_tasks.keys()):
+        cancelled_tasks += CONC.cancel_session_tasks(sid)
+    if cancelled_tasks:
+        log.info(f"shutdown.cancelled_run_tasks n={cancelled_tasks}")
     # Kill all tracked claude subprocesses
     for pid, proc in list(ACTIVE_PROCS.items()):
         try:
@@ -3408,7 +3734,8 @@ async def graceful_shutdown(app):
             await app.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
         except Exception as e:
             log.error(f"Failed to notify chat {chat_id}: {e}")
-    # Mark all running sessions as error so they don't block on restart
+    # Mark all interrupted sessions (running + queued) as error so they don't
+    # block on restart.
     for key, session in active:
         session.status = "error"
     # Persist final state so sessions can be restored after restart
@@ -3420,6 +3747,59 @@ async def graceful_shutdown(app):
 NW_HMAC = os.environ.get("BOT_NIGHTWATCH_HMAC_SECRET", "").strip()
 NW_PORT = int(os.environ.get("BOT_NIGHTWATCH_IPC_PORT", "9091"))
 NW_BIND = os.environ.get("BOT_NIGHTWATCH_IPC_BIND", "127.0.0.1")
+# Optional SECOND listener bind. Empty by default in the repo — production sets
+# BOT_NIGHTWATCH_IPC_BIND2 to the DO VPC private IP (e.g. 10.108.0.4) so prod can
+# POST /inject over the VPC while 127.0.0.1 stays bound for local scripts. Only a
+# loopback/private IP that differs from the primary is ever bound (never a
+# wildcard/public/multicast/invalid address) — see _nw_second_bind_ok.
+NW_BIND2 = os.environ.get("BOT_NIGHTWATCH_IPC_BIND2", "").strip()
+
+
+def _nw_second_bind_ok(bind: str, primary: str) -> "tuple[bool, str]":
+    """Validate an optional second NightWatch listener address.
+
+    Returns (ok, reason). Accepts ONLY a parseable loopback or private IP that
+    differs from the primary. Rejects empty, same-as-primary, wildcard
+    (0.0.0.0 / ::), unspecified, multicast, public, and unparseable addresses —
+    binding 9091 on a public/wildcard interface would expose the HMAC-gated
+    inject endpoint to the internet."""
+    b = (bind or "").strip()
+    if not b:
+        return (False, "empty")
+    if b == (primary or "").strip():
+        return (False, "same_as_primary")
+    if b in ("0.0.0.0", "::"):
+        return (False, "wildcard")
+    try:
+        ip = ipaddress.ip_address(b)
+    except ValueError:
+        return (False, "invalid")
+    if ip.is_unspecified:
+        return (False, "unspecified")
+    if ip.is_multicast:
+        return (False, "multicast")
+    if ip.is_loopback or ip.is_private:
+        return (True, "ok")
+    return (False, "public")
+
+
+async def _nw_start_sites(site_starter, binds: list) -> list:
+    """Start one TCPSite per address via `site_starter(bind)` (an awaitable).
+
+    The FIRST (primary) bind is mandatory — its failure re-raises. A secondary
+    bind that fails to start is logged and skipped WITHOUT tearing down the
+    primary. Returns the list of addresses that bound successfully. Extracted so
+    the fan-out is unit-testable without a real aiohttp runner."""
+    ok_binds = []
+    for i, b in enumerate(binds):
+        try:
+            await site_starter(b)
+            ok_binds.append(b)
+        except Exception as ex:
+            if i == 0:
+                raise
+            log.warning(f"nightwatch_ipc.second_bind_failed bind={b}:{NW_PORT}: {ex}")
+    return ok_binds
 NW_PREFIXES = [p.strip() for p in os.environ.get("BOT_NIGHTWATCH_ALLOWED_FILE_PREFIXES", "/opt/sentry-nightwatch/snapshots/").split(",") if p.strip()]
 NW_MAX_BYTES = 25 * 1024 * 1024
 NW_RUN_PYTHON = os.environ.get("NIGHTWATCH_VENV_PYTHON", "/opt/sentry-nightwatch/venv/bin/python")
@@ -3499,9 +3879,21 @@ async def _nw_ipc_start(app):
     a.router.add_get("/healthz", _nw_healthz)
     a.router.add_post("/inject", _nw_inject)
     runner = _aw.AppRunner(a); await runner.setup()
-    await _aw.TCPSite(runner, NW_BIND, NW_PORT).start()
+    # Primary listener (mandatory) + optional validated second listener.
+    binds = [NW_BIND]
+    if NW_BIND2:
+        ok, reason = _nw_second_bind_ok(NW_BIND2, NW_BIND)
+        if ok:
+            binds.append(NW_BIND2)
+        else:
+            log.warning(f"nightwatch_ipc.second_bind_rejected bind={NW_BIND2} reason={reason}")
+
+    async def _start(bind):
+        await _aw.TCPSite(runner, bind, NW_PORT).start()
+
+    bound = await _nw_start_sites(_start, binds)
     _NW_RUNNER = runner
-    log.info(f"nightwatch_ipc.listening bind={NW_BIND}:{NW_PORT}")
+    log.info(f"nightwatch_ipc.listening binds={bound}:{NW_PORT}")
 
 async def _nw_ipc_stop():
     global _NW_DOWN
