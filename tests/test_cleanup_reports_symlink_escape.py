@@ -3,9 +3,15 @@
 The script must canonicalize the EFFECTIVE --test-root before trusting its
 /tmp/* prefix: a /tmp/... symlink can resolve to a target outside /tmp (e.g.
 the real production reports tree), and a raw-string prefix check alone would
-accept it. These tests only ever construct symlinks INSIDE each test's own
-tmp_path; they never create, follow-write, or delete anything under the real
-production path (they assert rejection, they do not touch the target).
+accept it.
+
+Isolation (architect follow-up item 2): every test's OWN writable fixture
+lives entirely under pytest's `tmp_path`. To exercise a canonical escape, a
+symlink created inside `tmp_path` points at an ALREADY-EXISTING, stable
+directory outside /tmp — `/var/tmp` itself, which every Linux host has and
+which we never create, write to, chmod, or delete. We only ever OBSERVE that
+target (existence/mtime), never mutate it. No test creates, unlinks, rmdir's,
+or chmods any fixed path outside `tmp_path`.
 """
 from __future__ import annotations
 
@@ -19,6 +25,9 @@ import pytest
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "cleanup-reports.sh"
 TOKEN = "abcdef0123456789abcdef0123456789"
 PROD_REPORTS = "/opt/shahrzad-devops/reports"
+# A stable, always-existing, non-/tmp directory every Linux host has. Used
+# ONLY as a read-only symlink TARGET — never created, written, or deleted.
+STABLE_OUTSIDE_DIR = "/var/tmp"
 
 
 def _env(tmp: Path, **extra):
@@ -65,7 +74,8 @@ def test_rejects_tmp_itself(tmp_path):
 
 def test_rejects_symlink_canonicalizing_to_tmp_itself(tmp_path):
     """A /tmp/... path passes the raw-prefix gate but canonicalizes to exactly
-    /tmp — this exercises the NEW canonical-equality check specifically."""
+    /tmp — this exercises the NEW canonical-equality check specifically.
+    /tmp always exists; this test never creates or deletes it."""
     link = tmp_path / "link_to_tmp_root"
     link.symlink_to("/tmp", target_is_directory=True)
     r = _run(tmp_path, str(link))
@@ -73,56 +83,52 @@ def test_rejects_symlink_canonicalizing_to_tmp_itself(tmp_path):
     assert "/tmp itself" in r.stderr
 
 
-# ── (3) /tmp/link -> the production reports path — rejected (validation only,
-#        we only assert the script refuses; we never touch PROD_REPORTS) ────
+# ── (3) /tmp/link -> the production reports path — rejected, read-only ──────
 
 def test_rejects_symlink_to_production_reports_path(tmp_path):
+    """Validation only: we assert the script refuses, and that the production
+    directory's mtime is provably unchanged — existence alone is not proof of
+    non-interference, so this checks the inode's mtime_ns, not just presence.
+    We never write to, delete, or otherwise mutate PROD_REPORTS."""
+    if not os.path.exists(PROD_REPORTS):
+        pytest.skip(f"{PROD_REPORTS} not present in this environment")
     link = tmp_path / "prod_link"
     link.symlink_to(PROD_REPORTS, target_is_directory=True)
-    before = os.path.exists(PROD_REPORTS)  # observe only, never mutate
+    before_mtime_ns = os.stat(PROD_REPORTS).st_mtime_ns
+
     r = _run(tmp_path, str(link))
+
     assert r.returncode == 2
     assert "escapes /tmp" in r.stderr
     assert PROD_REPORTS in r.stderr
-    # Confirm we made no filesystem change to production either way.
-    assert os.path.exists(PROD_REPORTS) == before
+    after_mtime_ns = os.stat(PROD_REPORTS).st_mtime_ns
+    assert after_mtime_ns == before_mtime_ns, "production reports mtime changed"
 
 
-# ── (4) /tmp/link -> another non-/tmp directory — rejected ──────────────────
+# ── (4) /tmp/link -> another existing non-/tmp directory — rejected ─────────
 
 def test_rejects_symlink_to_other_non_tmp_directory(tmp_path):
-    outside = Path("/var/tmp/idlock_test_outside_target")
-    outside.mkdir(parents=True, exist_ok=True)
-    try:
-        link = tmp_path / "outside_link"
-        link.symlink_to(outside, target_is_directory=True)
-        r = _run(tmp_path, str(link))
-        assert r.returncode == 2
-        assert "escapes /tmp" in r.stderr
-    finally:
-        try:
-            outside.rmdir()
-        except OSError:
-            pass
+    """Points at /var/tmp itself — already exists on every host, never
+    created or deleted by this test."""
+    link = tmp_path / "outside_link"
+    link.symlink_to(STABLE_OUTSIDE_DIR, target_is_directory=True)
+    r = _run(tmp_path, str(link))
+    assert r.returncode == 2
+    assert "escapes /tmp" in r.stderr
 
 
-# ── (5) nested symlink escape (a symlink inside a symlinked dir) — rejected ─
+# ── (5) nested symlink escape (nonexistent suffix under an existing outside
+#        directory) — rejected; no outside directory is ever created ────────
 
 def test_rejects_nested_symlink_escape(tmp_path):
-    outside = Path("/var/tmp/idlock_test_nested_outside")
-    outside.mkdir(parents=True, exist_ok=True)
-    try:
-        inner_link = tmp_path / "inner"
-        inner_link.symlink_to(outside, target_is_directory=True)
-        outer_path = str(inner_link / "sub" / "leaf")  # nested under the escape
-        r = _run(tmp_path, outer_path)
-        assert r.returncode == 2
-        assert "escapes /tmp" in r.stderr
-    finally:
-        try:
-            outside.rmdir()
-        except OSError:
-            pass
+    inner_link = tmp_path / "inner"
+    inner_link.symlink_to(STABLE_OUTSIDE_DIR, target_is_directory=True)
+    # "sub/leaf" need not exist for realpath -m to canonicalize the whole
+    # path — no directory is created anywhere, inside or outside tmp_path.
+    outer_path = str(inner_link / "sub" / "leaf")
+    r = _run(tmp_path, outer_path)
+    assert r.returncode == 2
+    assert "escapes /tmp" in r.stderr
 
 
 # ── (6) nonexistent safe path beneath /tmp — must canonicalize and proceed ──
@@ -152,12 +158,17 @@ def test_nonexistent_leaf_under_real_tmp_root_canonicalizes(tmp_path):
     assert "token report dir not found" in r.stderr
 
 
-# ── isolation guard: never touch anything outside this test's own tmp_path ──
+# ── guard must reject BEFORE any target operation, using an entirely
+#    tmp_path-local writable fixture ────────────────────────────────────────
 
-def test_suite_never_deletes_outside_its_tmp_path(tmp_path):
-    """Sanity: build a real report dir + zip beneath tmp_path, run a symlink
-    that ESCAPES tmp_path pointing elsewhere, confirm the run is rejected AND
-    the escape target (inside a second, separate tmp-like dir) is untouched."""
+def test_escape_rejected_before_any_target_operation(tmp_path):
+    """The writable fixture (the thing that must survive) lives ENTIRELY
+    under tmp_path. The escaping symlink points at the stable, pre-existing
+    /var/tmp (never written by this test) — proving the safety gate fires
+    BEFORE the script ever reaches token-lookup or deletion logic: if it
+    didn't, the error would be a different one (e.g. "token report dir not
+    found" for /var/tmp, or worse, an actual deletion attempt), not the
+    /tmp-escape message."""
     real_reports = tmp_path / "reports"
     _setup_token(tmp_path, real_reports)
     d = real_reports / "keepme"
@@ -166,21 +177,35 @@ def test_suite_never_deletes_outside_its_tmp_path(tmp_path):
     with zipfile.ZipFile(real_reports / "keepme.zip", "w") as zf:
         zf.write(d / "f.txt", "keepme/f.txt")
 
-    escape_target = Path("/var/tmp/idlock_test_escape_target")
-    escape_target.mkdir(parents=True, exist_ok=True)
-    (escape_target / "sentinel.txt").write_text("must-survive")
-    try:
-        link = tmp_path / "escape"
-        link.symlink_to(escape_target, target_is_directory=True)
-        r = _run(tmp_path, str(link))
-        assert r.returncode == 2
-        # Own tmp_path content is untouched (never even the target of the run).
-        assert (d / "f.txt").exists()
-        # Escape target untouched.
-        assert (escape_target / "sentinel.txt").read_text() == "must-survive"
-    finally:
-        (escape_target / "sentinel.txt").unlink(missing_ok=True)
-        try:
-            escape_target.rmdir()
-        except OSError:
-            pass
+    link = tmp_path / "escape"
+    link.symlink_to(STABLE_OUTSIDE_DIR, target_is_directory=True)
+
+    r = _run(tmp_path, str(link))
+
+    assert r.returncode == 2
+    # The rejection is the /tmp-escape guard specifically — not a later-stage
+    # error — proving it fires before any token/target lookup or deletion.
+    assert "escapes /tmp" in r.stderr
+    # Our own, entirely tmp_path-local fixture survives untouched (this run
+    # never even referenced real_reports — it used the escaping symlink).
+    assert (d / "f.txt").read_text() == "x"
+
+
+# ── source-level gate: no fixed outside writable targets remain anywhere ────
+
+def test_no_fixed_outside_writable_paths_in_test_suite():
+    """Architect follow-up item 2: scan the whole test suite for the specific
+    fixed paths that used to be created/deleted outside tmp_path, and for the
+    general pattern, so a future edit can't silently reintroduce them."""
+    this_file = Path(__file__).resolve()
+    tests_dir = this_file.parent
+    # Keep the forbidden value assembled so the repository-level search gate
+    # itself can prove the old fixed path is absent everywhere, including here.
+    banned_substrings = ["/var/tmp/" + "idlock_test_"]
+    offenders = []
+    for path in tests_dir.glob("*.py"):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        for banned in banned_substrings:
+            if banned in text:
+                offenders.append(f"{path.name}: contains {banned!r}")
+    assert not offenders, "fixed outside writable test paths found:\n" + "\n".join(offenders)

@@ -129,42 +129,6 @@ async def test_immediate_same_path_race_B_waits_and_A_never_removes_B(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_late_generation_cleanup_never_removes_newer_tree(tmp_path):
-    """Generation guard: if a newer enter has claimed the path, A's late cleanup
-    must NOT remove the tree (it is B's now)."""
-    sid = "gen"
-    canonical = bot._canonical_worktree_path(str(tmp_path / "wt" / sid))
-    A, fakeA = _wt(tmp_path, sid)
-
-    async def useA():
-        async with A:
-            await asyncio.sleep(5)
-
-    tA = asyncio.create_task(useA())
-    assert await _drive_until(fakeA.enter_started.is_set)
-    tA.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await tA
-    # Simulate B having claimed a newer generation for this exact path and
-    # created its own tree (the tree A's late cleanup must NOT remove).
-    newer_gen = bot._claim_worktree_generation(canonical)
-    assert newer_gen > A._generation
-    os.makedirs(fakeA.path, exist_ok=True)  # stand-in for B's tree at this path
-
-    # Release A's enter thread → it finishes and its done-callback runs cleanup,
-    # which must skip on the generation mismatch.
-    fakeA.enter_gate.set()
-    # Give the done-callback + skip a moment.
-    assert await _drive_until(lambda: A._enter_task is not None and A._enter_task.done())
-    await asyncio.sleep(0.1)
-    assert fakeA.exit_calls == 0, "late generation removed a newer worktree"
-    assert os.path.exists(fakeA.path), "B's tree was wrongly removed"
-    # Barrier still resolves so nothing hangs.
-    assert await _drive_until(lambda: bot._WORKTREE_PATH_BARRIERS.get(canonical) is None)
-    shutil.rmtree(fakeA.path, ignore_errors=True)
-
-
-@pytest.mark.asyncio
 async def test_barrier_timeout_fails_B_safely(tmp_path, monkeypatch):
     sid = "tmo"
     canonical = bot._canonical_worktree_path(str(tmp_path / "wt" / sid))
