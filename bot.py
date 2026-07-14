@@ -1061,6 +1061,66 @@ def authorized(fn):
 # ═══════════════════════════════════════════
 #  Claude Code
 # ═══════════════════════════════════════════
+# ── Post-merge safety: per-worktree-path lifecycle coordinator ─────────────
+# asyncio.to_thread cannot stop the underlying thread, so a cancelled
+# __aenter__ (enter still running) or a cancelled __aexit__ (a SECOND
+# cancellation delivered while awaiting exit — exit still running) can each
+# leave real filesystem work (git worktree add/remove, rm -rf) in flight after
+# the coroutine that started it has already unwound and released its
+# per-session lock. Without coordination, a same-path turn B could then start
+# while turn A's enter/exit is still mutating that exact path on disk.
+#
+# We serialise per CANONICAL path with ONE lifecycle barrier that spans the
+# ENTIRE span from claiming ownership (start of __aenter__) through the
+# genuine completion of __aexit__'s _exit_sync — not just the enter phase:
+#   * __aenter__ claims a fresh owner token and publishes a lifecycle-barrier
+#     future for the path BEFORE starting any work;
+#   * a later __aenter__ on that exact path awaits the CURRENT owner's barrier
+#     (bounded by WORKTREE_BARRIER_TIMEOUT) before doing anything;
+#   * the barrier is resolved via an unconditional, idempotent done-callback —
+#     on the enter thread finishing after a cancelled enter, or on the exit
+#     thread finishing after a normal OR cancelled exit — so resolution is
+#     always tied to the REAL background work actually finishing, never to
+#     the coroutine merely unwinding;
+#   * a late cleanup (enter-orphan or exit) only touches the path while its
+#     token still owns it — a newer owner's tree is never touched;
+#   * once a lifecycle fully resolves AND no newer owner has since claimed the
+#     path, its registry entries are popped — long-lived paths do not
+#     accumulate unbounded owner/barrier state over the process's uptime.
+# Different paths are fully independent. All asyncio state below is touched
+# only from the event-loop thread (single-threaded), so no extra lock is
+# needed for the check-then-set claim (no `await` occurs between them).
+_WORKTREE_PATH_BARRIERS: dict[str, "asyncio.Future"] = {}   # canonical path -> current lifecycle-done future
+_WORKTREE_PATH_OWNER: dict[str, object] = {}                # canonical path -> current owner token (identity only)
+# Bounded, configurable: a later same-path enter fails safely rather than
+# waiting forever if a prior lifecycle never settles.
+WORKTREE_BARRIER_TIMEOUT = float(os.environ.get("BOT_WORKTREE_BARRIER_TIMEOUT", "30"))
+
+
+def _canonical_worktree_path(path: str) -> str:
+    """Canonical key for a worktree path (realpath of the parent + basename, so
+    a not-yet-created leaf still keys consistently with its eventual tree)."""
+    p = os.path.abspath(path)
+    parent = os.path.realpath(os.path.dirname(p))
+    return os.path.join(parent, os.path.basename(p))
+
+
+def _claim_worktree_owner(canonical: str) -> object:
+    """Claim a fresh, opaque owner token for this path. Object identity (`is`)
+    is all that's needed — no monotonic counter, no permanent per-path entry."""
+    token = object()
+    _WORKTREE_PATH_OWNER[canonical] = token
+    return token
+
+
+def _release_worktree_owner_if_current(canonical: str, token: object) -> None:
+    """Drop the owner entry once a lifecycle fully completes — but ONLY if no
+    newer owner has since claimed the path. Bounds registry growth: a path
+    that is not currently in-flight leaves no trace behind."""
+    if _WORKTREE_PATH_OWNER.get(canonical) is token:
+        _WORKTREE_PATH_OWNER.pop(canonical, None)
+
+
 class WorktreeSession:
     """Per-session ephemeral git worktree.
 
@@ -1088,6 +1148,9 @@ class WorktreeSession:
         self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
         self._enter_task = None
         self._orphan_cleanup_scheduled = False
+        self._canonical = None
+        self._owner_token = None
+        self._lifecycle_barrier = None  # spans claim -> real completion of enter-cleanup or exit
 
     def _enter_sync(self):
         if not self.is_git:
@@ -1165,29 +1228,98 @@ class WorktreeSession:
     # event loop (and thus every other session) for the duration.
     #
     # Cancellation caveat: asyncio.to_thread CANNOT stop the underlying thread.
-    # If the awaiter is cancelled while _enter_sync runs, the thread may still
-    # finish and leave a worktree behind after the coroutine has unwound. We
-    # bound this: on cancellation we let the enter thread run to completion under
-    # a done-callback that removes whatever it created EXACTLY ONCE (or, if the
-    # loop is gone during shutdown, leaves the on-disk tree for
-    # claude-worktree-gc.timer to sweep — never an unbounded wait).
+    # If the awaiter is cancelled while _enter_sync (or later _exit_sync) runs,
+    # the thread may still finish AFTER the coroutine has unwound. We bound
+    # this with the lifecycle barrier above: a cancelled enter's thread, and a
+    # cancelled exit's thread, both run to completion under a done-callback
+    # that resolves the barrier exactly once whatever finishes — never an
+    # unbounded wait, and a same-path re-entry cannot start until then.
     async def __aenter__(self):
+        self._canonical = _canonical_worktree_path(self.worktree_path)
+        await self._claim_lifecycle(self._canonical)
         self._enter_task = asyncio.ensure_future(asyncio.to_thread(self._enter_sync))
         try:
-            return await asyncio.shield(self._enter_task)
+            result = await asyncio.shield(self._enter_task)
         except asyncio.CancelledError:
             self._schedule_orphan_cleanup()
             raise
+        except Exception:
+            # Enter failed for a NORMAL (non-cancellation) reason, e.g. `git
+            # worktree add` failed. By the time this exception reaches us the
+            # shielded task is already done — no background work is left
+            # running, so it's safe to resolve/release the lifecycle barrier
+            # immediately (Python will NOT call __aexit__ since __aenter__
+            # raised, so nothing else will ever resolve it).
+            self._resolve_lifecycle_barrier()
+            raise
+        return result
+
+    async def _claim_lifecycle(self, canonical: str):
+        """Atomically (with respect to this event loop) wait for the current
+        owner, then publish this lifecycle's owner/barrier before another
+        same-path waiter can slip through.
+
+        It is important to loop after waiting: several waiters may all awake
+        when one old barrier resolves.  Only the first may claim; every later
+        waiter must observe and await that new owner's barrier instead of
+        overwriting its token while its enter/exit is in flight.
+        """
+        while True:
+            barrier = _WORKTREE_PATH_BARRIERS.get(canonical)
+            if barrier is None or barrier.done():
+                # No await between observation and publication: this claim is
+                # atomic on asyncio's single event-loop thread.
+                self._owner_token = _claim_worktree_owner(canonical)
+                self._lifecycle_barrier = asyncio.get_event_loop().create_future()
+                _WORKTREE_PATH_BARRIERS[canonical] = self._lifecycle_barrier
+                return
+            await self._await_prior_barrier(canonical, barrier)
+
+    async def _await_prior_barrier(self, canonical: str, barrier=None):
+        """Block until any in-flight lifecycle (enter-orphan cleanup OR exit) of
+        a PRIOR owner on this path is done. Bounded by WORKTREE_BARRIER_TIMEOUT
+        — on timeout we fail this run safely instead of waiting forever or
+        racing the prior lifecycle."""
+        barrier = barrier or _WORKTREE_PATH_BARRIERS.get(canonical)
+        if barrier is None or barrier.done():
+            return
+        try:
+            # shield so a timeout here never cancels the prior lifecycle itself.
+            await asyncio.wait_for(asyncio.shield(barrier), timeout=WORKTREE_BARRIER_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"worktree.barrier_timeout path={canonical} "
+                f"prior lifecycle did not settle within {WORKTREE_BARRIER_TIMEOUT}s")
+
+    def _resolve_lifecycle_barrier(self):
+        """Idempotent: settle OUR lifecycle barrier and release path ownership
+        — but only while we still hold it (a newer owner's claim is never
+        touched). Safe to call more than once / from more than one callback."""
+        barrier = self._lifecycle_barrier
+        if barrier is not None and not barrier.done():
+            barrier.set_result(True)
+        canonical = self._canonical
+        if canonical is None:
+            return
+        if _WORKTREE_PATH_BARRIERS.get(canonical) is barrier:
+            _WORKTREE_PATH_BARRIERS.pop(canonical, None)
+        _release_worktree_owner_if_current(canonical, self._owner_token)
 
     def _schedule_orphan_cleanup(self):
-        """Called when __aenter__ is cancelled. Ensures the worktree the enter
-        thread is (or finished) creating gets removed exactly once."""
+        """Called when __aenter__ is cancelled. Once the (uninterruptible) enter
+        thread finishes, removes whatever it created EXACTLY ONCE — but only
+        while this owner token still owns the path — then resolves the
+        already-published lifecycle barrier so a later same-path enter can
+        proceed."""
         if self._orphan_cleanup_scheduled or self._enter_task is None:
             return
         self._orphan_cleanup_scheduled = True
+        canonical = self._canonical
+        my_token = self._owner_token
 
         def _on_done(task):
             if task.cancelled():
+                self._resolve_lifecycle_barrier()
                 return
             # Retrieve any enter exception so it isn't logged as "never retrieved"
             # (the awaiter already received CancelledError). Nothing to clean if
@@ -1196,34 +1328,60 @@ class WorktreeSession:
             if exc is not None:
                 log.info(f"worktree.enter_after_cancel_failed sid={self.session_id} "
                          f"err={type(exc).__name__} (no tree to clean)")
+                self._resolve_lifecycle_barrier()
                 return
             try:
-                loop = asyncio.get_event_loop()
+                loop2 = asyncio.get_event_loop()
             except RuntimeError:
-                loop = None
+                loop2 = None
+
+            if loop2 is None or not loop2.is_running():
+                # Loop gone (shutdown) — mark the on-disk tree quarantined for
+                # the GC timer; never reuse it in-process. Settle the barrier so
+                # nothing waits forever on a dead loop.
+                log.info(f"worktree.orphan_left_for_gc sid={self.session_id} "
+                         f"path={canonical} quarantined=1")
+                self._resolve_lifecycle_barrier()
+                return
 
             async def _cleanup():
                 try:
+                    # Ownership guard: if a newer enter (turn B) has claimed this
+                    # path, its tree is NOT ours to remove — skip.
+                    if _WORKTREE_PATH_OWNER.get(canonical) is not my_token:
+                        log.info(f"worktree.orphan_cleanup_skipped_newer_owner "
+                                 f"sid={self.session_id} path={canonical}")
+                        return
                     await asyncio.to_thread(self._exit_sync, None, None, None)
                     log.info(f"worktree.orphan_cleaned sid={self.session_id}")
                 except Exception as ex:
                     log.warning(f"worktree.orphan_cleanup_failed sid={self.session_id}: "
                                 f"{ex} (claude-worktree-gc will sweep)")
+                finally:
+                    self._resolve_lifecycle_barrier()
 
-            if loop is not None and loop.is_running():
-                loop.create_task(_cleanup())
-            else:
-                # Loop gone (shutdown) — leave the on-disk tree for the GC timer.
-                log.info(f"worktree.orphan_left_for_gc sid={self.session_id}")
+            loop2.create_task(_cleanup())
 
         self._enter_task.add_done_callback(_on_done)
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        # Shield removal so a cancellation delivered during exit doesn't abandon
-        # the worktree half-removed — the thread runs to completion regardless.
+        # The lifecycle barrier is ALREADY published (from __aenter__) and
+        # spans through this exit. The done-callback below resolves it
+        # exactly once, tied to _exit_sync's REAL completion — cancellation-
+        # blind — so even if awaiting the shield is cancelled AGAIN here (a
+        # second cancellation delivered mid-exit), __aexit__ can unwind
+        # immediately without abandoning coordination: a same-path re-entry
+        # still cannot start until the real removal work genuinely finishes.
         exit_task = asyncio.ensure_future(
             asyncio.to_thread(self._exit_sync, exc_type, exc_val, exc_tb))
-        return await asyncio.shield(exit_task)
+        exit_task.add_done_callback(lambda _t: self._resolve_lifecycle_barrier())
+        try:
+            return await asyncio.shield(exit_task)
+        except asyncio.CancelledError:
+            log.info(f"worktree.exit_cancelled_deferred sid={self.session_id} "
+                     f"path={self._canonical} (exit continues under shield; "
+                     f"barrier resolves when it finishes)")
+            raise
 
 
 def _collect_tree(pid: int) -> list[int]:
@@ -3809,11 +3967,19 @@ SHUTDOWN_TASK_TIMEOUT = float(os.environ.get("BOT_SHUTDOWN_TASK_TIMEOUT", "10"))
 
 async def _cancel_and_await_run_tasks(timeout: float = SHUTDOWN_TASK_TIMEOUT) -> dict:
     """Snapshot all tracked run tasks (excluding the caller), cancel them, and
-    await their completion under a bounded timeout.
+    await their completion under a HARD bounded deadline (asyncio.wait, not
+    wait_for(gather(...)) — the latter can block past the deadline awaiting a
+    non-cooperative task's cancellation).
 
-    Each cancelled task's execution_slot rolls back its own lock/permit/registry
-    bookkeeping, so after this returns (within the timeout) no stale slot state
-    remains. Returns a summary dict. Testable in isolation — no app/bot needed.
+    Each task that finishes WITHIN the deadline (in the returned "awaited"
+    count) has its execution_slot roll back its own lock/permit/registry
+    bookkeeping via that task's own cancellation handler — so for those tasks
+    specifically, no stale slot state remains. Tasks reported under
+    "non_cooperative" did NOT finish within the deadline: this helper makes NO
+    claim their bookkeeping is clean, and shutdown proceeds regardless
+    (best-effort only for those stragglers — see graceful_shutdown).
+
+    Returns a summary dict. Testable in isolation — no app/bot needed.
     """
     try:
         current = asyncio.current_task()
@@ -3829,26 +3995,62 @@ async def _cancel_and_await_run_tasks(timeout: float = SHUTDOWN_TASK_TIMEOUT) ->
         t.cancel()
     awaited = 0
     timed_out = False
+    non_cooperative = 0
     if tasks:
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True), timeout=timeout)
-            awaited = len(tasks)
-        except asyncio.TimeoutError:
+        # HARD deadline: asyncio.wait returns (done, pending) AT the timeout and
+        # never awaits pending tasks. asyncio.wait_for(gather(...)) could block
+        # past the deadline because it awaits the gather's own cancellation,
+        # which a task suppressing CancelledError never completes.
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        awaited = len(done)
+        non_cooperative = len(pending)
+        # Consume each finished task's result/exception so a task that raised
+        # something OTHER than CancelledError can never produce a "Task
+        # exception was never retrieved" warning at garbage-collection time.
+        # (Task.exception() itself raises CancelledError for a task that WAS
+        # cancelled — that's not an unretrieved exception, so skip those.)
+        for t in done:
+            if t.cancelled():
+                continue
+            exc = t.exception()
+            if exc is not None:
+                log.warning(f"shutdown.run_task_exception err={type(exc).__name__}: {exc}")
+        if pending:
             timed_out = True
-            awaited = sum(1 for t in tasks if t.done())
+            # Best-effort only: these tasks are still live, so we do NOT claim
+            # their execution_slot bookkeeping is clean.
             log.warning(f"shutdown.run_tasks_timeout cancelled={len(tasks)} "
-                        f"finished={awaited} timeout_s={timeout}")
-    summary = {"cancelled": len(tasks), "awaited": awaited, "timed_out": timed_out}
+                        f"finished={awaited} non_cooperative={non_cooperative} "
+                        f"timeout_s={timeout}")
+    summary = {"cancelled": len(tasks), "awaited": awaited,
+               "timed_out": timed_out, "non_cooperative": non_cooperative}
     if tasks:
         log.info(f"shutdown.run_tasks {summary}")
     return summary
 
 
-async def _reap_active_procs(timeout: float = 5.0):
+# Small, FIXED bound for draining cancelled waiter tasks after the main reap
+# deadline — not a fresh per-process timeout, just enough for asyncio to
+# process the cancellation so no pending Task lingers past this function.
+_REAP_WAITER_DRAIN_TIMEOUT = 1.0
+
+
+async def _reap_active_procs(timeout: float = 5.0) -> dict:
     """Terminate any still-tracked Claude process trees and await their reaping
     (best-effort, bounded). Most are already gone via each run task's own
-    cancellation handler; this covers stragglers."""
+    cancellation handler; this covers stragglers.
+
+    ONE total deadline across ALL processes (they are reaped concurrently) —
+    not a fresh full timeout per process, which could stack to N*timeout and
+    blow past systemd TimeoutStopSec when several trees are non-cooperative.
+
+    Returns {"completed": n, "pending": n}. A process counted under "pending"
+    is NOT claimed as successfully reaped — the OS-level SIGKILL has already
+    been sent (via _kill_tree/terminate above), but this function only
+    observed that its exit wasn't reported within the deadline; ACTIVE_PROCS
+    bookkeeping is still cleared (best-effort — the tracking dict is not
+    itself a resource), with an explicit warning naming any pending handles.
+    """
     procs = list(ACTIVE_PROCS.items())
     for pid, proc in procs:
         try:
@@ -3858,12 +4060,46 @@ async def _reap_active_procs(timeout: float = 5.0):
                 proc.terminate()
             except Exception:
                 pass
-    for pid, proc in procs:
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout)
-        except (asyncio.TimeoutError, Exception):
-            pass
+    completed = 0
+    pending_count = 0
+    if procs:
+        waiters = {asyncio.ensure_future(proc.wait()): pid for pid, proc in procs}
+        done, pending = await asyncio.wait(waiters.keys(), timeout=timeout)
+        completed = len(done)
+        pending_count = len(pending)
+        # Consume results/exceptions of finished waiters so none can produce a
+        # "Task exception was never retrieved" warning.
+        for w in done:
+            if not w.cancelled():
+                w.exception()
+        if pending:
+            pending_pids = [waiters[w] for w in pending]
+            log.warning(f"shutdown.reap_procs_pending count={pending_count} "
+                        f"pids={pending_pids} timeout_s={timeout} "
+                        f"(NOT claimed as reaped)")
+            for w in pending:
+                w.cancel()
+            # Bounded, FIXED, non-blocking-forever drain so the cancelled
+            # waiter tasks actually finish before we return — avoids
+            # "Task was destroyed but it is pending!" at loop/test teardown.
+            # This is one small additional bound, not a fresh per-process
+            # timeout, and never turns into an unbounded await.
+            drained, still_pending = await asyncio.wait(pending, timeout=_REAP_WAITER_DRAIN_TIMEOUT)
+            for w in drained:
+                if not w.cancelled():
+                    w.exception()
+            if still_pending:
+                log.warning(f"shutdown.reap_procs_waiter_drain_incomplete "
+                            f"count={len(still_pending)} (best-effort only)")
+    summary = {"completed": completed, "pending": pending_count}
+    if procs:
+        log.info(f"shutdown.reap_procs {summary}")
+    # Best-effort only: OS-level kill already issued for every tracked pid; a
+    # pending wait handle means our wait() didn't observe the exit within the
+    # deadline(+drain), NOT that the process is confirmed still alive. We do
+    # NOT claim a still-pending process was successfully reaped (see above).
     ACTIVE_PROCS.clear()
+    return summary
 
 
 async def graceful_shutdown(app):

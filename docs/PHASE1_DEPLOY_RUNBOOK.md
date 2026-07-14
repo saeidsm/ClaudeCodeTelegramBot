@@ -66,12 +66,14 @@ systemctl cat claude-telegram-bot.service > "$B/claude-telegram-bot.service.txt"
 
 ## 3. Set env values (edit `/opt/shahrzad-devops/.env`)
 ```env
-BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4     # restores the live-only VPC listener (was drift)
-BOT_MAX_SESSIONS=9                      # was 6
+BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4
+BOT_MAX_SESSIONS=9
 BOT_MAX_RUNNING_AGENTS=2
 ```
 > `BOT_NIGHTWATCH_IPC_BIND2` **must** be set before replacing the live script, or
-> the second (VPC) listener won't bind (repo default is empty).
+> the second (VPC) listener won't bind (repo default is empty). This restores
+> the live-only VPC listener (previously drifted out of `.env`).
+> `BOT_MAX_SESSIONS` is raised from its prior live value of 6 to 9.
 
 ## 4. Dedicated non-secret cleanup config + retention migration
 Create the dedicated config (the cleanup service loads **only** this — never the
@@ -110,21 +112,17 @@ test "$(sha256sum "$DEPLOY_WT/bot.py" | cut -d' ' -f1)" \
 
 ## 6. Syntax + config verification WITHOUT sourcing the full .env (Section 11)
 Do **not** `source`/`.` the full `.env` into your shell (it would export every
-secret). Parse it with a non-executing parser and inject only into the check:
+secret). Parse it with the installed `python-dotenv` package's non-executing
+`dotenv_values()` — never a hand-written parser and never shell `source`/eval —
+and inject only into the check:
 ```bash
 python3 -m py_compile /opt/shahrzad-devops/scripts/claude-telegram-bot.py
 python3 - <<'PY'
-import os, ast, importlib.util
-# non-executing dotenv parse (KEY=VALUE lines only; no shell eval)
-env = {}
-with open("/opt/shahrzad-devops/.env", encoding="utf-8") as f:
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        k, v = line.split("=", 1)
-        env[k.strip()] = v.strip()
-os.environ.update(env)
+import os, importlib.util
+from dotenv import dotenv_values   # non-executing: parses KEY=VALUE, no shell eval
+
+env = dotenv_values("/opt/shahrzad-devops/.env")
+os.environ.update({k: v for k, v in env.items() if v is not None})
 spec = importlib.util.spec_from_file_location(
     "livebot", "/opt/shahrzad-devops/scripts/claude-telegram-bot.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
