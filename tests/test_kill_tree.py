@@ -243,12 +243,162 @@ def test_kill_tree_skips_pid_reused_since_freeze(monkeypatch):
 
         assert innocent.pid not in sigkilled, "reused pid was SIGKILLed despite start-time mismatch"
         assert innocent.poll() is None, "innocent bystander was killed"
+        assert _proc_state(innocent.pid) != "T", "innocent bystander left stopped"
     finally:
         try:
             innocent.kill()
         except Exception:
             pass
         innocent.wait(timeout=5)
+
+
+def _proc_state(pid: int):
+    """Single-char process state from /proc/<pid>/stat ('T' = stopped), or None."""
+    try:
+        st = Path(f"/proc/{pid}/stat").read_text()
+        return st[st.rindex(")") + 2:].split()[0]
+    except (OSError, ValueError):
+        return None
+
+
+def _wait_state_not(pid: int, unwanted: str, timeout: float = 3.0):
+    """Bounded wait for the process to leave `unwanted` state (e.g. resume from 'T')."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = _proc_state(pid)
+        if s is None or s != unwanted:
+            return s
+        time.sleep(0.02)
+    return _proc_state(pid)
+
+
+def test_kill_tree_initial_starttime_none_then_readable(monkeypatch):
+    """A transient unreadable identity on the first read (None) followed by a
+    readable one on a later round must still end with the process KILLED — never
+    leaked and never left stopped."""
+    import os
+    victim = subprocess.Popen(["sleep", "30"])
+    try:
+        real_start = bot._proc_starttime
+        calls = {"n": 0}
+
+        def flaky_start(p):
+            if p == victim.pid:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return None                 # first read: transient failure
+            return real_start(p)
+
+        monkeypatch.setattr(bot, "_collect_tree", lambda pid: [victim.pid])
+        monkeypatch.setattr(bot, "_proc_starttime", flaky_start)
+        bot._kill_tree(victim.pid)
+        monkeypatch.undo()
+
+        assert calls["n"] >= 2, "second round should have re-read the identity"
+        # killed within a bounded wait, not left stopped
+        deadline = time.time() + 5
+        while time.time() < deadline and victim.poll() is None:
+            time.sleep(0.05)
+        assert victim.poll() is not None, "victim survived despite readable identity on retry"
+    finally:
+        try:
+            os.kill(victim.pid, __import__("signal").SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        victim.wait(timeout=5)
+
+
+def test_kill_tree_starttime_unavailable_after_sigstop_not_left_stopped(monkeypatch):
+    """If identity is never readable after a successful SIGSTOP, the process must
+    NOT be treated as frozen and must NOT be left permanently stopped (it is
+    resumed on every bounded round and on return)."""
+    import os
+    victim = subprocess.Popen(["sleep", "30"])
+    try:
+        monkeypatch.setattr(bot, "_collect_tree", lambda pid: [victim.pid])
+        monkeypatch.setattr(bot, "_proc_starttime",
+                            lambda p: None if p == victim.pid else bot._proc_starttime(p))
+        # sanity: monkeypatched to always-None for the victim
+        bot._kill_tree(victim.pid)
+        monkeypatch.undo()
+
+        assert victim.poll() is None, "victim unexpectedly died"
+        assert _wait_state_not(victim.pid, "T") != "T", "victim left permanently STOPPED"
+    finally:
+        try:
+            os.kill(victim.pid, __import__("signal").SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        victim.wait(timeout=5)
+
+
+def test_kill_tree_sigstop_permission_or_oserror_not_frozen(monkeypatch):
+    """A failed SIGSTOP must NOT be counted as a successful freeze: the process is
+    neither recorded, nor SIGKILLed, nor left stopped."""
+    import os
+    import signal as _sig
+    victim = subprocess.Popen(["sleep", "30"])
+    real_kill = os.kill
+    sigkilled = []
+    try:
+        def fail_sigstop(p, s):
+            if p == victim.pid and s == _sig.SIGSTOP:
+                raise PermissionError("simulated: cannot SIGSTOP")
+            if s == _sig.SIGKILL:
+                sigkilled.append(p)
+            return real_kill(p, s)
+
+        monkeypatch.setattr(bot, "_collect_tree", lambda pid: [victim.pid])
+        monkeypatch.setattr(bot.os, "kill", fail_sigstop)
+        bot._kill_tree(victim.pid)              # must not raise, must not spin unbounded
+        monkeypatch.undo()
+
+        assert victim.pid not in sigkilled, "un-frozen (unstoppable) pid was SIGKILLed"
+        assert victim.poll() is None, "victim unexpectedly died"
+        assert _proc_state(victim.pid) != "T", "victim left stopped after failed SIGSTOP"
+    finally:
+        try:
+            real_kill(victim.pid, _sig.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        victim.wait(timeout=5)
+
+
+def test_kill_tree_leaves_no_frozen_process_stopped(tmp_path):
+    """Every successfully frozen live process in a real tree ends up killed — and
+    none is left in the STOPPED (T) state on the host."""
+    import os
+    import signal as _sig
+    pidfile = tmp_path / "loop.pid"
+    parent = subprocess.Popen(
+        ["bash", "-c",
+         f"setsid bash -c 'echo $$ > {pidfile}; while true; do sleep 300; done' & wait"])
+    loop_pid = None
+    try:
+        for _ in range(50):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        loop_pid = int(pidfile.read_text().strip())
+        time.sleep(0.2)
+        bot._kill_tree(parent.pid)
+        deadline = time.time() + 5
+        while time.time() < deadline and (_alive(parent.pid) or _alive(loop_pid)):
+            time.sleep(0.05)
+        assert not _alive(parent.pid) and not _alive(loop_pid), "tree survived"
+        # neither is parked in STOPPED state
+        assert _proc_state(parent.pid) != "T" and _proc_state(loop_pid) != "T", \
+            "a frozen process was left STOPPED"
+    finally:
+        for pid in ([parent.pid, loop_pid] if loop_pid else [parent.pid]):
+            try:
+                os.kill(pid, _sig.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            parent.wait(timeout=5)
+        except Exception:
+            pass
 
 
 def test_kill_tree_tolerates_pid_vanishing_before_kill(monkeypatch):
@@ -270,6 +420,56 @@ def test_proc_starttime_identifies_incarnation_and_gone():
         p.kill()
         p.wait(timeout=5)
     assert bot._proc_starttime(p.pid) is None  # gone -> None
+
+
+def test_collect_tree_finds_setsid_descendants_even_when_parent_stopped(tmp_path):
+    """_collect_tree must find a setsid() descendant via the independent PPID walk,
+    NOT the parent's per-task `children` file — including when the parent is
+    SIGSTOPped (the children file could under-report; the PPID walk reads the
+    descendant's own /proc/<pid>/stat, which is reliable regardless)."""
+    import os
+    import signal as _sig
+    pidfile = tmp_path / "loop.pid"
+    parent = subprocess.Popen(
+        ["bash", "-c",
+         f"setsid bash -c 'echo $$ > {pidfile}; while true; do sleep 300; done' & wait"])
+    loop_pid = None
+    try:
+        for _ in range(50):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        loop_pid = int(pidfile.read_text().strip())
+        time.sleep(0.2)
+        # setsid'd loop is in its OWN session/pgroup but PPID still points at parent
+        os.kill(parent.pid, _sig.SIGSTOP)         # even with parent stopped ...
+        try:
+            tree = bot._collect_tree(parent.pid)
+        finally:
+            os.kill(parent.pid, _sig.SIGCONT)
+        assert parent.pid in tree
+        assert loop_pid in tree, "PPID walk missed the setsid session-leader descendant"
+    finally:
+        for pid in ([parent.pid, loop_pid] if loop_pid else [parent.pid]):
+            try:
+                os.kill(pid, _sig.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            parent.wait(timeout=5)
+        except Exception:
+            pass
+
+
+def test_proc_ppid_reads_parent_and_none_when_gone():
+    import os
+    p = subprocess.Popen(["sleep", "5"])
+    try:
+        assert bot._proc_ppid(p.pid) == os.getpid()
+    finally:
+        p.kill()
+        p.wait(timeout=5)
+    assert bot._proc_ppid(p.pid) is None
 
 
 def test_spawn_timeout_default_is_120_minutes():

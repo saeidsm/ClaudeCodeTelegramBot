@@ -1384,22 +1384,48 @@ class WorktreeSession:
             raise
 
 
-def _collect_tree(pid: int) -> list[int]:
-    """Return pid + all /proc descendants (depth-first), even ones that
-    called setsid() — claude's Bash tool calls are their own session leaders,
-    so pgroup/session-based kills miss them (2026-06-05 regression)."""
-    pids = [pid]
+def _proc_ppid(pid: int) -> int | None:
+    """Parent pid — /proc/<pid>/stat field 4. comm (field 2) may contain spaces
+    /parens, so parse after the last ')'."""
     try:
-        for tid in os.listdir(f"/proc/{pid}/task"):
-            try:
-                children = Path(f"/proc/{pid}/task/{tid}/children").read_text().split()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                continue
-            for child in children:
-                pids.extend(_collect_tree(int(child)))
-    except (FileNotFoundError, ProcessLookupError, PermissionError):
-        pass
-    return pids
+        data = Path(f"/proc/{pid}/stat").read_text()
+        return int(data[data.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _collect_tree(pid: int) -> list[int]:
+    """Return `pid` followed by all of its /proc descendants (root first).
+
+    Descendants are found by an independent parent-pointer (PPID) walk over all
+    of /proc, reading each process's own /proc/<pid>/stat. A setsid() descendant
+    (claude's Bash tool calls run as their own session leaders) keeps its real
+    PPID — only its session/pgroup change — so a PPID walk still reaches it. This
+    replaces the earlier per-task `children` file, which is only reliable once the
+    parent is stopped and can silently under-report while the parent is running —
+    a descendant it misses would then escape _kill_tree (2026-06-05 regression)."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return [pid]
+    children: dict[int, list[int]] = {}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        cpid = int(entry)
+        ppid = _proc_ppid(cpid)
+        if ppid is not None:
+            children.setdefault(ppid, []).append(cpid)
+    out = [pid]
+    seen = {pid}
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                out.append(child)
+                stack.append(child)
+    return out
 
 
 def _proc_starttime(pid: int) -> str | None:
@@ -1411,7 +1437,7 @@ def _proc_starttime(pid: int) -> str | None:
     try:
         data = Path(f"/proc/{pid}/stat").read_text()
         return data[data.rindex(")") + 2:].split()[19]
-    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+    except (OSError, ValueError, IndexError):
         return None
 
 
@@ -1428,44 +1454,77 @@ def _kill_tree(pid: int) -> None:
     that poisoned every future `pgrep`-based wait loop).
 
     Freeze-then-kill closes the collect-versus-spawn/reparent race that a plain
-    snapshot+kill leaves open: SIGSTOP each process as it is discovered so it
-    cannot fork, exit, or reparent out of view while we walk /proc, rescanning
-    until the frozen set stops growing; only then SIGKILL, descendant-first /
-    root-last, so an intermediate death never orphans a not-yet-killed node out
-    of the tree. Each victim's start time is re-checked before the SIGKILL so a
-    pid reused after the freeze is never signalled. SIGKILL overrides SIGSTOP,
-    so freezing never blocks termination, and the round count is bounded, so this
-    never blocks indefinitely — graceful-shutdown deadlines are preserved."""
-    starts: dict[int, str | None] = {}   # victim pid -> start time when first frozen
-    order: list[int] = []                # discovery order, root first
-    for _ in range(_KILL_TREE_MAX_ROUNDS):
-        added = False
-        for p in _collect_tree(pid):
-            if p in starts:
-                continue
-            st = _proc_starttime(p)
+    snapshot+kill leaves open, and is identity-safe against PID reuse:
+
+    * A process is recorded as "frozen" ONLY after its SIGSTOP succeeds AND its
+      /proc start time is readable — an unreadable identity or a failed SIGSTOP is
+      never treated as a successful freeze, so the scan cannot go falsely stable
+      while a process we could not stop keeps spawning descendants.
+    * A successfully SIGSTOPped process cannot exit or be reaped, so its PID
+      cannot be reused while we hold it stopped; the recorded start time is
+      re-checked immediately before SIGKILL, so a procfs mis-read can only make us
+      skip a kill, never signal a stranger.
+    * SIGKILL is sent descendant-first / root-last, so an intermediate death never
+      orphans a not-yet-killed node out of the tree.
+    * Every process this function successfully froze is, on every return path,
+      either SIGKILLed or SIGCONT-resumed — none is ever left stopped.
+    * SIGKILL overrides SIGSTOP so freezing never blocks termination, and the
+      round count is bounded, so graceful-shutdown deadlines are preserved.
+    """
+    frozen: dict[int, str] = {}   # pid -> start time, ONLY for processes we
+                                  # successfully SIGSTOPped with a readable identity
+    order: list[int] = []         # freeze order (root discovered first)
+    resolved: set[int] = set()    # pids we will not revisit (frozen, gone, or unstoppable)
+    try:
+        for _ in range(_KILL_TREE_MAX_ROUNDS):
+            pending = [p for p in _collect_tree(pid) if p not in resolved]
+            if not pending:
+                break                        # frozen set stable → collection complete
+            for p in pending:
+                try:
+                    os.kill(p, signal.SIGSTOP)   # freeze → pins this incarnation
+                except ProcessLookupError:
+                    resolved.add(p)              # already gone
+                    continue
+                except (PermissionError, OSError):
+                    resolved.add(p)              # cannot freeze → NOT frozen, give up on it
+                    continue
+                st = _proc_starttime(p)          # identity read AFTER a successful stop
+                if st is None:
+                    # Frozen but identity unreadable (procfs race / just-exited): never
+                    # treat as safely frozen. Resume so it is not left stopped and let a
+                    # later bounded round retry it.
+                    try:
+                        os.kill(p, signal.SIGCONT)
+                    except OSError:
+                        pass
+                    continue
+                frozen[p] = st
+                order.append(p)
+                resolved.add(p)
+        # SIGKILL descendant-first, root last (root forced to the end regardless of
+        # the order it was frozen in).
+        victims = [p for p in reversed(order) if p != pid]
+        if pid in frozen:
+            victims.append(pid)
+        for p in victims:
+            if _proc_starttime(p) != frozen.get(p):
+                continue                         # identity changed → do not signal a stranger
             try:
-                os.kill(p, signal.SIGSTOP)   # freeze before it can spawn/reparent
+                os.kill(p, signal.SIGKILL)
             except ProcessLookupError:
-                continue                     # already gone — nothing to kill
-            except (PermissionError, OSError):
-                pass                         # can't stop it; still record + try SIGKILL
-            starts[p] = st
-            order.append(p)
-            added = True
-        if not added:
-            break                            # frozen set stable → collection complete
-    # Descendant-first, root last (reverse discovery order): killing a leaf before
-    # its parent means no live intermediate is left to lose track of a child.
-    for p in reversed(order):
-        if _proc_starttime(p) != starts.get(p):
-            continue                         # pid reused since freeze — do not signal a stranger
-        try:
-            os.kill(p, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as ex:
-            log.warning(f"kill_tree pid={p} failed: {ex}")
+                pass
+            except Exception as ex:
+                log.warning(f"kill_tree pid={p} failed: {ex}")
+            frozen.pop(p, None)                  # killed → nothing left to resume
+    finally:
+        # No process we successfully froze may remain stopped on any return path:
+        # resume anything not confirmed killed (harmless if already gone/running).
+        for p in list(frozen):
+            try:
+                os.kill(p, signal.SIGCONT)
+            except OSError:
+                pass
     if len(order) > 1:
         log.info(f"kill_tree root={pid} killed {len(order)} processes: {order}")
 
