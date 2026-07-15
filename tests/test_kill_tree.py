@@ -235,6 +235,8 @@ def test_kill_tree_skips_pid_reused_since_freeze(monkeypatch):
         def watch_kill(p, s):
             if s == _sig.SIGKILL:
                 sigkilled.append(p)
+            if p == innocent.pid:
+                return                 # never actually signal the real bystander
             return real_kill(p, s)
 
         monkeypatch.setattr(bot.os, "kill", watch_kill)
@@ -259,6 +261,42 @@ def _proc_state(pid: int):
         return st[st.rindex(")") + 2:].split()[0]
     except (OSError, ValueError):
         return None
+
+
+def test_kill_tree_resumes_when_sigkill_fails(monkeypatch):
+    """A process is really SIGSTOPped (frozen) but its SIGKILL fails
+    (PermissionError/OSError). It must NOT be dropped from the resume set: the
+    finally clause must SIGCONT it so it is left running, never stuck in T."""
+    import os
+    import signal as _sig
+
+    victim = subprocess.Popen(["sleep", "30"])
+    real_kill = os.kill
+    try:
+        # collection yields only the victim; SIGSTOP/SIGCONT are applied for real,
+        # but SIGKILL is refused -> victim stays our stopped incarnation, then must
+        # be resumed by finally.
+        monkeypatch.setattr(bot, "_collect_tree", lambda pid: [victim.pid])
+
+        def kill_mock(p, s):
+            if p == victim.pid and s == _sig.SIGKILL:
+                raise PermissionError("simulated: cannot SIGKILL")
+            return real_kill(p, s)
+
+        monkeypatch.setattr(bot.os, "kill", kill_mock)
+        bot._kill_tree(victim.pid)          # must not raise
+        monkeypatch.undo()
+
+        assert victim.poll() is None, "victim was killed despite SIGKILL failure"
+        # resumed by finally, not parked in STOPPED state
+        assert _wait_state_not(victim.pid, "T") != "T", \
+            "frozen victim left STOPPED after SIGKILL failure"
+    finally:
+        try:
+            real_kill(victim.pid, _sig.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        victim.wait(timeout=5)
 
 
 def _wait_state_not(pid: int, unwanted: str, timeout: float = 3.0):

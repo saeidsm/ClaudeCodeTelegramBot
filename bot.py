@@ -1457,43 +1457,54 @@ def _kill_tree(pid: int) -> None:
     snapshot+kill leaves open, and is identity-safe against PID reuse:
 
     * A process is recorded as "frozen" ONLY after its SIGSTOP succeeds AND its
-      /proc start time is readable — an unreadable identity or a failed SIGSTOP is
-      never treated as a successful freeze, so the scan cannot go falsely stable
-      while a process we could not stop keeps spawning descendants.
+      /proc start time is readable, so the scan cannot go falsely stable while a
+      process we could not stop keeps spawning descendants. A SIGSTOP that fails
+      with ProcessLookupError means the process is already gone; any other failure
+      (e.g. EPERM — a process we do not own) is a PERMANENT freeze failure: it is
+      recorded as unmanaged and never claimed as killed (fail-safe). Only an
+      unreadable identity *after* a successful stop is retried within the bounded
+      round budget.
     * A successfully SIGSTOPped process cannot exit or be reaped, so its PID
       cannot be reused while we hold it stopped; the recorded start time is
       re-checked immediately before SIGKILL, so a procfs mis-read can only make us
       skip a kill, never signal a stranger.
-    * SIGKILL is sent descendant-first / root-last, so an intermediate death never
-      orphans a not-yet-killed node out of the tree.
-    * Every process this function successfully froze is, on every return path,
-      either SIGKILLed or SIGCONT-resumed — none is ever left stopped.
+    * SIGKILL is sent descendant-first / root-last. A pid is dropped from the
+      resume set ONLY once its SIGKILL is delivered or ProcessLookupError proves
+      it gone; any other SIGKILL failure keeps it in the set so `finally` still
+      resumes it — no successfully frozen process is ever left stopped.
     * SIGKILL overrides SIGSTOP so freezing never blocks termination, and the
       round count is bounded, so graceful-shutdown deadlines are preserved.
+    * The outcome is logged accurately: only processes actually terminated are
+      reported as killed, and anything that could not be frozen or killed (and was
+      therefore left running) is logged as a warning.
     """
-    frozen: dict[int, str] = {}   # pid -> start time, ONLY for processes we
-                                  # successfully SIGSTOPped with a readable identity
+    frozen: dict[int, str] = {}   # pid -> start time, ONLY successfully SIGSTOPped + readable
     order: list[int] = []         # freeze order (root discovered first)
-    resolved: set[int] = set()    # pids we will not revisit (frozen, gone, or unstoppable)
+    resolved: set[int] = set()    # gone or permanently unmanageable — not revisited
+    unmanaged: list[int] = []     # discovered but could not be frozen (e.g. EPERM)
+    killed: list[int] = []        # SIGKILL delivered, or proven gone at kill time
+    exhausted = True              # cleared when the frozen set stabilizes within budget
     try:
         for _ in range(_KILL_TREE_MAX_ROUNDS):
-            pending = [p for p in _collect_tree(pid) if p not in resolved]
+            pending = [p for p in _collect_tree(pid) if p not in resolved and p not in frozen]
             if not pending:
+                exhausted = False
                 break                        # frozen set stable → collection complete
             for p in pending:
                 try:
                     os.kill(p, signal.SIGSTOP)   # freeze → pins this incarnation
                 except ProcessLookupError:
-                    resolved.add(p)              # already gone
+                    resolved.add(p)              # already gone — nothing to kill
                     continue
-                except (PermissionError, OSError):
-                    resolved.add(p)              # cannot freeze → NOT frozen, give up on it
+                except OSError:
+                    resolved.add(p)              # cannot freeze (EPERM/other): PERMANENT.
+                    unmanaged.append(p)          # fail-safe — record, never claim we killed it
                     continue
                 st = _proc_starttime(p)          # identity read AFTER a successful stop
                 if st is None:
                     # Frozen but identity unreadable (procfs race / just-exited): never
                     # treat as safely frozen. Resume so it is not left stopped and let a
-                    # later bounded round retry it.
+                    # later bounded round retry it (not added to resolved).
                     try:
                         os.kill(p, signal.SIGCONT)
                     except OSError:
@@ -1509,24 +1520,38 @@ def _kill_tree(pid: int) -> None:
             victims.append(pid)
         for p in victims:
             if _proc_starttime(p) != frozen.get(p):
-                continue                         # identity changed → do not signal a stranger
+                continue                         # identity changed → leave for finally SIGCONT
             try:
                 os.kill(p, signal.SIGKILL)
             except ProcessLookupError:
-                pass
-            except Exception as ex:
-                log.warning(f"kill_tree pid={p} failed: {ex}")
-            frozen.pop(p, None)                  # killed → nothing left to resume
+                frozen.pop(p, None)              # already gone → nothing to resume
+                killed.append(p)
+            except OSError as ex:
+                # Could not deliver SIGKILL (e.g. EPERM): KEEP it in `frozen` so the
+                # finally clause resumes it — never leave it SIGSTOPped.
+                log.warning(f"kill_tree pid={p} SIGKILL failed: {ex}")
+            else:
+                frozen.pop(p, None)              # delivered
+                killed.append(p)
     finally:
-        # No process we successfully froze may remain stopped on any return path:
-        # resume anything not confirmed killed (harmless if already gone/running).
+        # Resume anything we froze but did not kill — identity-checked so a reused
+        # pid is never signalled — so no successfully frozen process is left stopped.
         for p in list(frozen):
-            try:
-                os.kill(p, signal.SIGCONT)
-            except OSError:
-                pass
-    if len(order) > 1:
-        log.info(f"kill_tree root={pid} killed {len(order)} processes: {order}")
+            if _proc_starttime(p) == frozen[p]:
+                try:
+                    os.kill(p, signal.SIGCONT)
+                except OSError:
+                    pass
+    if killed:
+        log.info(f"kill_tree root={pid} killed {len(killed)} process(es): {killed}")
+    not_terminated = unmanaged + list(frozen)
+    if not_terminated or exhausted:
+        log.warning(
+            f"kill_tree root={pid} did NOT fully terminate the tree: "
+            f"{len(not_terminated)} process(es) could not be frozen/killed and were left "
+            f"running: {not_terminated}"
+            + (f"; collection did not stabilize within {_KILL_TREE_MAX_ROUNDS} rounds"
+               if exhausted else ""))
 
 
 async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
