@@ -1402,21 +1402,72 @@ def _collect_tree(pid: int) -> list[int]:
     return pids
 
 
+def _proc_starttime(pid: int) -> str | None:
+    """Process start time — /proc/<pid>/stat field 22 (jiffies since boot).
+    Together with the pid it identifies one process incarnation, so a pid reused
+    by an unrelated process after we recorded it is detectable (start time
+    differs). comm (field 2) may contain spaces/parens, so split after the last
+    ')'."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+        return data[data.rindex(")") + 2:].split()[19]
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+        return None
+
+
+# Bounded number of freeze+rescan rounds in _kill_tree. Converges in 1–2 rounds
+# even for an aggressively forking child (once SIGSTOPped it cannot spawn more);
+# the cap only guarantees we never loop forever on a pathological tree.
+_KILL_TREE_MAX_ROUNDS = 16
+
+
 def _kill_tree(pid: int) -> None:
-    """SIGKILL `pid` and every descendant. Collect first, then kill — a child
-    spawned in the race window dies with its parent (orphaned sleep ≤20s).
-    Without this, `until pgrep ...` wait-loops survived the claude kill,
-    reparented to PID 1, and poisoned future pgrep-based loops forever."""
-    victims = _collect_tree(pid)
-    for p in victims:
+    """SIGKILL `pid` and every /proc descendant, including setsid() session
+    leaders that pgroup/session kills miss (2026-06-05 regression: claude Bash
+    tool calls run as their own session leaders and survived as immortal orphans
+    that poisoned every future `pgrep`-based wait loop).
+
+    Freeze-then-kill closes the collect-versus-spawn/reparent race that a plain
+    snapshot+kill leaves open: SIGSTOP each process as it is discovered so it
+    cannot fork, exit, or reparent out of view while we walk /proc, rescanning
+    until the frozen set stops growing; only then SIGKILL, descendant-first /
+    root-last, so an intermediate death never orphans a not-yet-killed node out
+    of the tree. Each victim's start time is re-checked before the SIGKILL so a
+    pid reused after the freeze is never signalled. SIGKILL overrides SIGSTOP,
+    so freezing never blocks termination, and the round count is bounded, so this
+    never blocks indefinitely — graceful-shutdown deadlines are preserved."""
+    starts: dict[int, str | None] = {}   # victim pid -> start time when first frozen
+    order: list[int] = []                # discovery order, root first
+    for _ in range(_KILL_TREE_MAX_ROUNDS):
+        added = False
+        for p in _collect_tree(pid):
+            if p in starts:
+                continue
+            st = _proc_starttime(p)
+            try:
+                os.kill(p, signal.SIGSTOP)   # freeze before it can spawn/reparent
+            except ProcessLookupError:
+                continue                     # already gone — nothing to kill
+            except (PermissionError, OSError):
+                pass                         # can't stop it; still record + try SIGKILL
+            starts[p] = st
+            order.append(p)
+            added = True
+        if not added:
+            break                            # frozen set stable → collection complete
+    # Descendant-first, root last (reverse discovery order): killing a leaf before
+    # its parent means no live intermediate is left to lose track of a child.
+    for p in reversed(order):
+        if _proc_starttime(p) != starts.get(p):
+            continue                         # pid reused since freeze — do not signal a stranger
         try:
             os.kill(p, signal.SIGKILL)
         except ProcessLookupError:
             pass
         except Exception as ex:
             log.warning(f"kill_tree pid={p} failed: {ex}")
-    if len(victims) > 1:
-        log.info(f"kill_tree root={pid} killed {len(victims)} processes: {victims}")
+    if len(order) > 1:
+        log.info(f"kill_tree root={pid} killed {len(order)} processes: {order}")
 
 
 async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
