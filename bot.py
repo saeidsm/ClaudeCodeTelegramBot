@@ -14,6 +14,19 @@ from collections import OrderedDict, defaultdict
 import aiohttp
 from aiohttp import web as _aw
 
+# ── Phase 2: engine adapters, coordination, resource footer ──
+import engines.base as engines
+from engines.claude_adapter import ClaudeAdapter
+from engines.codex_adapter import (
+    CodexAdapter, build_codex_cmd, parse_codex_output, classify_codex_failure,
+    parse_codex_models,
+)
+from engines.openrouter_chat import (
+    OpenRouterClient, ChatCatalog, ChatHistory, ChatAdapter, ChatError,
+)
+import coordination as coord
+import resource_footer
+
 from telegram import (
     Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, Message
@@ -154,6 +167,32 @@ ACTIVE_FALLBACK = {"provider": "gemini", "model": ""}
 # (e.g. branch-reset failure notice from run_claude) can send Telegram messages.
 BOT = None
 APPLICATION = None  # telegram Application; set in main() so non-handler paths can schedule work
+
+# ── Phase 2: engine layer config + singletons ──
+CHAT_SESSIONS_DIR = os.environ.get("BOT_CHAT_SESSIONS_DIR", f"{BOT_DATA_ROOT}/chat-sessions")
+COORDINATION_FILE = os.environ.get("BOT_COORDINATION_FILE", f"{BOT_CONFIGS_DIR}/coordination.json")
+CHAT_CATALOG_TTL = _positive_int_env("BOT_CHAT_CATALOG_TTL", 3600)
+CHAT_CONCURRENCY = _positive_int_env("BOT_CHAT_CONCURRENCY", 4)  # independent of heavy cap
+APP_REFERER_URL = os.environ.get("APP_REFERER_URL", "")
+APP_TITLE = os.environ.get("APP_TITLE", "Claude Code Telegram Bot")
+
+# Adapter singletons + shared stores. Populated by init_engines() at startup;
+# built here too so import-time/test code has real objects.
+COORD = coord.CoordinationStore(COORDINATION_FILE)
+_or_client = OpenRouterClient(OPENROUTER_API_KEY or None, APP_REFERER_URL, APP_TITLE)
+CHAT_CATALOG = ChatCatalog(_or_client, ttl=float(CHAT_CATALOG_TTL))
+CHAT_SEM = None  # asyncio.Semaphore(CHAT_CONCURRENCY); created in init (needs a loop)
+
+
+def init_engines():
+    """Register the three adapters. Idempotent; safe to call from tests."""
+    engines.reset_registry()
+    engines.register(ClaudeAdapter())
+    engines.register(CodexAdapter())
+    engines.register(ChatAdapter(CHAT_CATALOG))
+
+
+init_engines()
 
 # ── Logging ──
 for d in [LOGS, UPLOADS, os.path.dirname(PROMPTS_FILE)]:
@@ -528,6 +567,11 @@ class Session:
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
     claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
+    # ── Phase 2: multi-engine ──
+    engine: str = "claude"           # claude | codex | chat  (old sessions => claude)
+    model: str = ""                  # generic per-engine model id (codex/chat); Claude keeps claude_model
+    provider_session_id: str = ""    # Codex thread id (Claude uses session_uuid; chat unused)
+    chat_history_ref: str = ""       # chat-session dir for the bounded Chat history
 
 
 class SessionManager:
@@ -687,15 +731,23 @@ class _Concurrency:
         self.semaphore: "asyncio.Semaphore | None" = None
         self.max_running: int = MAX_RUNNING_AGENTS
         self.running: int = 0                                   # cosmetic: admitted heavy runs
+        self.chat_semaphore: "asyncio.Semaphore | None" = None  # Phase 2: independent chat cap
+        self.max_chat: int = CHAT_CONCURRENCY
+        self.chat_running: int = 0
         self.session_locks: dict[str, asyncio.Lock] = {}
         self.session_lock_refs: dict[str, int] = defaultdict(int)
         self.session_tasks: dict[str, set] = defaultdict(set)   # session_id -> {asyncio.Task}
 
-    def init(self, max_running: "int | None" = None):
+    def init(self, max_running: "int | None" = None, max_chat: "int | None" = None):
         if max_running is not None and max_running > 0:
             self.max_running = max_running
         self.semaphore = asyncio.Semaphore(self.max_running)
         self.running = 0
+        # Phase 2: Chat runs on an INDEPENDENT semaphore (default 4), so
+        # conversational turns never consume a heavy Claude/Codex permit.
+        self.max_chat = max_chat if (max_chat and max_chat > 0) else CHAT_CONCURRENCY
+        self.chat_semaphore = asyncio.Semaphore(self.max_chat)
+        self.chat_running = 0
         self.session_locks.clear()
         self.session_lock_refs.clear()
         # session_tasks intentionally not cleared: live registrations survive re-init.
@@ -773,9 +825,13 @@ class execution_slot:
     ``__aexit__`` — so they can never double-release.
     """
 
-    def __init__(self, session_id: str, session=None):
+    def __init__(self, session_id: str, session=None, *, heavy: bool = True):
         self.session_id = session_id
         self.session = session
+        # heavy=True (default, unchanged): global MAX_RUNNING_AGENTS permit.
+        # heavy=False (Chat): independent chat_semaphore, does not touch
+        # CONC.running / the heavy cap.
+        self.heavy = heavy
         self._lock = None
         self._task = None
         # each of these is released/undone exactly once by _cleanup
@@ -791,8 +847,12 @@ class execution_slot:
         by cancellation partway through."""
         if self._have_permit:
             self._have_permit = False
-            CONC.running -= 1
-            CONC.semaphore.release()
+            if self.heavy:
+                CONC.running -= 1
+                CONC.semaphore.release()
+            else:
+                CONC.chat_running -= 1
+                CONC.chat_semaphore.release()
         if self._have_lock:
             self._have_lock = False
             self._lock.release()
@@ -821,10 +881,15 @@ class execution_slot:
             self._lockref_taken = True
             await self._lock.acquire()
             self._have_lock = True
-            # 2) global concurrency permit
-            await CONC.semaphore.acquire()
-            self._have_permit = True
-            CONC.running += 1
+            # 2) global concurrency permit (heavy) or independent chat permit
+            if self.heavy:
+                await CONC.semaphore.acquire()
+                self._have_permit = True
+                CONC.running += 1
+            else:
+                await CONC.chat_semaphore.acquire()
+                self._have_permit = True
+                CONC.chat_running += 1
             if self.session is not None:
                 self.session.status = "running"
             return self
@@ -933,14 +998,58 @@ def project_kb(session_key: str = ""):
     ps = get_project_names()
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"📦 {p}", callback_data=_cb(f"proj:{session_key}:{p}"))] for p in ps])
 
-def new_session_project_kb(label: str, has_name: bool = True):
-    """Project picker for /new flow — callback stores the session label.
-    has_name=False uses 'newneed:' prefix so we know to ask for name after project pick."""
+_ENGINE_ICONS = {"claude": "🤖", "codex": "🧠", "chat": "💬"}
+
+
+def new_session_engine_kb(label: str, has_name: bool):
+    """Engine picker — first step of /new. Label is LAST in the callback so
+    session names never collide with the ':' field separator."""
+    hn = "1" if has_name else "0"
+    rows = []
+    for a in engines.all_engines():
+        icon = _ENGINE_ICONS.get(a.caps.engine, "•")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {a.caps.label}",
+            callback_data=_cb(f"neng:{a.caps.engine}:{hn}:{label}"))])
+    return InlineKeyboardMarkup(rows)
+
+
+def new_session_project_kb(engine: str, label: str, has_name: bool = True):
+    """Project picker for the Claude/Codex /new flow. Engine is threaded so the
+    session is created with the right engine. has_name=False uses 'newneed:'."""
     ps = get_project_names()
     prefix = "newproj" if has_name else "newneed"
-    rows = [[InlineKeyboardButton(f"📁 {p}", callback_data=_cb(f"{prefix}:{label}:{p}"))] for p in ps]
-    rows.append([InlineKeyboardButton("➕ New project...", callback_data=_cb(f"addproj:{label}:{'1' if has_name else '0'}"))])
+    rows = [[InlineKeyboardButton(f"📁 {p}", callback_data=_cb(f"{prefix}:{engine}:{label}:{p}"))] for p in ps]
+    rows.append([InlineKeyboardButton("➕ New project...", callback_data=_cb(f"addproj:{engine}:{label}:{'1' if has_name else '0'}"))])
     return InlineKeyboardMarkup(rows)
+
+
+def chat_model_kb(label: str, has_name: bool, models):
+    """OpenRouter favorite/search picker for the Chat /new flow. Model id is
+    LAST (it may itself contain ':' e.g. ':free')."""
+    hn = "1" if has_name else "0"
+    rows = []
+    for m in models:
+        if not m.available:
+            continue
+        rows.append([InlineKeyboardButton(f"⭐ {m.label}", callback_data=_cb(f"cmk:{hn}:{label}:{m.id}"))])
+    rows.append([InlineKeyboardButton("🔎 Search models", callback_data=_cb(f"cmsearch:{hn}:{label}"))])
+    return InlineKeyboardMarkup(rows)
+
+
+def _apply_engine(session, engine: str, model: str = ""):
+    """Set the engine/model on a freshly created session. For chat, provisions
+    the isolated bounded-history directory. Unknown engine falls back to claude."""
+    session.engine = engine if engines.known_engine(engine) else "claude"
+    session.model = model or ""
+    if session.engine == engines.ENGINE_CHAT:
+        session.project = "chat"
+        session.chat_history_ref = f"{CHAT_SESSIONS_DIR}/{session.id.replace(':', '_')}"
+        try:
+            os.makedirs(session.chat_history_ref, exist_ok=True)
+        except Exception as e:
+            log.warning(f"chat dir create failed: {e}")
+    return session
 
 def sessions_kill_kb(sessions: list):
     """Inline kill buttons for /sessions display."""
@@ -1737,6 +1846,188 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
 
 # ═══════════════════════════════════════════
+#  Phase 2: coordination helpers + Codex / Chat run-paths + dispatch
+# ═══════════════════════════════════════════
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+async def _coord_start(session: "Session", repo: str, branch: str, worktree: str, summary: str):
+    """Record/refresh this run in the shared store and drop AGENT_COORDINATION.md
+    into the worktree. Best-effort; never blocks the loop (flock off-thread)."""
+    try:
+        entry = coord.CoordEntry(
+            session_id=session.id, engine=session.engine,
+            model=session.model or session.claude_model or "",
+            repo=repo, branch=branch or "main", worktree=worktree,
+            summary=(summary or "").strip()[:120], status="running", eta="unknown")
+        await asyncio.to_thread(COORD.upsert, entry)
+        await asyncio.to_thread(COORD.link_into_worktree, worktree, repo)
+    except Exception as ex:
+        log.warning(f"coord_start failed sid={session.id}: {ex}")
+
+
+async def _coord_finish(session_id: str, status: str):
+    try:
+        await asyncio.to_thread(COORD.set_status, session_id, status)
+    except Exception:
+        pass
+
+
+async def run_codex(prompt, project, session, files=None):
+    """Invoke the Codex CLI for a session inside a per-session git worktree.
+
+    Mirrors run_claude's isolation model (heavy permit + FIFO lock + worktree +
+    hardened tree-kill). Codex-specific bits — argv construction, thread-id
+    capture/resume, JSONL parsing, error normalization — live in the codex
+    adapter module. First turn captures ``thread.started``; later turns resume it.
+    """
+    repo = get_project_path(project)
+    if not os.path.isdir(repo):
+        repo = f"{REPOS}/{project}"
+    if not os.path.isdir(repo):
+        try:
+            os.makedirs(repo, exist_ok=True)
+        except Exception as e:
+            return f"❌ Not found: {project}\nCould not create: {e}"
+
+    starting_branch = getattr(session, 'starting_branch', 'main')
+    sid_safe = session.id.replace(':', '_')
+    model = session.model or engines.get_adapter("codex").default_model()
+    proc = None
+    final_status = "failed"
+    try:
+        async with execution_slot(session.id, session):
+            async with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+                fnote = ""; images = []
+                if files:
+                    td = f"{wt_path}/.claude-tasks"
+                    os.makedirs(td, exist_ok=True)
+                    copied = []
+                    for fp in files:
+                        if os.path.isfile(fp):
+                            d = f"{td}/{os.path.basename(fp)}"
+                            await asyncio.to_thread(shutil.copy2, fp, d)
+                            copied.append(d)
+                            if d.lower().endswith(_IMAGE_EXTS):
+                                images.append(d)
+                    if copied:
+                        fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+                full_prompt = prompt + fnote
+
+                await _coord_start(session, os.path.realpath(repo), starting_branch, wt_path, prompt)
+
+                thread_id = session.provider_session_id or None
+                cmd = build_codex_cmd(full_prompt, model, thread_id, images)
+                log.info(f"spawn.codex sid={session.id} project={project} "
+                         f"mode={'resume' if thread_id else 'create'} model={model or 'default'} "
+                         f"worktree={wt_path}")
+                proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
+                result = parse_codex_output(r)
+
+                if result.thread_id and not session.provider_session_id:
+                    session.provider_session_id = result.thread_id
+
+                USAGE.record(len(full_prompt), len(result.text), session.label)
+
+                kind = classify_codex_failure(proc.returncode, r, e)
+                if kind == "auth":
+                    return ("❌ Codex is not logged in on the server. "
+                            "Run <code>codex login</code> as the bot user, then retry.")
+                if kind == "rate_limit":
+                    log.warning(f"Codex rate-limited sid={session.id} rc={proc.returncode}")
+                    return ("⏳ Codex is rate-limited or over quota right now. "
+                            "Try again shortly, or switch engine/model with /model.")
+
+                text = result.text
+                if not text:
+                    if result.diagnostics:
+                        text = "⚠️ " + result.diagnostics[-1][:500]
+                    elif kind == "nonzero":
+                        tail = (e or r).strip()[:500]
+                        text = f"❌ Codex exited {proc.returncode}." + (f"\n⚠️ {tail}" if tail else "")
+                    elif result.malformed:
+                        text = "⚠️ Codex produced no parseable output."
+                    else:
+                        text = "(no output)"
+                else:
+                    final_status = "completed"
+                return text.strip() or "(no output)"
+    except RuntimeError as rt_err:
+        log.error(f"worktree.fatal(codex) sid={session.id} err={rt_err}")
+        return f"❌ Worktree creation failed: {rt_err}"
+    except asyncio.CancelledError:
+        final_status = "cancelled"
+        raise
+    except asyncio.TimeoutError:
+        try:
+            if proc: _kill_tree(proc.pid)
+        except Exception: pass
+        return f"⏰ Timeout ({SPAWN_TIMEOUT_SECONDS // 60} min)."
+    except Exception as e:
+        return f"❌ {e}"
+    finally:
+        await _coord_finish(session.id, final_status)
+
+
+def _chat_dir_for(session: "Session") -> str:
+    return session.chat_history_ref or f"{CHAT_SESSIONS_DIR}/{session.id.replace(':', '_')}"
+
+
+_CHAT_ERR_MSG = {
+    "auth": "❌ Chat is unavailable: OPENROUTER_API_KEY is not configured.",
+    "rate_limit": "⏳ The model is rate-limited. Try again shortly or pick another model with /model.",
+    "timeout": "⏰ The model took too long to respond. Try again or pick a lighter model.",
+    "http": "❌ The model provider returned an error. Try another model with /model.",
+    "network": "❌ Network error reaching the model provider. Try again shortly.",
+    "empty": "⚠️ The model returned an empty response. Try rephrasing or another model.",
+}
+
+
+async def run_chat(prompt, session, files=None):
+    """OpenRouter conversational turn. No worktree, no tools, no repo/deploy.
+
+    Uses the INDEPENDENT chat concurrency cap (not the heavy permit) plus the
+    per-session FIFO lock, so two turns in one chat session never overlap.
+    History is bounded and stored per session outside bot-state.json.
+    """
+    model = session.model or engines.get_adapter("chat").default_model()
+    chat_dir = _chat_dir_for(session)
+    history = ChatHistory(chat_dir)
+    prefix = ""
+    if files:
+        prefix = "ℹ️ Chat sessions can't open attachments — answering the text only.\n\n"
+    try:
+        async with execution_slot(session.id, session, heavy=False):
+            messages = history.build_messages(prompt)
+            try:
+                text = await _or_client.chat(model, messages, timeout=120.0, max_retries=3)
+            except ChatError as ce:
+                log.warning(f"chat error sid={session.id} kind={ce.kind}: {ce.message}")
+                return _CHAT_ERR_MSG.get(ce.kind, f"❌ Chat error: {ce.kind}")
+            history.append(prompt, text)
+            USAGE.record(len(prompt), len(text), session.label)
+            return (prefix + text).strip() or "(no output)"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        return f"❌ {e}"
+
+
+async def dispatch_turn(prompt, project, session, files=None):
+    """Single engine dispatch point — handlers never branch on engine name.
+    Unknown/removed engine fails safely with a recovery hint."""
+    adapter = engines.get_adapter(session.engine)
+    if adapter is None:
+        return (f"⚠️ This session's engine (<code>{esc(session.engine)}</code>) is not "
+                f"available. Start a fresh session with /new, or change it with /model.")
+    if session.engine == engines.ENGINE_CHAT:
+        return await run_chat(prompt, session, files)
+    if session.engine == engines.ENGINE_CODEX:
+        return await run_codex(prompt, project, session, files)
+    return await run_claude(prompt, project, session, files)
+
+
+# ═══════════════════════════════════════════
 #  Rate-limit interactive flow
 # ═══════════════════════════════════════════
 def _rl_keyboard(rl_id: str, session) -> InlineKeyboardMarkup:
@@ -2091,13 +2382,19 @@ def _split_html_chunks(text: str, mx: int = 4000) -> list:
     return chunks
 
 
-async def send_long(msg, text, pm=ParseMode.HTML, rm=None):
+async def send_long(msg, text, pm=ParseMode.HTML, rm=None, footer=False):
     """Send a long message, splitting safely on HTML tag boundaries.
 
     On BadRequest (HTML parse error) retries the same chunk as plain text
     so the user always sees *something* — silent drops were the #1 reason
     reports appeared lost across sessions.
+
+    Phase 2: ``footer=True`` appends the cached RAM/Swap/Disk footer once
+    (idempotent, length-aware). Used for primary agent replies only —
+    callback acks, uploads and logs pass footer=False.
     """
+    if footer and pm == ParseMode.HTML:
+        text = resource_footer.with_footer(text, html=True)
     mx = 4000
     chunks = _split_html_chunks(text, mx) if pm == ParseMode.HTML else (
         [text] if len(text) <= mx else [text[i:i+mx] for i in range(0, len(text), mx)]
@@ -2251,7 +2548,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 
     progress_task = asyncio.create_task(progress_updater())
     try:
-        output = await run_claude(prompt, proj, session, files)
+        output = await dispatch_turn(prompt, proj, session, files)
     finally:
         progress_task.cancel()
 
@@ -2289,7 +2586,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 
     sent = await send_long(update.message,
         f"{pfx} | \U0001f916 <code>{proj}</code>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n{fmt_out(output)}",
-        rm=kb)
+        rm=kb, footer=True)
     await track_reply(sent, session)
 
     if len(output) > 8000:
@@ -2435,11 +2732,11 @@ async def cmd_new(u, c):
             parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
         return
 
-    # Show project picker — session created on project selection
-    # If no name given, we'll ask for name after project selection
+    # Phase 2: pick the engine first (Claude Code | Codex | Chat), then the
+    # Claude/Codex flow continues to project selection; Chat picks a model.
     await u.message.reply_text(
-        f"🆕 New session{f' <b>{esc(label)}</b>' if has_name else ''} — which project?",
-        parse_mode=ParseMode.HTML, reply_markup=new_session_project_kb(label, has_name=has_name))
+        f"🆕 New session{f' <b>{esc(label)}</b>' if has_name else ''} — pick an engine:",
+        parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(label, has_name=has_name))
 
 @authorized
 async def cmd_sessions(u, c):
@@ -2565,11 +2862,17 @@ async def cmd_model(u, c):
     """
     cid = u.effective_chat.id
 
-    # Active session (for per-session Claude Code model)
+    # Active session (for per-session primary-engine model)
     active_key = ACTIVE_SESSION.get(cid)
     active_session = SM.sessions.get(active_key) if active_key else None
-    current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
+    active_engine = (active_session.engine if active_session else engines.ENGINE_CLAUDE) or engines.ENGINE_CLAUDE
+    active_adapter = engines.get_adapter(active_engine) or engines.get_adapter(engines.ENGINE_CLAUDE)
+    if active_session and active_engine != engines.ENGINE_CLAUDE:
+        current_cc = active_session.model or active_adapter.default_model()
+    else:
+        current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
     cc_label = current_cc if current_cc else "default (CLI default — latest Sonnet/Opus)"
+    engine_label = active_adapter.caps.label if active_adapter else "Claude Code"
 
     # Fallback chain
     prov = ACTIVE_FALLBACK["provider"]
@@ -2581,17 +2884,35 @@ async def cmd_model(u, c):
 
     rows = []
 
-    # ── Claude Code (primary) ──
-    cc_match = (active_session.claude_model if active_session else "") if active_session else None
-    cc_options = [("",       "Default (CLI default)"),
-                  ("sonnet", "Sonnet"),
-                  ("opus",   "Opus")]
-    for val, lbl in cc_options:
-        is_active = (cc_match == val) if active_session else False
-        icon = "✅" if is_active else ("🔹" if active_session else "🔸")
-        cb_token = val if val else "default"
-        rows.append([InlineKeyboardButton(f"CC: {icon} {lbl}", callback_data=_cb(f"ccmod:{cb_token}"))])
-    rows.append([InlineKeyboardButton("CC: ✏️ Custom model name…", callback_data="ccmod:custom")])
+    # ── Primary engine (engine-aware) ──
+    # Claude keeps its exact legacy ccmod: menu (no regression). Codex/Chat
+    # render their own verified catalogs via emod:. Only the ACTIVE session's
+    # engine is shown; selections are validated + rejected across engines.
+    if active_engine == engines.ENGINE_CLAUDE:
+        cc_match = (active_session.claude_model if active_session else "") if active_session else None
+        cc_options = [("",       "Default (CLI default)"),
+                      ("sonnet", "Sonnet"),
+                      ("opus",   "Opus")]
+        for val, lbl in cc_options:
+            is_active = (cc_match == val) if active_session else False
+            icon = "✅" if is_active else ("🔹" if active_session else "🔸")
+            cb_token = val if val else "default"
+            rows.append([InlineKeyboardButton(f"CC: {icon} {lbl}", callback_data=_cb(f"ccmod:{cb_token}"))])
+        rows.append([InlineKeyboardButton("CC: ✏️ Custom model name…", callback_data="ccmod:custom")])
+    elif active_session:
+        cur = active_session.model or ""
+        elabel = active_adapter.caps.label
+        stale = active_adapter.caps.is_chat and CHAT_CATALOG.stale
+        for m in active_adapter.list_models()[:10]:
+            if not m.available:
+                continue
+            icon = "✅" if cur == m.id else "🔹"
+            rows.append([InlineKeyboardButton(f"{elabel}: {icon} {m.display()}",
+                                              callback_data=_cb(f"emod:{m.id}"))])
+        if active_adapter.caps.is_chat:
+            rows.append([InlineKeyboardButton(
+                f"{elabel}: 🔎 Search…" + (" (cached)" if stale else ""),
+                callback_data="emsearch")])
 
     # ── Fallback chain ──
     rows.append([InlineKeyboardButton(
@@ -2607,15 +2928,16 @@ async def cmd_model(u, c):
     rows.append([InlineKeyboardButton("FB: 🔍 Search OpenRouter…", callback_data="mdl:search")])
 
     sess_note = (
-        f"Active session: {active_session.color_emoji} <b>{esc(active_session.label)}</b>\n"
+        f"Active session: {active_session.color_emoji} <b>{esc(active_session.label)}</b> "
+        f"· engine <b>{esc(engine_label)}</b>\n"
         if active_session else
-        "<i>No active session — start one with /new before changing the Claude Code model.</i>\n"
+        "<i>No active session — start one with /new before changing the primary model.</i>\n"
     )
 
     await u.message.reply_text(
         f"🤖 <b>Model Settings</b>\n"
         f"{sess_note}"
-        f"\n<b>Claude Code (primary)</b>: <code>{esc(cc_label)}</code>\n"
+        f"\n<b>{esc(engine_label)} (primary)</b>: <code>{esc(cc_label)}</code>\n"
         f"<b>Fallback chain</b>: <code>{esc(current_fb)}</code>\n\n"
         f"🎤 STT: <code>{gemini_transcribe}</code>\n"
         f"🧠 Refine: <code>{gemini_refine}</code>\n"
@@ -2675,7 +2997,7 @@ async def schedule_delayed_prompt(dp: DelayedPrompt, app):
     session.status = "running"
     session.last_active = time.time()
     try:
-        output = await run_claude(dp.prompt, project, session, dp.files or None)
+        output = await dispatch_turn(dp.prompt, project, session, dp.files or None)
     except Exception as e:
         output = f"❌ Delayed execution error: {e}"
 
@@ -2774,7 +3096,7 @@ async def schedule_next_delayed_prompt(dp: DelayedPrompt, app):
         session.status = "running"
         session.last_active = time.time()
         try:
-            output = await run_claude(dp.prompt, project, session, dp.files or None)
+            output = await dispatch_turn(dp.prompt, project, session, dp.files or None)
         except Exception as e:
             output = f"❌ Delayed execution error: {e}"
 
@@ -3038,7 +3360,7 @@ async def on_callback(u, c):
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
         files = session.files; session.files = []
         session.status = "running"
-        output = await run_claude(vt, session.project, session, files or None)
+        output = await dispatch_turn(vt, session.project, session, files or None)
         if output == RL_ASK_SENTINEL:
             session.status = "idle"; session.last_active = time.time()
             return
@@ -3058,11 +3380,43 @@ async def on_callback(u, c):
             session.voice_text = ""
         await q.edit_message_text("✏️ <b>Edit mode.</b> Type corrected message (reply to session):", parse_mode=ParseMode.HTML)
 
-    elif d.startswith("newproj:"):
-        # newproj:<label>:<project> — create session with chosen project
-        parts = d.split(":", 2)
-        label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        proj_name = parts[2] if len(parts) > 2 else parts[1]
+    elif d.startswith("neng:"):
+        # neng:<engine>:<hn>:<label> — engine chosen; branch to project or chat model
+        parts = d.split(":", 3)
+        engine = parts[1] if len(parts) > 3 else engines.ENGINE_CLAUDE
+        hn = parts[2] if len(parts) > 3 else "1"
+        label = parts[3] if len(parts) > 3 else f"session-{int(time.time()) % 10000}"
+        has_name = hn == "1"
+        adapter = engines.get_adapter(engine)
+        if adapter is None:
+            await q.edit_message_text("⚠️ Unknown engine.", parse_mode=ParseMode.HTML)
+            return
+        if adapter.caps.is_chat:
+            try:
+                favs = await CHAT_CATALOG.favorites()
+            except Exception:
+                favs = []
+            note = " <i>(cached)</i>" if CHAT_CATALOG.stale else ""
+            if not any(m.available for m in favs):
+                await q.edit_message_text(
+                    "💬 Chat catalog is unavailable right now (no OpenRouter access). "
+                    "Try again shortly.", parse_mode=ParseMode.HTML)
+                return
+            await q.edit_message_text(
+                f"💬 <b>Chat</b> — pick a model{note}:",
+                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(label, has_name, favs))
+        else:
+            await q.edit_message_text(
+                f"{_ENGINE_ICONS.get(engine, '•')} <b>{esc(adapter.caps.label)}</b> — which project?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=new_session_project_kb(engine, label, has_name=has_name))
+
+    elif d.startswith("cmk:"):
+        # cmk:<hn>:<label>:<model> — create a Chat session with the chosen model
+        parts = d.split(":", 3)
+        label = parts[2] if len(parts) > 3 else f"chat-{int(time.time()) % 10000}"
+        model = parts[3] if len(parts) > 3 else ""
+        CONV_STATE.pop(cid, None)
         if not SM.can_create(cid):
             active = SM.active_for_chat(cid)
             await q.edit_message_text(
@@ -3070,43 +3424,83 @@ async def on_callback(u, c):
                 parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
             return
         session = SM.create(cid, label)
-        session.project = proj_name
+        _apply_engine(session, engines.ENGINE_CHAT, model)
         await q.edit_message_text(
-            f"{session.color_emoji} Session <b>{esc(session.label)}</b> created.\n"
-            f"📁 Project: <b>{proj_name}</b>\n\n"
-            f"Reply to this message to interact with this session.",
+            f"{session.color_emoji} 💬 Chat session <b>{esc(session.label)}</b> created.\n"
+            f"🧠 Model: <code>{esc(model)}</code>\n\n"
+            f"Reply to this message to chat. No tools, repos or deploy — just conversation.",
             parse_mode=ParseMode.HTML)
-        # Track the anchor message
         session.anchor_message_id = q.message.message_id
         SM.register_message(q.message.message_id, session.id)
         session.message_ids.append(q.message.message_id)
-        log.info(f"Session created (picker): {session.label} → {proj_name} for chat {cid}")
+        log.info(f"Chat session created: {session.label} model={model} chat {cid}")
 
-    elif d.startswith("newneed:"):
-        # newneed:<auto_label>:<project> — project selected but no name given, ask for name
+    elif d.startswith("cmsearch:"):
+        # cmsearch:<hn>:<label> — free-text OpenRouter model search for Chat
         parts = d.split(":", 2)
-        auto_label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        proj_name = parts[2] if len(parts) > 2 else parts[1]
+        hn = parts[1] if len(parts) > 2 else "1"
+        label = parts[2] if len(parts) > 2 else f"chat-{int(time.time()) % 10000}"
+        CONV_STATE[cid] = {"state": "awaiting_chat_model_search", "label": label, "has_name": hn == "1"}
+        await q.edit_message_text(
+            "🔎 Type part of a model id or name to search OpenRouter "
+            "(e.g. <code>qwen</code>, <code>glm</code>, <code>opus</code>):",
+            parse_mode=ParseMode.HTML)
+
+    elif d.startswith("newproj:"):
+        # newproj:<engine>:<label>:<project> — create session with chosen project
+        parts = d.split(":", 3)
+        engine = parts[1] if len(parts) > 3 else engines.ENGINE_CLAUDE
+        label = parts[2] if len(parts) > 3 else f"session-{int(time.time()) % 10000}"
+        proj_name = parts[3] if len(parts) > 3 else parts[-1]
         if not SM.can_create(cid):
             active = SM.active_for_chat(cid)
             await q.edit_message_text(
                 f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
                 parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
             return
-        # Store state: waiting for session name
-        CONV_STATE[cid] = {"state": "awaiting_session_name", "project": proj_name, "auto_label": auto_label}
+        session = SM.create(cid, label)
+        _apply_engine(session, engine)
+        session.project = proj_name
+        await q.edit_message_text(
+            f"{session.color_emoji} {_ENGINE_ICONS.get(engine,'•')} <b>{esc(session.label)}</b> "
+            f"({esc(engines.get_adapter(engine).caps.label)}) created.\n"
+            f"📁 Project: <b>{esc(proj_name)}</b>\n\n"
+            f"Reply to this message to interact with this session.",
+            parse_mode=ParseMode.HTML)
+        # Track the anchor message
+        session.anchor_message_id = q.message.message_id
+        SM.register_message(q.message.message_id, session.id)
+        session.message_ids.append(q.message.message_id)
+        log.info(f"Session created (picker): {session.label} engine={engine} → {proj_name} for chat {cid}")
+
+    elif d.startswith("newneed:"):
+        # newneed:<engine>:<auto_label>:<project> — project chosen, ask for name
+        parts = d.split(":", 3)
+        engine = parts[1] if len(parts) > 3 else engines.ENGINE_CLAUDE
+        auto_label = parts[2] if len(parts) > 3 else f"session-{int(time.time()) % 10000}"
+        proj_name = parts[3] if len(parts) > 3 else parts[-1]
+        if not SM.can_create(cid):
+            active = SM.active_for_chat(cid)
+            await q.edit_message_text(
+                f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
+                parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
+            return
+        # Store state: waiting for session name (engine threaded through)
+        CONV_STATE[cid] = {"state": "awaiting_session_name", "engine": engine,
+                           "project": proj_name, "auto_label": auto_label}
         await q.edit_message_text(
             f"📁 Project: <b>{esc(proj_name)}</b>\n\nEnter a name for this session (or tap Skip):",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{auto_label}:{proj_name}"))]
+                [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{engine}:{auto_label}:{proj_name}"))]
             ]))
 
     elif d.startswith("skipname:"):
-        # skipname:<auto_label>:<project> — user skipped naming, use auto-generated label
-        parts = d.split(":", 2)
-        auto_label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        proj_name = parts[2] if len(parts) > 2 else parts[1]
+        # skipname:<engine>:<auto_label>:<project> — use the auto-generated label
+        parts = d.split(":", 3)
+        engine = parts[1] if len(parts) > 3 else engines.ENGINE_CLAUDE
+        auto_label = parts[2] if len(parts) > 3 else f"session-{int(time.time()) % 10000}"
+        proj_name = parts[3] if len(parts) > 3 else parts[-1]
         CONV_STATE.pop(cid, None)
         if not SM.can_create(cid):
             active = SM.active_for_chat(cid)
@@ -3115,23 +3509,26 @@ async def on_callback(u, c):
                 parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
             return
         session = SM.create(cid, auto_label)
+        _apply_engine(session, engine)
         session.project = proj_name
         await q.edit_message_text(
-            f"{session.color_emoji} Session <b>{esc(session.label)}</b> created.\n"
-            f"📁 Project: <b>{proj_name}</b>\n\n"
+            f"{session.color_emoji} {_ENGINE_ICONS.get(engine,'•')} <b>{esc(session.label)}</b> created.\n"
+            f"📁 Project: <b>{esc(proj_name)}</b>\n\n"
             f"Reply to this message to interact with this session.",
             parse_mode=ParseMode.HTML)
         session.anchor_message_id = q.message.message_id
         SM.register_message(q.message.message_id, session.id)
         session.message_ids.append(q.message.message_id)
-        log.info(f"Session created (skip-name): {session.label} → {proj_name} for chat {cid}")
+        log.info(f"Session created (skip-name): {session.label} engine={engine} → {proj_name} for chat {cid}")
 
     elif d.startswith("addproj:"):
-        # addproj:<label>:<has_name> — user wants to add a new project path
-        parts = d.split(":", 2)
-        label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        has_name_flag = parts[2] if len(parts) > 2 else "1"
-        CONV_STATE[cid] = {"state": "awaiting_project_path", "label": label, "has_name": has_name_flag == "1"}
+        # addproj:<engine>:<label>:<has_name> — add a new project path
+        parts = d.split(":", 3)
+        engine = parts[1] if len(parts) > 3 else engines.ENGINE_CLAUDE
+        label = parts[2] if len(parts) > 3 else f"session-{int(time.time()) % 10000}"
+        has_name_flag = parts[3] if len(parts) > 3 else "1"
+        CONV_STATE[cid] = {"state": "awaiting_project_path", "engine": engine,
+                           "label": label, "has_name": has_name_flag == "1"}
         await q.edit_message_text(
             "📂 Enter the full path on this server:\n"
             "Example: <code>/opt/shahrzad-devops/repos/MyProject</code>\n"
@@ -3169,7 +3566,7 @@ async def on_callback(u, c):
             else:
                 # Fallback: run claude directly and send output
                 session.status = "running"
-                output = await run_claude(pending["text"], session.project, session, f or None)
+                output = await dispatch_turn(pending["text"], session.project, session, f or None)
                 if output == RL_ASK_SENTINEL:
                     session.status = "idle"; session.last_active = time.time()
                     return
@@ -3446,8 +3843,8 @@ async def on_callback(u, c):
         else:
             label = f"session-{int(time.time()) % 10000}"
             await c.bot.send_message(cid,
-                f"🆕 New session — which project?",
-                parse_mode=ParseMode.HTML, reply_markup=new_session_project_kb(label, has_name=False))
+                f"🆕 New session — pick an engine:",
+                parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(label, has_name=False))
 
     elif d == "menu:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
@@ -3482,6 +3879,62 @@ async def on_callback(u, c):
             f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
             f"set to: <code>{esc(shown)}</code>",
             parse_mode=ParseMode.HTML)
+
+    elif d.startswith("emod:"):
+        # emod:<model_id> — set the Codex/Chat model on the active session.
+        # id may contain ':' (e.g. openrouter ':free'), so take the whole tail.
+        model_id = d[len("emod:"):]
+        active_key = ACTIVE_SESSION.get(cid)
+        target = SM.sessions.get(active_key) if active_key else None
+        if not target:
+            await q.edit_message_text(
+                "ℹ️ No active session. Start one with /new first.", parse_mode=ParseMode.HTML)
+            return
+        adapter = engines.get_adapter(target.engine)
+        if adapter is None or adapter.caps.engine == engines.ENGINE_CLAUDE:
+            await q.edit_message_text("⚠️ Use the CC buttons for Claude sessions.",
+                                      parse_mode=ParseMode.HTML)
+            return
+        if not adapter.validate_model(model_id):
+            await q.edit_message_text(
+                f"⚠️ <code>{esc(model_id)}</code> isn't valid for this "
+                f"{esc(adapter.caps.label)} session.", parse_mode=ParseMode.HTML)
+            return
+        target.model = model_id  # affects only this session's future turns
+        await q.edit_message_text(
+            f"✅ {adapter.caps.label} model for {target.color_emoji} "
+            f"<b>{esc(target.label)}</b> set to: <code>{esc(model_id)}</code>",
+            parse_mode=ParseMode.HTML)
+
+    elif d == "emsearch":
+        active_key = ACTIVE_SESSION.get(cid)
+        target = SM.sessions.get(active_key) if active_key else None
+        if not target or target.engine != engines.ENGINE_CHAT:
+            await q.edit_message_text("ℹ️ Model search is for Chat sessions.",
+                                      parse_mode=ParseMode.HTML)
+            return
+        CONV_STATE[cid] = {"state": "awaiting_chat_model_change", "session_key": target.id}
+        await q.edit_message_text(
+            "🔎 Type part of a model id/name to search OpenRouter "
+            "(<code>cancel</code> to abort):", parse_mode=ParseMode.HTML)
+
+    elif d.startswith("emodset:"):
+        # emodset:<session_key>:<model> from search results (model tail may hold ':')
+        rest = d[len("emodset:"):]
+        skey, _, model_id = rest.partition("|")
+        target = SM.sessions.get(skey)
+        if not target:
+            await q.edit_message_text("Session no longer exists.", parse_mode=ParseMode.HTML)
+            return
+        adapter = engines.get_adapter(target.engine)
+        if adapter is None or not adapter.validate_model(model_id):
+            await q.edit_message_text(f"⚠️ Invalid model <code>{esc(model_id)}</code>.",
+                                      parse_mode=ParseMode.HTML)
+            return
+        target.model = model_id
+        await q.edit_message_text(
+            f"✅ Chat model for {target.color_emoji} <b>{esc(target.label)}</b> "
+            f"set to: <code>{esc(model_id)}</code>", parse_mode=ParseMode.HTML)
 
     elif d.startswith("mdl:"):
         parts = d.split(":", 2)
@@ -3664,6 +4117,7 @@ async def on_text(u, c):
             # User typed a session name
             CONV_STATE.pop(cid, None)
             proj_name = conv["project"]
+            engine = conv.get("engine", engines.ENGINE_CLAUDE)
             label = t.strip().replace(" ", "-")[:30]
             if not SM.can_create(cid):
                 active = SM.active_for_chat(cid)
@@ -3672,6 +4126,7 @@ async def on_text(u, c):
                     parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
                 return
             session = SM.create(cid, label)
+            _apply_engine(session, engine)
             session.project = proj_name
             sent = await u.message.reply_text(
                 f"{session.color_emoji} Session <b>{esc(session.label)}</b> created.\n"
@@ -3690,6 +4145,7 @@ async def on_text(u, c):
             path = t.strip()
             label = conv["label"]
             has_name = conv["has_name"]
+            engine = conv.get("engine", engines.ENGINE_CLAUDE)
             # Derive project name from path
             proj_name = os.path.basename(path.rstrip("/"))
             if not proj_name:
@@ -3711,6 +4167,7 @@ async def on_text(u, c):
                         parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
                     return
                 session = SM.create(cid, label)
+                _apply_engine(session, engine)
                 session.project = proj_name
                 sent = await u.message.reply_text(
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n"
@@ -3721,13 +4178,14 @@ async def on_text(u, c):
                 SM.register_message(sent.message_id, session.id)
                 session.message_ids.append(sent.message_id)
             else:
-                # No name given — ask for name
-                CONV_STATE[cid] = {"state": "awaiting_session_name", "project": proj_name, "auto_label": label}
+                # No name given — ask for name (engine threaded through)
+                CONV_STATE[cid] = {"state": "awaiting_session_name", "engine": engine,
+                                   "project": proj_name, "auto_label": label}
                 await u.message.reply_text(
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n\nEnter a name for this session (or tap Skip):",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{label}:{proj_name}"))]
+                        [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{engine}:{label}:{proj_name}"))]
                     ]))
             return
 
@@ -3744,6 +4202,50 @@ async def on_text(u, c):
                 f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
                 f"set to: <code>{esc(entry)}</code>",
                 parse_mode=ParseMode.HTML)
+            return
+
+        if state == "awaiting_chat_model_change":
+            # /model on a Chat session: search → pick to change THIS session's model
+            CONV_STATE.pop(cid, None)
+            entry = t.strip()
+            skey = conv.get("session_key")
+            target = SM.sessions.get(skey) if skey else None
+            if entry.lower() == "cancel" or not target:
+                await u.message.reply_text("❌ Cancelled.")
+                return
+            try:
+                results = await CHAT_CATALOG.search(entry, limit=12)
+            except Exception:
+                results = []
+            if not results:
+                await u.message.reply_text(
+                    f"No models matched <code>{esc(entry)}</code>.", parse_mode=ParseMode.HTML)
+                return
+            rows = [[InlineKeyboardButton(f"⭐ {m.display()}",
+                     callback_data=_cb(f"emodset:{skey}|{m.id}"))] for m in results]
+            await u.message.reply_text(
+                f"🔎 Results for <code>{esc(entry)}</code> — pick one:",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+            return
+
+        if state == "awaiting_chat_model_search":
+            # Chat /new: free-text OpenRouter model search → pick from results
+            CONV_STATE.pop(cid, None)
+            query = t.strip()
+            label = conv.get("label", f"chat-{int(time.time()) % 10000}")
+            has_name = conv.get("has_name", True)
+            try:
+                results = await CHAT_CATALOG.search(query, limit=12)
+            except Exception:
+                results = []
+            if not results:
+                await u.message.reply_text(
+                    f"No models matched <code>{esc(query)}</code>. Try /new again.",
+                    parse_mode=ParseMode.HTML)
+                return
+            await u.message.reply_text(
+                f"🔎 Results for <code>{esc(query)}</code> — pick one:",
+                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(label, has_name, results))
             return
 
         if state == "awaiting_model_search":
@@ -3927,6 +4429,8 @@ _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
     "tasks", "claude_created", "claude_model",
+    # Phase 2 multi-engine fields (absent in old state → safe defaults)
+    "engine", "model", "provider_session_id", "chat_history_ref",
 )
 
 
@@ -3988,6 +4492,13 @@ def load_state():
                 tasks=s.get("tasks", 0),
                 claude_created=s.get("claude_created", False),
                 claude_model=s.get("claude_model", ""),
+                # Phase 2 migration: old sessions lack these → engine=claude,
+                # empty model/thread. Claude UUID/resume + legacy claude_model
+                # are preserved untouched above.
+                engine=s.get("engine", "claude") or "claude",
+                model=s.get("model", ""),
+                provider_session_id=s.get("provider_session_id", ""),
+                chat_history_ref=s.get("chat_history_ref", ""),
             )
             SM.sessions[k] = session
             restored += 1
@@ -4052,6 +4563,30 @@ async def session_cleanup_task(app):
         return
 
 
+async def _discover_engine_catalogs():
+    """Best-effort, non-blocking catalog warm-up. Failures are non-fatal —
+    adapters fall back to their verified static/last-known-good catalogs."""
+    # Codex: discover account-visible models via `codex debug models`.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "codex", "debug", "models",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ, "HOME": "/root"})
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        models = parse_codex_models(out.decode("utf-8", "replace"))
+        if models:
+            engines.get_adapter("codex").set_discovered(models)
+            log.info(f"codex.catalog discovered={len(models)}")
+    except Exception as e:
+        log.info(f"codex.catalog discovery skipped: {e}")
+    # Chat: warm the OpenRouter catalog cache (TTL/last-known-good handles rest).
+    try:
+        cat = await CHAT_CATALOG.get()
+        log.info(f"chat.catalog models={len(cat)} stale={CHAT_CATALOG.stale}")
+    except Exception as e:
+        log.info(f"chat.catalog warm skipped: {e}")
+
+
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "\U0001f3e0 Home"),
@@ -4079,6 +4614,16 @@ async def post_init(app):
     log.info(f"limits.effective max_sessions={MAX_SESSIONS} max_running_agents={MAX_RUNNING_AGENTS}")
     # Restore previous session state before starting handlers
     load_state()
+    # Phase 2: reconcile stale coordination entries against restored sessions
+    # (mark orphaned running/queued as 'stale', never delete active work), then
+    # warm engine catalogs in the background (non-fatal).
+    try:
+        n = await asyncio.to_thread(COORD.reconcile, set(SM.sessions.keys()))
+        if n:
+            log.info(f"coordination.reconciled stale={n}")
+    except Exception as e:
+        log.warning(f"coordination.reconcile failed: {e}")
+    asyncio.create_task(_discover_engine_catalogs())
     # Start background cleanup + autosave tasks (handles saved so
     # graceful_shutdown can cancel them — otherwise asyncio prints
     # "Task was destroyed but it is pending!" on every restart).
@@ -4259,6 +4804,12 @@ async def graceful_shutdown(app):
     await _cancel_and_await_run_tasks()
     # Terminate any straggler Claude process trees and await reaping (bounded).
     await _reap_active_procs()
+    # Phase 2: nothing is running post-cancel — mark any lingering running/queued
+    # coordination entries stale (never deletes; startup reconcile mirrors this).
+    try:
+        await asyncio.to_thread(COORD.reconcile, set())
+    except Exception:
+        pass
     # Notify each chat with active sessions
     notified_chats = set()
     for key, session in active:

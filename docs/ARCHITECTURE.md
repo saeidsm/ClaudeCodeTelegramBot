@@ -159,6 +159,29 @@ bot.py
 └── Boot & main (lines 1680-1742)
 ```
 
+## Engine layer (Phase 2)
+
+A typed adapter registry (`engines/`) with exactly `claude`, `codex`, `chat`.
+Each adapter owns its model **catalog**, model **validation**, **capabilities**
+(`uses_worktree`, `counts_as_heavy`, `is_chat`, …) and — for the code engines —
+**command construction** and **output parsing**. Handlers never branch on engine
+name: `execute()` (and the delayed/voice/buffered paths) call a single
+`dispatch_turn(prompt, project, session, files)` which routes by `session.engine`:
+
+- **claude** → `run_claude` (unchanged Phase 1 path).
+- **codex** → `run_codex`: same worktree + heavy permit + tree-kill isolation;
+  builds `codex exec [resume <thread>] --json …` from `engines/codex_adapter`,
+  parses the JSONL (`thread.started` id, `agent_message` text, usage).
+- **chat** → `run_chat`: **no worktree**, no tools; uses an **independent chat
+  semaphore** (default 4) + the per-session FIFO lock; async OpenRouter client
+  with bounded/retry/redaction; bounded atomic history under `chat-sessions/`.
+
+`Session` gains `engine`, `model`, `provider_session_id`, `chat_history_ref`
+(old state migrates to `engine=claude`). A shared, flock-protected
+`coordination.py` store (keyed by canonical repo) records every code-engine run
+and renders `AGENT_COORDINATION.md` into each worktree. A cached RAM/Swap/Disk
+footer (`resource_footer.py`) is appended to primary agent replies via `send_long`.
+
 ## Design Decisions
 
 - **Single file:** Keeps deployment simple — just copy `bot.py` and run
