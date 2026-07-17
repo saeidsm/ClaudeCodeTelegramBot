@@ -460,7 +460,12 @@ def cb2(kind: str, chat_id: int, **fields) -> str:
         token = "p2:" + secrets.token_urlsafe(16)
         if token not in _P2_REGISTRY:
             break
-    _P2_REGISTRY[token] = {"k": kind, "cid": chat_id, **fields}
+    # Reserved keys are set LAST so a caller field named "k"/"cid" can never
+    # override the kind or the chat binding (ownership must be un-spoofable).
+    payload = dict(fields)
+    payload["k"] = kind
+    payload["cid"] = chat_id
+    _P2_REGISTRY[token] = payload
     while len(_P2_REGISTRY) > _P2_MAX:
         _P2_REGISTRY.popitem(last=False)  # evict oldest
     return token
@@ -3226,15 +3231,22 @@ async def cmd_model(u, c):
             if not m.available:
                 continue
             icon = "✅" if cur == m.id else "🔹"
-            rows.append([InlineKeyboardButton(f"{elabel}: {icon} {m.display()}",
-                                              callback_data=cb2("emod", cid, model=m.id))])
+            # Bind the button to the session the menu is rendered FOR (id+engine),
+            # so switching the active session before a click can't retarget it.
+            rows.append([InlineKeyboardButton(
+                f"{elabel}: {icon} {m.display()}",
+                callback_data=cb2("emod", cid, session_key=active_session.id,
+                                  engine=active_engine, model=m.id))])
         if active_adapter.caps.is_chat:
             rows.append([InlineKeyboardButton(
                 f"{elabel}: 🔎 Search…" + (" (cached)" if stale else ""),
-                callback_data=cb2("emsearch", cid))])
+                callback_data=cb2("emsearch", cid, session_key=active_session.id,
+                                  engine=active_engine))])
         else:
             rows.append([InlineKeyboardButton(
-                f"{elabel}: ✏️ Custom model…", callback_data=cb2("emcustom", cid))])
+                f"{elabel}: ✏️ Custom model…",
+                callback_data=cb2("emcustom", cid, session_key=active_session.id,
+                                  engine=active_engine))])
 
     # ── Fallback chain ──
     rows.append([InlineKeyboardButton(
@@ -3512,6 +3524,35 @@ async def error_handler(update, context):
 # ═══════════════════════════════════════════
 #  Handler: Inline Buttons
 # ═══════════════════════════════════════════
+async def _p2_rendered_session(q, cid, p):
+    """Resolve the session a /model menu was rendered FOR — carried in the token
+    as ``session_key`` (+ expected ``engine``) — NOT the current ACTIVE_SESSION.
+
+    Fail closed with a refresh hint if the button predates a change: session
+    killed/replaced, migrated to a different engine, or (defence in depth over the
+    central chat gate) a key that isn't in this chat. Returns the Session or None
+    (after sending the refresh message)."""
+    skey = p.get("session_key", "")
+    exp_engine = p.get("engine", "")
+    stale = ("⚠️ This model menu is out of date (the session changed). "
+             "Open /model again for the current session.")
+    if not skey or not skey.startswith(f"{cid}:"):
+        await q.edit_message_text(stale, parse_mode=ParseMode.HTML)
+        return None
+    target = SM.sessions.get(skey)
+    if target is None:
+        await q.edit_message_text(
+            "⚠️ That session no longer exists. Open /model again.",
+            parse_mode=ParseMode.HTML)
+        return None
+    if exp_engine and target.engine != exp_engine:
+        await q.edit_message_text(
+            "⚠️ That session's engine changed. Open /model again.",
+            parse_mode=ParseMode.HTML)
+        return None
+    return target
+
+
 async def _handle_p2(q, c, cid, p: dict, token: str = ""):
     """Dispatch a Phase-2 structured callback payload. Fields come straight from
     the token registry — never parsed from the callback string — so arbitrary
@@ -3665,13 +3706,11 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
             parse_mode=ParseMode.HTML)
 
     elif kind == "emod":
-        # Set Claude/Codex/Chat model on the ACTIVE session (re-validated).
+        # Set the model on the session THIS menu was rendered for (bound in the
+        # token), NOT whatever is active now (re-validated).
         model_id = p.get("model", "")
-        active_key = ACTIVE_SESSION.get(cid)
-        target = SM.sessions.get(active_key) if active_key else None
-        if not target:
-            await q.edit_message_text("ℹ️ No active session. Start one with /new first.",
-                                      parse_mode=ParseMode.HTML)
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
             return
         adapter = engines.get_adapter(target.engine)
         if adapter is None:
@@ -3696,25 +3735,25 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
             parse_mode=ParseMode.HTML)
 
     elif kind == "emsearch":
-        active_key = ACTIVE_SESSION.get(cid)
-        target = SM.sessions.get(active_key) if active_key else None
-        if not target or target.engine != engines.ENGINE_CHAT:
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
+            return
+        if target.engine != engines.ENGINE_CHAT:
             await q.edit_message_text("ℹ️ Model search is for Chat sessions.",
                                       parse_mode=ParseMode.HTML)
             return
+        # Conv-state stays bound to THIS rendered session id; a later active-
+        # session switch cannot retarget the search.
         CONV_STATE[cid] = {"state": "awaiting_chat_model_change", "session_key": target.id}
         await q.edit_message_text(
             "🔎 Type part of a model id/name to search OpenRouter "
             "(<code>cancel</code> to abort):", parse_mode=ParseMode.HTML)
 
     elif kind == "emcustom":
-        # Free-text custom model for a Claude/Codex session — still validated
-        # by the active engine's adapter (rejects cross-engine ids).
-        active_key = ACTIVE_SESSION.get(cid)
-        target = SM.sessions.get(active_key) if active_key else None
-        if not target:
-            await q.edit_message_text("ℹ️ No active session. Start one with /new first.",
-                                      parse_mode=ParseMode.HTML)
+        # Free-text custom model for the RENDERED Claude/Codex session — still
+        # validated by that engine's adapter (rejects cross-engine ids).
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
             return
         adapter = engines.get_adapter(target.engine)
         example = ("sonnet · opus · claude-sonnet-5" if target.engine == engines.ENGINE_CLAUDE

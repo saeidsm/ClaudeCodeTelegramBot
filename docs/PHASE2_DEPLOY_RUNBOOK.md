@@ -14,33 +14,73 @@ box was rolled back) and Phase 2 in a single backup-protected transaction.
 
 ## Executable procedure (do not hand-type these steps)
 
-The steps below are implemented, one transaction, by the repository-owned,
-offline-tested script — so deployment is an exact procedure, not commands
-invented at deploy time (the cause of the prior deploy loops):
+Every step in this runbook is implemented as ONE transaction by the
+repository-owned, offline-tested script — so deployment is an exact procedure,
+not commands invented at deploy time (the cause of the prior deploy loops):
 
 ```
-scripts/deploy-phase1-phase2.sh          # implements every step in this runbook
-tests/test_deploy_script.py              # offline proof: preflight=no-mutation,
-                                         # per-stage rollback, byte-preserving env
+scripts/deploy-phase1-phase2.sh          # THE procedure — run this, do not improvise
+tests/test_deploy_script.py              # offline proof of every gate + rollback
 ```
 
-- **Read-only by default:** `deploy-phase1-phase2.sh --preflight` runs the source
-  syntax gates, takes the single flock, and STOPS before any mutation.
-- **Mutate only behind the gate:** `deploy-phase1-phase2.sh --execute
-  --reviewed-pr 19 --merged-sha <40-hex>` — refuses unless the PR is 19 and the
-  merged SHA equals both the immutable source HEAD and `origin/main`.
-- One flock; installs from the detached source (never the dirty main checkout);
-  writes a `PRESENT_BEFORE` manifest; edits `.env` only through a byte-preserving
-  allow-list (never `source`/`eval`, secrets untouched); performs the Phase-1
-  retention migration; runs the live-dir import/FooterBot construction smoke;
-  restarts **exactly once**; and on ANY post-mutation failure a trap restores or
-  removes every artifact by manifest and restarts the old bot. It writes exactly
-  one of `DEPLOYED` / `ROLLED_BACK` / `STOPPED_BEFORE_MUTATION`.
-- **No real report deletion** happens during the transaction (retention runs
-  `--dry-run` only). Production is never touched by the test suite.
+Invoke:
 
-The remaining sections document what each stage does and the acceptance
-evidence to confirm afterwards.
+```
+scripts/deploy-phase1-phase2.sh --preflight --merged-sha <40-hex> --source <detached-wt>
+scripts/deploy-phase1-phase2.sh --execute  --reviewed-pr 19 --merged-sha <40-hex> --source <detached-wt>
+```
+
+The script performs, in order, exactly:
+
+1. **Read-only preflight (both modes), writing only under `/tmp`** — no lock, no
+   mutation, no `__pycache__`/`.pytest_cache` in the source (bytecode disabled,
+   caches + basetemp under a `/tmp` scratch dir):
+   - **source gate:** the source is a **detached** worktree (no branch), fully
+     clean (no staged/unstaged/untracked), its HEAD equals the 40-hex merged
+     SHA, `git fetch origin` succeeds (fail-closed — never trust a stale
+     `origin/main`), and freshly-fetched `origin/main` equals the merged SHA;
+   - **suite gate:** `py_compile` all runtime modules, `bash -n` all shell
+     scripts, and the complete offline suite from the immutable source
+     (`pytest -p no:cacheprovider`, temp cache/basetemp); optional documented total;
+   - **readiness gate (records, never prints secrets):** bot service active
+     (capture unit/user/PID/timestamp); **zero** running/queued sessions from the
+     real state file; capacity/OOM + NightWatch listeners when configured;
+     `.env` parses non-executingly (`dotenv_values`) with a nonempty OpenRouter
+     key; as the service user — Claude CLI, `codex login status`, `codex debug
+     models`, and Python imports of PTB/aiohttp/dotenv + runtime modules; the
+     report-cleanup **dry-run** (no `|| true`). `basic-memory` / Graphify are
+     inspected and reported as **optional follow-ups (not integrated)**.
+   - In production mode (no `--test-root`) every test-seam variable is **refused**.
+2. **Execute-only, after all read-only gates:** require `--reviewed-pr 19`, then
+   acquire the single deploy **flock**.
+3. **Manifest + backup** of every artifact and live datum (state/type/owner/
+   group/mode/hash): runtime artifacts/package, `.env`, `bot-state.json`,
+   coordination store + `.lock`, OpenRouter cache, chat-history root, cleanup
+   script/config/**both** systemd units, **both** conflicting crons,
+   `nightly-cleanup.sh`, and the timer's prior enabled/active state.
+4. **Install** from the detached source (hash-verified) + least-privilege runtime dirs.
+5. **`.env`** allow-list only: `BOT_MAX_SESSIONS=9`, `BOT_MAX_RUNNING_AGENTS=2`,
+   `BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4`, and explicit Phase-2 non-secret paths
+   (chat sessions, coordination store, absolute coordination publisher). Never
+   `source`/`eval`; every unrelated line and secret preserved byte-for-byte.
+6. **All three retention migrations:** remove `/etc/cron.d/cleanup-reports` and
+   `/etc/cron.d/nightwatch-reports-cleanup`, and **surgically** comment only the
+   report-deletion command(s) inside `nightly-cleanup.sh` (fail closed if a
+   deletion is entangled with other commands); install the canonical cleanup
+   script/config/units and require its **dry-run** — no real deletion runs.
+7. **Verify** the live directory: compile/import closure + real offline
+   `FooterBot`/`Application` construction with the live dir on `sys.path`.
+8. **Restart exactly once** (after re-checking the busy-session gate), then
+   **health**: new stable PID, no fatal traceback, `Bot v4 ready`, effective
+   limits 9/2, three engines, listeners, writable coordination/chat paths.
+9. **Only after health,** enable + start `reports-cleanup.timer`; verify it is
+   enabled, active, and resolves the stable live cleanup path; then observe the
+   bounded window (default 90 s in production) and re-verify.
+10. Any post-mutation failure → the trap restores/removes every artifact and the
+    prior timer state by manifest and restarts the old bot → `ROLLED_BACK`.
+    Success → `DEPLOYED`; a pre-mutation stop → `STOPPED_BEFORE_MUTATION`.
+
+The remaining sections document acceptance evidence to confirm afterwards.
 
 ---
 

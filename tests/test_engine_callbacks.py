@@ -124,7 +124,7 @@ async def test_emodset_cross_chat_rejected(monkeypatch, tmp_path):
 
 async def test_emod_stale_session_rejected(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path)
-    # no active session -> emod fails closed
-    tok = bot.cb2("emod", 9, model="gpt-5.6-sol")
+    # emod bound to a session key that no longer exists -> fail closed (refresh)
+    tok = bot.cb2("emod", 9, session_key="9:gone", engine="codex", model="gpt-5.6-sol")
     q = await _dispatch(tok, 9)
-    assert "No active session" in q.message.edits[-1]
+    assert "no longer exists" in q.message.edits[-1]
