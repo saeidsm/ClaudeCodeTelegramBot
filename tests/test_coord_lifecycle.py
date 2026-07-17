@@ -65,7 +65,9 @@ async def test_running_writes_safe_worktree_view(tmp_path, monkeypatch):
     view = (wt / "AGENT_COORDINATION.md")
     assert view.is_file()
     body = view.read_text()
-    assert "5:x" in body and "coord_publish.py" in body   # publish instructions present
+    # publish instructions present, via the injected absolute-path env var
+    assert "5:x" in body and "$AGENT_COORD_PUBLISHER" in body
+    assert "snapshot" in body                              # labelled point-in-time
 
 
 def test_coord_env_is_session_scoped(tmp_path, monkeypatch):

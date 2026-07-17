@@ -4,7 +4,7 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, shutil, ipaddress, zipfile, contextvars
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -34,7 +34,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes
+    filters, ContextTypes, ExtBot
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import BadRequest
@@ -172,6 +172,14 @@ APPLICATION = None  # telegram Application; set in main() so non-handler paths c
 # ── Phase 2: engine layer config + singletons ──
 CHAT_SESSIONS_DIR = os.environ.get("BOT_CHAT_SESSIONS_DIR", f"{BOT_DATA_ROOT}/chat-sessions")
 COORDINATION_FILE = os.environ.get("BOT_COORDINATION_FILE", f"{BOT_CONFIGS_DIR}/coordination.json")
+# The coordination publish helper ships next to the bot modules. Agents run in
+# worktrees of ARBITRARY projects that do NOT contain scripts/coord_publish.py,
+# so a relative path is useless there — we inject the validated ABSOLUTE path
+# (AGENT_COORD_PUBLISHER) into the child env. BOT_COORD_PUBLISHER overrides the
+# default for non-standard deploy layouts; it is preflighted before injection.
+_COORD_PUBLISHER_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "scripts", "coord_publish.py")
+BOT_COORD_PUBLISHER = os.environ.get("BOT_COORD_PUBLISHER", "").strip() or _COORD_PUBLISHER_SRC
 CHAT_CATALOG_TTL = _positive_int_env("BOT_CHAT_CATALOG_TTL", 3600)
 CHAT_CONCURRENCY = _positive_int_env("BOT_CHAT_CONCURRENCY", 4)  # independent of heavy cap
 APP_REFERER_URL = os.environ.get("APP_REFERER_URL", "")
@@ -431,21 +439,28 @@ def _cb_resolve(data: str) -> str:
 
 # ── Phase 2: opaque STRUCTURED callback codec ──────────────────────────────
 # Every Phase-2 button stores a structured payload (dict) server-side and emits
-# a tiny opaque token `p2:<n>` (always << 64 bytes). This removes ALL delimiter
-# parsing of user data: labels/project names/model ids may contain ':', '|',
-# '/', Unicode or arbitrary length and can never be truncated or misrouted.
-# Fails closed after restart/eviction (token missing -> expired-button UX).
+# an opaque, UNGUESSABLE token `p2:<random>` (always << 64 bytes). This removes
+# ALL delimiter parsing of user data (labels/project names/model ids may contain
+# ':', '|', '/', Unicode or arbitrary length) AND binds each payload to its
+# originating chat id so a second authorized chat cannot guess/replay a token to
+# act in the wrong chat. on_callback validates `cid` ownership in ONE central
+# gate before any action code. Fails closed on unknown/expired/wrong-chat/evicted
+# tokens (restart clears the registry -> expired-button UX).
 _P2_REGISTRY: "OrderedDict[str, dict]" = OrderedDict()
-_p2_counter = 0
 _P2_MAX = 4000
 
 
-def cb2(kind: str, **fields) -> str:
-    """Register a structured Phase-2 payload; return its opaque token."""
-    global _p2_counter
-    _p2_counter += 1
-    token = f"p2:{_p2_counter}"
-    _P2_REGISTRY[token] = {"k": kind, **fields}
+def cb2(kind: str, chat_id: int, **fields) -> str:
+    """Register a chat-bound structured Phase-2 payload; return its opaque token.
+
+    ``chat_id`` is the chat the button is being sent to; it is stored as the
+    reserved ``cid`` key and enforced by on_callback. The token is 128 bits of
+    randomness (unguessable), not a sequential counter."""
+    for _ in range(8):
+        token = "p2:" + secrets.token_urlsafe(16)
+        if token not in _P2_REGISTRY:
+            break
+    _P2_REGISTRY[token] = {"k": kind, "cid": chat_id, **fields}
     while len(_P2_REGISTRY) > _P2_MAX:
         _P2_REGISTRY.popitem(last=False)  # evict oldest
     return token
@@ -454,6 +469,12 @@ def cb2(kind: str, **fields) -> str:
 def cb2_resolve(token: str) -> "dict | None":
     """Return the structured payload for a token, or None if expired/unknown."""
     return _P2_REGISTRY.get(token)
+
+
+def cb2_consume(token: str) -> None:
+    """One-shot: drop a token so a double-tap/replay of a create action fails
+    closed (expired-button UX) instead of creating/replacing a second session."""
+    _P2_REGISTRY.pop(token, None)
 
 
 # ═══════════════════════════════════════════
@@ -1035,7 +1056,7 @@ def project_kb(session_key: str = ""):
 _ENGINE_ICONS = {"claude": "🤖", "codex": "🧠", "chat": "💬"}
 
 
-def new_session_engine_kb(label: str, has_name: bool):
+def new_session_engine_kb(chat_id: int, label: str, has_name: bool):
     """Engine picker — first step of /new. Uses opaque structured tokens, so the
     label may contain any character without delimiter ambiguity."""
     rows = []
@@ -1043,24 +1064,24 @@ def new_session_engine_kb(label: str, has_name: bool):
         icon = _ENGINE_ICONS.get(a.caps.engine, "•")
         rows.append([InlineKeyboardButton(
             f"{icon} {a.caps.label}",
-            callback_data=cb2("neng", engine=a.caps.engine, label=label, has_name=has_name))])
+            callback_data=cb2("neng", chat_id, engine=a.caps.engine, label=label, has_name=has_name))])
     return InlineKeyboardMarkup(rows)
 
 
-def new_session_project_kb(engine: str, label: str, has_name: bool = True):
+def new_session_project_kb(chat_id: int, engine: str, label: str, has_name: bool = True):
     """Project picker for the Claude/Codex /new flow."""
     ps = get_project_names()
     kind = "newproj" if has_name else "newneed"
     rows = [[InlineKeyboardButton(
         f"📁 {p}",
-        callback_data=cb2(kind, engine=engine, label=label, project=p))] for p in ps]
+        callback_data=cb2(kind, chat_id, engine=engine, label=label, project=p))] for p in ps]
     rows.append([InlineKeyboardButton(
         "➕ New project...",
-        callback_data=cb2("addproj", engine=engine, label=label, has_name=has_name))])
+        callback_data=cb2("addproj", chat_id, engine=engine, label=label, has_name=has_name))])
     return InlineKeyboardMarkup(rows)
 
 
-def chat_model_kb(label: str, has_name: bool, models):
+def chat_model_kb(chat_id: int, label: str, has_name: bool, models):
     """OpenRouter favorite/search picker for the Chat /new flow."""
     rows = []
     for m in models:
@@ -1068,9 +1089,9 @@ def chat_model_kb(label: str, has_name: bool, models):
             continue
         rows.append([InlineKeyboardButton(
             f"⭐ {m.label}",
-            callback_data=cb2("cmk", label=label, has_name=has_name, model=m.id))])
+            callback_data=cb2("cmk", chat_id, label=label, has_name=has_name, model=m.id))])
     rows.append([InlineKeyboardButton(
-        "🔎 Search models", callback_data=cb2("cmsearch", label=label, has_name=has_name))])
+        "🔎 Search models", callback_data=cb2("cmsearch", chat_id, label=label, has_name=has_name))])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1928,20 +1949,81 @@ _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
 
 _COORD_INSTRUCTIONS = (
     "### How to coordinate\n"
-    "1. Read the table above before large edits — a sibling agent may be working "
-    "the same repo/paths.\n"
-    "2. Publish your own claim (task summary, expected paths, ETA) so others see it:\n"
-    "   `python3 scripts/coord_publish.py --summary \"<what you are doing>\" "
+    "The table above is a **point-in-time snapshot** written when your worktree "
+    "was created — a sibling may have published newer claims since. Before large "
+    "edits, read the LIVE central view:\n"
+    "   `python3 \"$AGENT_COORD_PUBLISHER\" --show`\n"
+    "Then publish your own claim (task summary, expected paths, ETA) so others "
+    "see it:\n"
+    "   `python3 \"$AGENT_COORD_PUBLISHER\" --summary \"<what you are doing>\" "
     "--paths <comma,separated,paths> --eta <e.g. 10m>`\n"
-    "   (Your session id and the shared store are injected via the environment — "
-    "you can only update your own entry.)\n"
+    "(`$AGENT_COORD_PUBLISHER` is the absolute path to the helper, injected into "
+    "your environment; a relative `scripts/` path does NOT exist in this project "
+    "worktree.)\n\n"
+    "_Note: this is cooperative session identity, not a security boundary. The "
+    "shared store is advisory — please only update your own entry._\n"
 )
 
 
+def _valid_coord_publisher(path: str) -> "str | None":
+    """Return the absolute publisher path iff it passes preflight, else None.
+
+    Refuses anything that is not a regular, non-symlink file owned by root or the
+    running service user and readable, and whose bytes do not match the immutable
+    repo-shipped source (``_COORD_PUBLISHER_SRC``). Fail-closed: an unverifiable
+    publisher is simply not injected (agents skip publishing) rather than shipping
+    a tampered/unexpected script path into every child engine."""
+    try:
+        if not path:
+            return None
+        ap = os.path.abspath(path)
+        if os.path.islink(ap):
+            return None
+        st = os.stat(ap)  # follows nothing new: islink already ruled out a link
+        if not os.path.isfile(ap):
+            return None
+        try:
+            allowed = {0, os.geteuid()}
+        except AttributeError:  # pragma: no cover (non-POSIX)
+            allowed = {st.st_uid}
+        if st.st_uid not in allowed:
+            return None
+        if not os.access(ap, os.R_OK):
+            return None
+        src = os.path.abspath(_COORD_PUBLISHER_SRC)
+        if ap != src:
+            if _sha256_file(ap) != _sha256_file(src):
+                return None
+        return ap
+    except Exception:
+        return None
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _coord_env(session: "Session") -> dict:
-    """Session-scoped credentials for the coordination publish helper. The agent
-    can only update ITS OWN entry because the session id comes from here."""
-    return {"AGENT_COORD_STORE": COORDINATION_FILE, "AGENT_COORD_SESSION": session.id}
+    """Session-scoped identity for the coordination publish helper.
+
+    NOT a security boundary — this is COOPERATIVE session identity: a shell-capable
+    engine could set its own AGENT_COORD_SESSION and update any entry, and the code
+    engines already run with broad host permissions. The shared store is advisory.
+    We inject the VALIDATED absolute publisher path so the helper is runnable from a
+    foreign project worktree (which has no relative ``scripts/coord_publish.py``)."""
+    env = {
+        "AGENT_COORD_STORE": COORDINATION_FILE,
+        "AGENT_COORD_SESSION": session.id,
+        "AGENT_COORD_REPO": coord.canonical_repo(get_project_path(session.project)),
+    }
+    pub = _valid_coord_publisher(BOT_COORD_PUBLISHER)
+    if pub:
+        env["AGENT_COORD_PUBLISHER"] = pub
+    return env
 
 
 class CoordRun:
@@ -2567,8 +2649,38 @@ def _footerize(text, parse_mode):
         return text
 
 
+class FooterBot(ExtBot):
+    """ExtBot subclass that appends the cached RAM/Swap/Disk footer to every
+    user-visible text send/edit.
+
+    Production uses this (supplied via ``ApplicationBuilder.bot(...)``) instead of
+    replacing instance attributes: ``ExtBot`` inherits frozen, slot-based
+    ``TelegramObject``, which rejects public attribute assignment
+    (``bot.send_message = ...`` raises ``AttributeError`` and aborts startup).
+    Overriding the methods on a subclass is the supported interception point —
+    ``Message.reply_text`` / ``Message.edit_text`` /
+    ``CallbackQuery.edit_message_text`` all funnel through the bot's
+    ``send_message`` / ``edit_message_text``. Footering is idempotent by
+    construction (``_footerize`` -> ``with_footer`` skips an already-present
+    footer) and honours the ``_FOOTER_SUPPRESS`` contextvar used by send_long.
+    """
+
+    async def send_message(self, chat_id=None, text=None, *args, **kwargs):
+        return await super().send_message(
+            chat_id, _footerize(text, kwargs.get("parse_mode")), *args, **kwargs)
+
+    async def edit_message_text(self, text=None, *args, **kwargs):
+        return await super().edit_message_text(
+            _footerize(text, kwargs.get("parse_mode")), *args, **kwargs)
+
+
 def install_send_footer(bot):
-    """Idempotently wrap send_message / edit_message_text on the Bot instance."""
+    """Wrap send_message / edit_message_text on a MUTABLE Bot-like object.
+
+    Only for test doubles / non-frozen bots. Production must use ``FooterBot``
+    (see above) because the real ``ExtBot`` is frozen and would raise here.
+    Idempotent via the ``_footer_wrapped`` marker.
+    """
     if getattr(bot, "_footer_wrapped", False):
         return
     orig_send = bot.send_message
@@ -2598,10 +2710,16 @@ async def send_long(msg, text, pm=ParseMode.HTML, rm=None, footer=True):
     suppressed for the individual chunks so earlier chunks never get one.
     Chunking uses Telegram's UTF-16 code-unit limit, not code points.
     """
-    if footer and pm == ParseMode.HTML:
-        text = resource_footer.with_footer(text, html=True)
     mx = 4000
     chunks = _split_html_chunks(text, mx) if pm == ParseMode.HTML else _split_plain_utf16(text, mx)
+    # Footer the FINAL chunk AFTER splitting. Appending to the whole message
+    # first drops the footer on exactly the long (>4096) replies that get split,
+    # because with_footer() refuses to exceed Telegram's limit. Each chunk is
+    # <=mx (4000) UTF-16 units, leaving ample room for the ~80-unit footer under
+    # the 4096 limit. Mirror the central policy: HTML + plain get a footer,
+    # Markdown is left alone.
+    if footer and pm in (None, ParseMode.HTML) and chunks:
+        chunks[-1] = resource_footer.with_footer(chunks[-1], html=(pm == ParseMode.HTML))
     last = None
     # Suppress the per-send footer wrapper: the footer is already on the final
     # chunk (added above), so individual chunks must NOT each get one.
@@ -2945,7 +3063,7 @@ async def cmd_new(u, c):
     # Claude/Codex flow continues to project selection; Chat picks a model.
     await u.message.reply_text(
         f"🆕 New session{f' <b>{esc(label)}</b>' if has_name else ''} — pick an engine:",
-        parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(label, has_name=has_name))
+        parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(cid, label, has_name=has_name))
 
 @authorized
 async def cmd_sessions(u, c):
@@ -3109,14 +3227,14 @@ async def cmd_model(u, c):
                 continue
             icon = "✅" if cur == m.id else "🔹"
             rows.append([InlineKeyboardButton(f"{elabel}: {icon} {m.display()}",
-                                              callback_data=cb2("emod", model=m.id))])
+                                              callback_data=cb2("emod", cid, model=m.id))])
         if active_adapter.caps.is_chat:
             rows.append([InlineKeyboardButton(
                 f"{elabel}: 🔎 Search…" + (" (cached)" if stale else ""),
-                callback_data=cb2("emsearch"))])
+                callback_data=cb2("emsearch", cid))])
         else:
             rows.append([InlineKeyboardButton(
-                f"{elabel}: ✏️ Custom model…", callback_data=cb2("emcustom"))])
+                f"{elabel}: ✏️ Custom model…", callback_data=cb2("emcustom", cid))])
 
     # ── Fallback chain ──
     rows.append([InlineKeyboardButton(
@@ -3394,11 +3512,14 @@ async def error_handler(update, context):
 # ═══════════════════════════════════════════
 #  Handler: Inline Buttons
 # ═══════════════════════════════════════════
-async def _handle_p2(q, c, cid, p: dict):
+async def _handle_p2(q, c, cid, p: dict, token: str = ""):
     """Dispatch a Phase-2 structured callback payload. Fields come straight from
     the token registry — never parsed from the callback string — so arbitrary
     labels/project names/model ids (Unicode, ':' , '|', '/', long) are exact.
-    Engine/session/model are re-validated here at execution time."""
+    Engine/session/model are re-validated here at execution time. Chat ownership
+    is already enforced by on_callback's central gate. Create actions consume the
+    token (one-shot) so a double-tap/replay cannot spawn/replace a second
+    same-label session."""
     kind = p.get("k")
 
     async def _cap_guard() -> bool:
@@ -3435,12 +3556,12 @@ async def _handle_p2(q, c, cid, p: dict):
                 return
             await q.edit_message_text(
                 f"💬 <b>Chat</b> — pick a model{note}:",
-                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(label, has_name, favs))
+                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(cid, label, has_name, favs))
         else:
             await q.edit_message_text(
                 f"{_ENGINE_ICONS.get(engine, '•')} <b>{esc(adapter.caps.label)}</b> — which project?",
                 parse_mode=ParseMode.HTML,
-                reply_markup=new_session_project_kb(engine, label, has_name=has_name))
+                reply_markup=new_session_project_kb(cid, engine, label, has_name=has_name))
 
     elif kind == "newproj":
         engine = p.get("engine", engines.ENGINE_CLAUDE)
@@ -3450,6 +3571,7 @@ async def _handle_p2(q, c, cid, p: dict):
             engine = engines.ENGINE_CLAUDE
         if not await _cap_guard():
             return
+        cb2_consume(token)          # one-shot: block a double-tap second create
         session = SM.create(cid, label)
         _apply_engine(session, engine)
         session.project = proj_name
@@ -3475,7 +3597,7 @@ async def _handle_p2(q, c, cid, p: dict):
             f"📁 Project: <b>{esc(proj_name)}</b>\n\nEnter a name for this session (or tap Skip):",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                "⏭ Skip", callback_data=cb2("skipname", engine=engine,
+                "⏭ Skip", callback_data=cb2("skipname", cid, engine=engine,
                                             label=auto_label, project=proj_name))]]))
 
     elif kind == "skipname":
@@ -3485,6 +3607,7 @@ async def _handle_p2(q, c, cid, p: dict):
         CONV_STATE.pop(cid, None)
         if not await _cap_guard():
             return
+        cb2_consume(token)          # one-shot: block a double-tap second create
         session = SM.create(cid, auto_label)
         _apply_engine(session, engine)
         session.project = proj_name
@@ -3520,6 +3643,7 @@ async def _handle_p2(q, c, cid, p: dict):
             return
         if not await _cap_guard():
             return
+        cb2_consume(token)          # one-shot: block a double-tap second create
         session = SM.create(cid, label)
         _apply_engine(session, engines.ENGINE_CHAT, model)
         await q.edit_message_text(
@@ -3643,7 +3767,16 @@ async def on_callback(u, c):
                 "Please use the command again: /new or /model",
                 parse_mode=ParseMode.HTML)
             return
-        await _handle_p2(q, c, cid, payload)
+        # Central ownership gate: the token is bound to the chat it was issued in.
+        # A different (even authorized) chat that guesses/replays it is refused
+        # BEFORE any action-specific code runs. Fail closed on a missing/mismatched
+        # cid (malformed or pre-binding token).
+        if payload.get("cid") != cid:
+            log.warning(f"p2 cross-chat token rejected chat={cid} owner={payload.get('cid')}")
+            await q.edit_message_text(
+                "⚠️ This button isn't for this chat.", parse_mode=ParseMode.HTML)
+            return
+        await _handle_p2(q, c, cid, payload, token=q.data)
         return
 
     d = _cb_resolve(q.data)
@@ -4145,7 +4278,7 @@ async def on_callback(u, c):
             label = f"session-{int(time.time()) % 10000}"
             await c.bot.send_message(cid,
                 f"🆕 New session — pick an engine:",
-                parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(label, has_name=False))
+                parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(cid, label, has_name=False))
 
     elif d == "menu:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
@@ -4405,7 +4538,7 @@ async def on_text(u, c):
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n\nEnter a name for this session (or tap Skip):",
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                        "⏭ Skip", callback_data=cb2("skipname", engine=engine,
+                        "⏭ Skip", callback_data=cb2("skipname", cid, engine=engine,
                                                     label=label, project=proj_name))]]))
             return
 
@@ -4455,7 +4588,7 @@ async def on_text(u, c):
                     f"No models matched <code>{esc(entry)}</code>.", parse_mode=ParseMode.HTML)
                 return
             rows = [[InlineKeyboardButton(f"⭐ {m.display()}",
-                     callback_data=cb2("emodset", session_key=skey, model=m.id))] for m in results]
+                     callback_data=cb2("emodset", cid, session_key=skey, model=m.id))] for m in results]
             await u.message.reply_text(
                 f"🔎 Results for <code>{esc(entry)}</code> — pick one:",
                 parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
@@ -4478,7 +4611,7 @@ async def on_text(u, c):
                 return
             await u.message.reply_text(
                 f"🔎 Results for <code>{esc(query)}</code> — pick one:",
-                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(label, has_name, results))
+                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(cid, label, has_name, results))
             return
 
         if state == "awaiting_model_search":
@@ -5304,7 +5437,6 @@ async def cmd_nightwatch_last(update, context):
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
     log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
-    from telegram.ext import Defaults
     from telegram.request import HTTPXRequest
     # Increase timeouts to prevent ReadError during long Claude operations
     request = HTTPXRequest(
@@ -5313,16 +5445,24 @@ def main():
         connect_timeout=30,
         pool_timeout=30,
     )
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(graceful_shutdown).request(request).build()
+    # Phase 2: FooterBot (an ExtBot subclass) appends the RAM/Swap/Disk footer to
+    # every user-visible text via its send_message / edit_message_text overrides.
+    # ExtBot is frozen/slotted, so we cannot patch the instance after build();
+    # instead build the bot ourselves and hand it to ApplicationBuilder.bot().
+    # get_updates_request mirrors the builder's own default (pool size 1); the
+    # custom `request` carries the long-operation timeouts as before.
+    footer_bot = FooterBot(
+        BOT_TOKEN,
+        request=request,
+        get_updates_request=HTTPXRequest(connection_pool_size=1),
+    )
+    app = Application.builder().bot(footer_bot).post_init(post_init).post_shutdown(graceful_shutdown).build()
     # Expose bot reference module-wide so non-handler code paths (e.g. the
     # worktree-creation failure notice from run_claude) can send Telegram messages.
     global BOT, APPLICATION
     BOT = app.bot
     APPLICATION = app
-    # Phase 2: centralize the RAM/Swap/Disk footer on every user-visible text
-    # (send_message / edit_message_text). Binary uploads / acks / actions use
-    # other Bot methods and are excluded automatically.
-    install_send_footer(app.bot)
+    # The footer is applied by FooterBot (built above); no instance patching.
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))

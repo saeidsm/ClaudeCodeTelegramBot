@@ -1,7 +1,8 @@
 """Coordination file safety + truthful semantics (Correction 4).
 
-Symlink / tracked-file refusal (with outside sentinels), session-authorized
-bounded updates, and sibling visibility during concurrent active runs."""
+Symlink / tracked-file refusal (with outside sentinels), bounded per-session
+updates (cooperative identity — store integrity, not access control), and
+sibling visibility during concurrent active runs."""
 from __future__ import annotations
 
 import os

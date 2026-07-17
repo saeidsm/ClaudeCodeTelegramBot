@@ -160,8 +160,9 @@ class CoordinationStore:
         """Update ONLY the given session's entry (must already exist). Fields are
         length/count-bounded and status is validated. Returns True if updated.
 
-        This is the single authorized path for an agent to publish its task
-        claim / expected paths / ETA mid-run; it cannot touch another session."""
+        This targets a single session id by convention (cooperative identity, not
+        a security boundary — a shell-capable agent could pass any session id).
+        Field bounds here defend the store's integrity, not access control."""
         def _fn(doc):
             e = doc["entries"].get(session_id)
             if e is None:
@@ -186,6 +187,10 @@ class CoordinationStore:
                  "",
                  "_Shared, bot-managed view of concurrent Claude/Codex agents. "
                  "Read this before large edits so you don't collide with a sibling agent._",
+                 "",
+                 "_This file is a **point-in-time snapshot** captured when your worktree "
+                 "was created; for the current state run "
+                 "`python3 \"$AGENT_COORD_PUBLISHER\" --show`._",
                  ""]
         if instructions:
             lines += [instructions, ""]

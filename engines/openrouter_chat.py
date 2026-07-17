@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass
 
@@ -420,40 +421,57 @@ def _sanitize_records(data) -> list[dict]:
     return out
 
 
+def _open_session_dirfd(chat_dir: str) -> "int | None":
+    """Open the session directory itself with ``O_DIRECTORY | O_NOFOLLOW``.
+
+    This is the race fix: a path-based ``islink`` check followed by an operation
+    on the same *pathname* (mkstemp / open / remove) can be defeated by swapping
+    the directory entry to a symlink between the check and the use (TOCTOU). By
+    holding an fd to the real directory inode and doing every file op relative to
+    it (``dir_fd=``, openat-style), a later swap of the path cannot redirect us,
+    and ``O_NOFOLLOW`` refuses a directory that is *already* a symlink (ELOOP).
+    Returns the fd (caller must close) or None (symlink / not-a-dir / missing)."""
+    try:
+        return os.open(chat_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+
+
+def _load_via_dirfd(dfd: int) -> list[dict]:
+    try:
+        fd = os.open(_HISTORY_FILENAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+    except OSError:
+        return []  # missing, or history.json itself is a symlink (ELOOP)
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    return _sanitize_records(data)
+
+
 class ChatHistory:
     """Per-session message log at ``<chat_dir>/history.json``. Bounded, atomic,
-    and symlink-hardened.
+    and race-hardened.
 
-    Never follows a symlink for the session directory or the history file. The
-    session directory must be a real directory (not a symlink); reads/writes use
-    ``O_NOFOLLOW``. Removed only by explicit lifecycle events (``purge``)."""
+    Every operation opens the session directory with ``O_DIRECTORY|O_NOFOLLOW``
+    and does its file I/O relative to that fd (openat semantics), so a directory
+    -> symlink swap between check and use cannot redirect a read/write/delete to
+    an outside target, and a symlinked session dir is refused outright. Removed
+    only by explicit lifecycle events (``purge``)."""
 
     def __init__(self, chat_dir: str):
         self.chat_dir = chat_dir
         self.path = os.path.join(chat_dir, _HISTORY_FILENAME)
 
-    def _dir_is_safe(self) -> bool:
-        # A symlinked session dir is never acceptable. A non-existent dir is fine
-        # (created on first append). An existing non-dir is rejected.
-        if os.path.islink(self.chat_dir):
-            return False
-        if os.path.exists(self.chat_dir) and not os.path.isdir(self.chat_dir):
-            return False
-        return True
-
     def load(self) -> list[dict]:
-        if not self._dir_is_safe():
+        dfd = _open_session_dirfd(self.chat_dir)
+        if dfd is None:
             return []
         try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
-            return []  # missing, or a symlink (ELOOP) -> treated as empty
-        try:
-            with os.fdopen(fd, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return []
-        return _sanitize_records(data)
+            return _load_via_dirfd(dfd)
+        finally:
+            os.close(dfd)
 
     def _bound(self, msgs: list[dict]) -> list[dict]:
         msgs = msgs[-_history_max_turns() * 2:]  # a turn == user+assistant
@@ -469,35 +487,44 @@ class ChatHistory:
 
     def append(self, user: str, assistant: str) -> bool:
         """Append one turn atomically. Returns False (no-op) if the session dir
-        is unsafe — never writes through a symlink."""
-        if os.path.islink(self.chat_dir):
-            return False
-        msgs = self.load()
-        msgs.append({"role": "user", "content": str(user)})
-        msgs.append({"role": "assistant", "content": str(assistant)})
-        msgs = self._bound(msgs)
+        is unsafe (a symlink / not a directory) — never writes through a swap."""
+        # Create the dir on first use; makedirs never creates through a symlink
+        # for the final component, and the O_NOFOLLOW open below re-checks anyway.
         try:
             os.makedirs(self.chat_dir, exist_ok=True)
-        except FileExistsError:
-            return False  # a non-dir/symlink now occupies the path
-        if os.path.islink(self.chat_dir) or not os.path.isdir(self.chat_dir):
+        except OSError:
             return False
-        import tempfile
-        fd, tmp = tempfile.mkstemp(prefix=".hist-", suffix=".tmp", dir=self.chat_dir)
+        dfd = _open_session_dirfd(self.chat_dir)
+        if dfd is None:
+            return False  # symlink / non-dir occupying the path -> fail closed
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(msgs, f, ensure_ascii=False)
-            # Replace the target only if it is not a symlink (defence in depth).
-            if os.path.islink(self.path):
-                os.remove(self.path)
-            os.replace(tmp, self.path)
-            return True
+            msgs = _load_via_dirfd(dfd)
+            msgs.append({"role": "user", "content": str(user)})
+            msgs.append({"role": "assistant", "content": str(assistant)})
+            msgs = self._bound(msgs)
+            tmpname = "." + secrets.token_hex(8) + ".hist.tmp"
+            try:
+                fd = os.open(tmpname,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=dfd)
+            except OSError:
+                return False
+            ok = False
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(msgs, f, ensure_ascii=False)
+                # Atomic openat rename within the SAME real directory inode.
+                os.replace(tmpname, _HISTORY_FILENAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+                ok = True
+                return True
+            finally:
+                if not ok:
+                    try:
+                        os.unlink(tmpname, dir_fd=dfd)
+                    except OSError:
+                        pass
         finally:
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
+            os.close(dfd)
 
     def build_messages(self, new_user: str) -> list[dict]:
         # Fixed system prompt ALWAYS first; sanitized history can never inject it.
@@ -507,12 +534,20 @@ class ChatHistory:
 
     def purge(self) -> None:
         """Remove this session's history file and its (empty) directory only.
-        Never follows a symlink and never recursively deletes an unverified path."""
-        # Remove the history file (unlink removes the link itself, not its target).
-        try:
-            os.remove(self.path)
-        except (FileNotFoundError, OSError):
-            pass
+
+        Opens the session dir with O_NOFOLLOW and unlinks ``history.json``
+        relative to that fd, so a swapped chat_dir symlink can never make us
+        delete an outside target. rmdir never follows a final-component symlink
+        and only removes an empty real directory."""
+        dfd = _open_session_dirfd(self.chat_dir)
+        if dfd is not None:
+            try:
+                try:
+                    os.unlink(_HISTORY_FILENAME, dir_fd=dfd)
+                except (FileNotFoundError, OSError):
+                    pass
+            finally:
+                os.close(dfd)
         # Remove the session directory ONLY if it is a real, now-empty directory.
         try:
             if not os.path.islink(self.chat_dir) and os.path.isdir(self.chat_dir):

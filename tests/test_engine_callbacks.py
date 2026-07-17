@@ -55,7 +55,7 @@ async def _dispatch(token, chat_id):
     q = FakeQuery(token, chat_id)
     payload = bot.cb2_resolve(token)
     assert payload is not None
-    await bot._handle_p2(q, None, chat_id, payload)
+    await bot._handle_p2(q, None, chat_id, payload, token=token)
     return q
 
 
@@ -65,7 +65,7 @@ EXOTIC_LABELS = ["foo:bar", "a/b/c", "pipe|x", "نام‌فارسی", "x" * 120]
 @pytest.mark.parametrize("label", EXOTIC_LABELS)
 async def test_newproj_roundtrips_exotic_label(monkeypatch, tmp_path, label):
     _reset(monkeypatch, tmp_path)
-    tok = bot.cb2("newproj", engine="claude", label=label, project="my:proj/x")
+    tok = bot.cb2("newproj", 42, engine="claude", label=label, project="my:proj/x")
     assert len(tok.encode()) <= 64
     q = await _dispatch(tok, 42)
     # the exact label + project routed through, no truncation
@@ -78,7 +78,7 @@ async def test_newproj_roundtrips_exotic_label(monkeypatch, tmp_path, label):
 
 async def test_cmk_free_model_id_preserved(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path)
-    tok = bot.cb2("cmk", label="chatty", has_name=True, model="qwen/qwen3-coder:free")
+    tok = bot.cb2("cmk", 7, label="chatty", has_name=True, model="qwen/qwen3-coder:free")
     q = await _dispatch(tok, 7)
     s = bot.SM.sessions["7:chatty"]
     assert s.engine == "chat"
@@ -87,7 +87,7 @@ async def test_cmk_free_model_id_preserved(monkeypatch, tmp_path):
 
 async def test_cmk_rejects_invalid_model(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path)
-    tok = bot.cb2("cmk", label="c", has_name=True, model="not-a-real/model")
+    tok = bot.cb2("cmk", 7, label="c", has_name=True, model="not-a-real/model")
     q = await _dispatch(tok, 7)
     assert "7:c" not in bot.SM.sessions          # not created
     assert "isn't a valid chat model" in q.message.edits[-1]
@@ -104,7 +104,7 @@ async def test_expired_token_fails_closed(monkeypatch, tmp_path):
 async def test_long_payload_indirection_under_64_bytes(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path)
     huge = "قهرمان-" + "x" * 300
-    tok = bot.cb2("neng", engine="codex", label=huge, has_name=False)
+    tok = bot.cb2("neng", 1, engine="codex", label=huge, has_name=False)
     assert len(tok.encode()) <= 64
     assert bot.cb2_resolve(tok)["label"] == huge
 
@@ -116,7 +116,7 @@ async def test_emodset_cross_chat_rejected(monkeypatch, tmp_path):
     bot._apply_engine(s, "chat", "z-ai/glm-5.2")
     bot.SM.sessions[s.id] = s
     # attacker in chat 200 clicks an emodset button referencing 100:c
-    tok = bot.cb2("emodset", session_key="100:c", model="z-ai/glm-5.2")
+    tok = bot.cb2("emodset", 200, session_key="100:c", model="z-ai/glm-5.2")
     q = await _dispatch(tok, 200)
     assert "isn't in this chat" in q.message.edits[-1]
     assert s.model == "z-ai/glm-5.2"             # unchanged by the attacker
@@ -125,6 +125,6 @@ async def test_emodset_cross_chat_rejected(monkeypatch, tmp_path):
 async def test_emod_stale_session_rejected(monkeypatch, tmp_path):
     _reset(monkeypatch, tmp_path)
     # no active session -> emod fails closed
-    tok = bot.cb2("emod", model="gpt-5.6-sol")
+    tok = bot.cb2("emod", 9, model="gpt-5.6-sol")
     q = await _dispatch(tok, 9)
     assert "No active session" in q.message.edits[-1]

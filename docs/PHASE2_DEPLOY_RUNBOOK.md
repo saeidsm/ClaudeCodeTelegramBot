@@ -12,6 +12,38 @@ box was rolled back) and Phase 2 in a single backup-protected transaction.
 
 ---
 
+## Executable procedure (do not hand-type these steps)
+
+The steps below are implemented, one transaction, by the repository-owned,
+offline-tested script — so deployment is an exact procedure, not commands
+invented at deploy time (the cause of the prior deploy loops):
+
+```
+scripts/deploy-phase1-phase2.sh          # implements every step in this runbook
+tests/test_deploy_script.py              # offline proof: preflight=no-mutation,
+                                         # per-stage rollback, byte-preserving env
+```
+
+- **Read-only by default:** `deploy-phase1-phase2.sh --preflight` runs the source
+  syntax gates, takes the single flock, and STOPS before any mutation.
+- **Mutate only behind the gate:** `deploy-phase1-phase2.sh --execute
+  --reviewed-pr 19 --merged-sha <40-hex>` — refuses unless the PR is 19 and the
+  merged SHA equals both the immutable source HEAD and `origin/main`.
+- One flock; installs from the detached source (never the dirty main checkout);
+  writes a `PRESENT_BEFORE` manifest; edits `.env` only through a byte-preserving
+  allow-list (never `source`/`eval`, secrets untouched); performs the Phase-1
+  retention migration; runs the live-dir import/FooterBot construction smoke;
+  restarts **exactly once**; and on ANY post-mutation failure a trap restores or
+  removes every artifact by manifest and restarts the old bot. It writes exactly
+  one of `DEPLOYED` / `ROLLED_BACK` / `STOPPED_BEFORE_MUTATION`.
+- **No real report deletion** happens during the transaction (retention runs
+  `--dry-run` only). Production is never touched by the test suite.
+
+The remaining sections document what each stage does and the acceptance
+evidence to confirm afterwards.
+
+---
+
 ## Gate 0 — do not mutate until all true
 
 ```
