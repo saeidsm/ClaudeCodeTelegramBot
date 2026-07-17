@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -128,6 +129,60 @@ async def test_chat_cancellation_propagates_and_closes():
 def test_redaction():
     assert "sk-secret" not in _redact("error with sk-secret here", "sk-secret")
     assert _redact("Authorization: Bearer abc.def-123", None).endswith("Bearer ***")
+
+
+def test_no_bearer_none_header():
+    c = OpenRouterClient(None)
+    assert "Authorization" not in c._headers()          # never 'Bearer None'
+    c2 = OpenRouterClient("k")
+    assert c2._headers()["Authorization"] == "Bearer k"
+
+
+async def test_cancellation_closes_session():
+    holder = {}
+    class CancelSession(FakeSession):
+        def post(self, *a, **k):
+            raise asyncio.CancelledError()
+    def factory():
+        s = CancelSession([]); holder["s"] = s; return s
+    c = OpenRouterClient("k", session_factory=factory)
+    with pytest.raises(asyncio.CancelledError):
+        await c.chat("m", [])
+    assert holder["s"].closed is True                    # session closed on cancel
+
+
+def test_extract_content_shapes():
+    from engines.openrouter_chat import _extract_content
+    assert _extract_content({"choices": [{"message": {"content": "hi"}}]}) == "hi"
+    # list-of-parts shape
+    doc = {"choices": [{"message": {"content": [{"type": "text", "text": "a"},
+                                                {"type": "text", "text": "b"}]}}]}
+    assert _extract_content(doc) == "ab"
+    assert _extract_content({}) == ""
+    assert _extract_content({"choices": [{"message": {"content": None}}]}) == ""
+    assert _extract_content({"choices": [{"message": {"content": 42}}]}) == ""
+
+
+async def test_is_selectable_fail_closed(tmp_path):
+    cl = OneShotClient([{"id": "a/b", "name": "AB"}])
+    cat = ChatCatalog(cl, ttl=1000, cache_path=str(tmp_path / "c.json"))
+    assert await cat.is_selectable("a/b")                # in catalog
+    assert not await cat.is_selectable("x/missing")      # not in catalog
+    assert not await cat.is_selectable("bare-code-id")   # no vendor slash
+    # empty catalog (fetch yields nothing) -> refuse everything
+    empty = ChatCatalog(OneShotClient([]), ttl=1000, cache_path=str(tmp_path / "e.json"))
+    assert not await empty.is_selectable("a/b")
+
+
+def test_save_persistent_no_fixed_tmp_leak(tmp_path):
+    cl = OneShotClient([{"id": "a/b", "name": "AB"}])
+    cat = ChatCatalog(cl, cache_path=str(tmp_path / "c.json"))
+    cat._save_persistent([{"id": "a/b", "name": "AB"}])
+    assert os.path.exists(str(tmp_path / "c.json"))
+    # no leftover fixed ".tmp" and no stray temp files
+    assert not os.path.exists(str(tmp_path / "c.json.tmp"))
+    leftovers = [p for p in os.listdir(tmp_path) if p.endswith(".tmp")]
+    assert leftovers == []
 
 
 # ── catalog ─────────────────────────────────────────────────────────────

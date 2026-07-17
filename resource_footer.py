@@ -15,9 +15,15 @@ import time
 
 FOOTER_MARK = "🖥"
 _CACHE_TTL = 8.0            # seconds (within the 5–10s window)
-_TELEGRAM_MAX = 4096
+_TELEGRAM_MAX = 4096       # Telegram limit is in UTF-16 code units, not code points
 
 _cache: tuple[float, str] = (0.0, "")
+
+
+def tg_len(s: str) -> int:
+    """Telegram message length = number of UTF-16 code units (a non-BMP char
+    like an emoji counts as 2), NOT Python code points."""
+    return len(s.encode("utf-16-le")) // 2
 
 
 def _human(nbytes: float) -> str:
@@ -94,7 +100,8 @@ def with_footer(text: str, *, html: bool = True) -> str:
         return text
     foot = footer_text()
     block = f"\n\n<code>{foot}</code>" if html else f"\n\n{foot}"
-    if len(text) + len(block) > _TELEGRAM_MAX:
+    # Enforce Telegram's UTF-16 code-unit limit (emoji count as 2), not code points.
+    if tg_len(text) + tg_len(block) > _TELEGRAM_MAX:
         return text
     return text + block
 

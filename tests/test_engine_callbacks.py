@@ -1,56 +1,130 @@
-"""Callback-data encoding for the new engine flows (§C/§D).
+"""End-to-end Phase-2 callback codec + handler tests (Correction 3).
 
-The ':' separator is dangerous because OpenRouter model ids can themselves
-contain ':' (e.g. ':free'). These tests pin the parsing contract the
-on_callback handlers rely on so a refactor can't silently truncate an id.
-"""
+Drives the real ``_handle_p2`` with a fake callback query. Proves arbitrary
+delimiter/Unicode labels and ``:free`` model ids round-trip through the opaque
+token registry without misrouting, that expiry fails closed, and that
+cross-chat / stale sessions are rejected. No ``split()`` is duplicated here."""
 from __future__ import annotations
 
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import bot
+import engines.base as eb
 
 
-def test_cmk_parse_preserves_model_with_colon():
-    # cmk:<hn>:<label>:<model> — model is the tail, may contain ':'
-    d = "cmk:1:mychat:qwen/qwen3-coder:free"
-    parts = d.split(":", 3)
-    assert parts[1] == "1"
-    assert parts[2] == "mychat"
-    assert parts[3] == "qwen/qwen3-coder:free"
+class FakeMsg:
+    def __init__(self, chat_id, mid=555):
+        self.chat = type("C", (), {"id": chat_id})()
+        self.message_id = mid
+        self.edits = []
+
+    async def edit_message_text(self, text, **k):
+        self.edits.append(text)
 
 
-def test_neng_parse_label_last():
-    d = "neng:codex:0:my-session"
-    parts = d.split(":", 3)
-    assert parts[1] == "codex" and parts[2] == "0" and parts[3] == "my-session"
+class FakeQuery:
+    def __init__(self, data, chat_id):
+        self.data = data
+        self.message = FakeMsg(chat_id)
+        self.answered = False
+
+    async def answer(self, *a, **k):
+        self.answered = True
+
+    async def edit_message_text(self, text, **k):
+        self.message.edits.append(text)
 
 
-def test_newproj_parse_engine_threaded():
-    d = "newproj:claude:sess:ZigguratKids4"
-    parts = d.split(":", 3)
-    assert parts[1] == "claude" and parts[2] == "sess" and parts[3] == "ZigguratKids4"
+def _reset(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "CHAT_SESSIONS_DIR", str(tmp_path / "chat"))
+    bot.SM.sessions.clear()
+    bot.ACTIVE_SESSION.clear()
+    bot._P2_REGISTRY.clear()
+    from engines.base import ModelInfo
+    bot.CHAT_CATALOG._models = [ModelInfo("z-ai/glm-5.2", "GLM 5.2"),
+                                ModelInfo("qwen/qwen3-coder:free", "Qwen Coder Free")]
+    bot.CHAT_CATALOG._fetched_at = 1e18
 
 
-def test_emod_takes_whole_tail():
-    d = "emod:qwen/qwen3-coder:free"
-    assert d[len("emod:"):] == "qwen/qwen3-coder:free"
+async def _dispatch(token, chat_id):
+    q = FakeQuery(token, chat_id)
+    payload = bot.cb2_resolve(token)
+    assert payload is not None
+    await bot._handle_p2(q, None, chat_id, payload)
+    return q
 
 
-def test_emodset_pipe_separator():
-    d = "emodset:9:mychat|qwen/x:free"
-    rest = d[len("emodset:"):]
-    skey, _, model = rest.partition("|")
-    assert skey == "9:mychat"
-    assert model == "qwen/x:free"
+EXOTIC_LABELS = ["foo:bar", "a/b/c", "pipe|x", "نام‌فارسی", "x" * 120]
 
 
-def test_cb_encoding_roundtrip_over_64_bytes():
-    # long chat model callbacks must survive the 64-byte registry indirection
-    long_model = "some-vendor/a-really-long-model-name-that-exceeds-limits-1234567890"
-    data = f"cmk:1:a-fairly-long-session-label:{long_model}"
-    token = bot._cb(data)
-    assert bot._cb_resolve(token) == data
+@pytest.mark.parametrize("label", EXOTIC_LABELS)
+async def test_newproj_roundtrips_exotic_label(monkeypatch, tmp_path, label):
+    _reset(monkeypatch, tmp_path)
+    tok = bot.cb2("newproj", engine="claude", label=label, project="my:proj/x")
+    assert len(tok.encode()) <= 64
+    q = await _dispatch(tok, 42)
+    # the exact label + project routed through, no truncation
+    key = f"42:{label}"
+    assert key in bot.SM.sessions
+    s = bot.SM.sessions[key]
+    assert s.project == "my:proj/x"
+    assert s.engine == "claude"
+
+
+async def test_cmk_free_model_id_preserved(monkeypatch, tmp_path):
+    _reset(monkeypatch, tmp_path)
+    tok = bot.cb2("cmk", label="chatty", has_name=True, model="qwen/qwen3-coder:free")
+    q = await _dispatch(tok, 7)
+    s = bot.SM.sessions["7:chatty"]
+    assert s.engine == "chat"
+    assert s.model == "qwen/qwen3-coder:free"   # ':free' tail intact
+
+
+async def test_cmk_rejects_invalid_model(monkeypatch, tmp_path):
+    _reset(monkeypatch, tmp_path)
+    tok = bot.cb2("cmk", label="c", has_name=True, model="not-a-real/model")
+    q = await _dispatch(tok, 7)
+    assert "7:c" not in bot.SM.sessions          # not created
+    assert "isn't a valid chat model" in q.message.edits[-1]
+
+
+async def test_expired_token_fails_closed(monkeypatch, tmp_path):
+    _reset(monkeypatch, tmp_path)
+    # simulate restart/eviction: token not in registry
+    q = FakeQuery("p2:99999", 1)
+    # on_callback path: expired -> resolve None
+    assert bot.cb2_resolve("p2:99999") is None
+
+
+async def test_long_payload_indirection_under_64_bytes(monkeypatch, tmp_path):
+    _reset(monkeypatch, tmp_path)
+    huge = "قهرمان-" + "x" * 300
+    tok = bot.cb2("neng", engine="codex", label=huge, has_name=False)
+    assert len(tok.encode()) <= 64
+    assert bot.cb2_resolve(tok)["label"] == huge
+
+
+async def test_emodset_cross_chat_rejected(monkeypatch, tmp_path):
+    _reset(monkeypatch, tmp_path)
+    # a chat session owned by chat 100
+    s = bot.Session(id="100:c", label="c", color_emoji="🔵", session_uuid="u")
+    bot._apply_engine(s, "chat", "z-ai/glm-5.2")
+    bot.SM.sessions[s.id] = s
+    # attacker in chat 200 clicks an emodset button referencing 100:c
+    tok = bot.cb2("emodset", session_key="100:c", model="z-ai/glm-5.2")
+    q = await _dispatch(tok, 200)
+    assert "isn't in this chat" in q.message.edits[-1]
+    assert s.model == "z-ai/glm-5.2"             # unchanged by the attacker
+
+
+async def test_emod_stale_session_rejected(monkeypatch, tmp_path):
+    _reset(monkeypatch, tmp_path)
+    # no active session -> emod fails closed
+    tok = bot.cb2("emod", model="gpt-5.6-sol")
+    q = await _dispatch(tok, 9)
+    assert "No active session" in q.message.edits[-1]

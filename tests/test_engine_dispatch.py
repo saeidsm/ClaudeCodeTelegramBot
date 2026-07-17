@@ -53,22 +53,29 @@ async def test_chat_creates_no_worktree(monkeypatch, tmp_path):
         raise AssertionError("Chat must not create a worktree")
     monkeypatch.setattr(bot, "WorktreeSession", boom)
     bot.CONC.init(max_running=2, max_chat=2)
+    # temp chat root (never the real /opt path) + offline preloaded catalog
+    monkeypatch.setattr(bot, "CHAT_SESSIONS_DIR", str(tmp_path / "chat-root"))
+    from engines.base import ModelInfo
+    bot.CHAT_CATALOG._models = [ModelInfo("z-ai/glm-5.2", "GLM 5.2")]
+    bot.CHAT_CATALOG._fetched_at = 1e18  # far future -> never refetches (offline)
 
     async def fake_chat_call(model, messages, timeout=120.0, max_retries=3):
         return "chat reply"
     monkeypatch.setattr(bot._or_client, "chat", fake_chat_call)
 
     s = _mk("chat", "cc", model="z-ai/glm-5.2")
-    s.chat_history_ref = str(tmp_path / "sess")
+    bot._apply_engine(s, "chat", "z-ai/glm-5.2")   # derives safe dir under temp root
     bot.SM.sessions[s.id] = s
     try:
         out = await bot.run_chat("hello", s)
     finally:
         bot.SM.sessions.pop(s.id, None)
+        bot.CHAT_CATALOG._models = []; bot.CHAT_CATALOG._fetched_at = 0.0
     assert out == "chat reply"
-    # history persisted
+    # history persisted under the safe derived dir inside the temp root
     hist = json.loads(Path(s.chat_history_ref, "history.json").read_text())
     assert hist[-1]["content"] == "chat reply"
+    assert str(tmp_path) in s.chat_history_ref
 
 
 async def test_chat_cap_independent_of_heavy(monkeypatch):

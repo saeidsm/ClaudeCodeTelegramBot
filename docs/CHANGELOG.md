@@ -2,6 +2,36 @@
 
 All notable changes to the Shahrzad DevOps Telegram Bot.
 
+## [Unreleased] — 2026-07-17 — Phase 2 architect corrections (PR #19)
+
+Hardening applied after architect review, before merge:
+
+- **Chat history filesystem safety**: history dirs derive from an opaque
+  SHA-256-based key (never raw label/path); canonical containment + `O_NOFOLLOW`
+  reads/writes/purge; migration re-validates a restored `chat_history_ref`;
+  `/kill`, timeout, and duplicate-label replacement purge history; a killed
+  session's late turn can't recreate purged history.
+- **`/model` real catalogs**: every engine renders its own verified adapter
+  catalog (Claude shows Fable 5 / Opus 4.8 / Sonnet 5 / Haiku 4.5 / Default);
+  every button AND free-text choice is validated by the active engine's adapter
+  (cross-engine ids rejected); state saved on model change and on first Codex
+  `thread.started` capture.
+- **Reversible callback codec**: all Phase-2 callbacks use an opaque
+  structured-token registry — arbitrary Unicode / `:` / `|` / `/` / `:free` ids
+  round-trip exactly, 64-byte safe, fail-closed on expiry, re-validated at
+  execution, cross-chat rejected.
+- **Coordination**: `AGENT_COORDINATION.md` write refuses symlink / directory /
+  git-tracked destinations (atomic `O_NOFOLLOW`); truthful lifecycle
+  queued→running→completed/failed/cancelled for BOTH Claude and Codex;
+  session-authorized bounded live-claim helper (`scripts/coord_publish.py`).
+- **Footer**: centralized on `send_message`/`edit_message_text` so every
+  user-visible text gets exactly one footer (uploads/acks/actions excluded);
+  Telegram UTF-16 code-unit limit enforced; footer on the final chunk once.
+- **OpenRouter**: no `Authorization: Bearer None`; model validated against the
+  current/last-known-good catalog before each request; session closed on
+  cancel; history records validated (stored `system` dropped); safe content
+  shapes; unique catalog temp file.
+
 ## [Unreleased] — 2026-07-17 — Phase 2: Engines (Claude / Codex / Chat)
 
 Adds a typed engine-adapter layer so a session can run **Claude Code**, **Codex

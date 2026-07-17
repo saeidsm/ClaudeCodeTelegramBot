@@ -1,108 +1,158 @@
-# Phase 2 Deploy Runbook — Engines (Claude / Codex / Chat)
+# Combined Phase-1 + Phase-2 Deployment Runbook (Engines: Claude / Codex / Chat)
 
-**LOCKED.** Do not deploy until the owner sends the exact gate message:
+**DOCUMENTATION ONLY. Do NOT execute in this task.** Deployment is locked behind
+the architect review + merged-SHA gate. This runbook is written as one
+transactional, autonomous procedure that installs **both** Phase 1 (if the live
+box was rolled back) and Phase 2 in a single backup-protected transaction.
+
+> Why combined: the earlier Phase-1 deploy was **rolled back**, so production may
+> still be running the *old* bot with `BOT_MAX_SESSIONS=6` and the three
+> conflicting report-retention cron paths. A Phase-2-only runbook that assumes
+> Phase 1 is live is unsafe. Audit first; install what is missing.
+
+---
+
+## Gate 0 — do not mutate until all true
 
 ```
 GO PHASE2 DEPLOY
-REVIEWED_PR=<number>
+REVIEWED_PR=19
 MERGED_SHA=<full 40-char SHA>
 ```
 
-and `MERGED_SHA == origin/main`, the reviewed head tree equals the merge tree,
-and the implementation-report gates passed. Otherwise **stop before any mutation**.
+- PR #19 is **merged**; `MERGED_SHA == origin/main` (fetch read-only to confirm).
+- The reviewed head tree equals the merge tree (supports **squash** merge: compare
+  `git rev-parse <MERGED_SHA>^{tree}` against the reviewed tree, not the commit).
+- The implementation-report gates passed.
 
-Deployment must install **every** new runtime module — not only `bot.py`.
+If any is false → **STOP BEFORE MUTATION**, write `STOPPED BEFORE MUTATION`.
 
-## Runtime artifact manifest (must all be copied to the live script dir)
+## Gate 1 — immutable deployment worktree
 
-Live entrypoint dir: `/opt/shahrzad-devops/scripts/` (deployed as `claude-telegram-bot.py`).
-The engines package + new modules must sit **next to** the entrypoint so
-`import engines...`, `import coordination`, `import resource_footer` resolve.
+Create a detached worktree at the merged SHA; never deploy from the dirty main
+checkout:
 
-| Source (repo) | Live destination |
+```
+git worktree add --detach /tmp/phase2-deploy-<shortsha> <MERGED_SHA>
+```
+
+Run all gates here: `py_compile bot.py engines/*.py coordination.py resource_footer.py`,
+full `pytest` green, `git diff --check`, `bash -n scripts/*.sh`, isolated import
+smoke, secret scan. Abort on any failure.
+
+## Gate 2 — audit live Phase-1 state (read-only)
+
+Determine the **service user** from systemd and record, without printing secrets:
+
+```
+systemctl show claude-telegram-bot -p MainPID -p ActiveEnterTimestamp -p User -p ExecStart
+```
+
+Audit and record `PRESENT_BEFORE` (present/absent + hash) for each of:
+
+- Live entrypoint `/opt/shahrzad-devops/scripts/claude-telegram-bot.py`.
+- Phase-2 modules/package: `engines/` (+`__init__.py`), `coordination.py`,
+  `resource_footer.py`, `scripts/coord_publish.py`.
+- `/opt/shahrzad-devops/.env`; bot state `configs/bot-state.json`.
+- Chat data dir (`chat-sessions/`), coordination store (`configs/coordination.json`
+  + `.lock`), OpenRouter catalog cache (`configs/openrouter-catalog.json`).
+- Report retention: `scripts/cleanup-reports.sh`, its config, the systemd
+  `reports-cleanup.service` + `.timer`, **both** report cron files, and the
+  nightly cleanup — the **three conflicting retention paths** noted in project
+  memory. Record each so rollback can restore the exact prior state.
+- Service unit file + drop-ins; owners/modes/hashes of everything above.
+
+If Phase 1 is absent/partial, the SAME transaction must also install the Phase-1
+env keys and retention fix:
+
+```
+BOT_MAX_SESSIONS=9
+BOT_MAX_RUNNING_AGENTS=2
+BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4     # VPC private second listener
+```
+…plus the single authoritative report cleanup script/config/systemd timer, and
+**removal of exactly the three conflicting retention paths** — all inside the
+one backup-protected transaction.
+
+## Gate 3 — capability verification as the service user (no secrets printed)
+
+Run as the exact service user determined in Gate 2:
+
+- `codex login status` → must be logged in (ChatGPT). `codex debug models` → Sol/
+  Terra/Luna present. `codex exec --help` / `codex exec resume --help` → the
+  `--json` + `resume <SESSION_ID>` contract still holds.
+- `claude models` → catalog visible.
+- OpenRouter reachable (`GET /api/v1/models`) with the **existing** key.
+  **A missing/invalid `OPENROUTER_API_KEY` is a pre-mutation NO-GO** — never
+  invent or edit the secret.
+- basic-memory / Graphify are OPTIONAL — absence is non-fatal.
+
+## Gate 4 — pre-mutation safety
+
+- Parse `.env` **non-executingly**; modify only explicitly allow-listed non-secret
+  keys, preserving every unrelated line and secret byte-for-byte.
+- Require **zero running/queued sessions**, capacity/cgroup headroom, both
+  NightWatch listeners healthy (if enabled), a clean test run, and a report
+  retention **dry-run** (no real deletion) before any mutation.
+- Acquire a single deployment flock.
+
+## Backup + manifest (before ANY write)
+
+Create a unique root-only backup dir; copy every artifact from Gate 2 with its
+`PRESENT_BEFORE` state, owners, modes, hashes, and the exact rollback commands.
+Snapshot the service unit + `MainPID`/timestamp.
+
+## Install (from the immutable worktree only)
+
+Copy every runtime dependency to stable live paths and verify each:
+
+| Artifact | Live destination |
 |---|---|
 | `bot.py` | `/opt/shahrzad-devops/scripts/claude-telegram-bot.py` |
-| `engines/__init__.py` | `/opt/shahrzad-devops/scripts/engines/__init__.py` |
-| `engines/base.py` | `.../scripts/engines/base.py` |
-| `engines/claude_adapter.py` | `.../scripts/engines/claude_adapter.py` |
-| `engines/codex_adapter.py` | `.../scripts/engines/codex_adapter.py` |
-| `engines/openrouter_chat.py` | `.../scripts/engines/openrouter_chat.py` |
-| `coordination.py` | `.../scripts/coordination.py` |
-| `resource_footer.py` | `.../scripts/resource_footer.py` |
-| `log_filters.py` (unchanged) | already live — verify hash |
-| `video_module/` (unchanged) | already live — verify hash |
+| `engines/` (incl. `__init__.py`) | `.../scripts/engines/` |
+| `coordination.py`, `resource_footer.py` | `.../scripts/` |
+| `scripts/coord_publish.py` | `.../scripts/coord_publish.py` |
 
-> `engines/__init__.py` must exist (empty is fine) so the package imports.
-> If the live layout imports `bot` as a module elsewhere, the sibling modules
-> and the `engines/` package must be on the same `sys.path` entry as `bot.py`.
+Verify: hashes match source, owner/mode correct, **import closure** resolves with
+the **live dir on `sys.path`**, `aiohttp` importable, and the `engines` package
+resolves next to `bot.py`. Create `chat-sessions/`, `configs/coordination.json`
+parent, and catalog-cache dir least-privilege (service-user owned, `0700`/`0600`).
+Configure basic-memory only with verified syntax + backup + handshake (optional).
 
-## New writable paths (create least-privilege, root-owned)
+## Restart exactly once, then verify (≤120s)
 
-| Path | Purpose | Default |
-|---|---|---|
-| `BOT_CHAT_SESSIONS_DIR` | bounded per-session Chat history | `/opt/shahrzad-devops/chat-sessions` |
-| `BOT_COORDINATION_FILE` (+`.lock`) | shared Claude/Codex coordination store | `/opt/shahrzad-devops/configs/coordination.json` |
-| OpenRouter catalog cache | last-known-good models | `<configs>/openrouter-catalog.json` |
+Restart the service **once** after all pre-restart gates. Require:
 
-## Env keys to add (non-secret; edit only reviewed keys, never expose secrets)
+- stable new PID (old PID unchanged until this final step); no loop/fatal traceback;
+- `limits.effective max_sessions=9 ... max_running_agents=2`;
+- three engine registrations (claude/codex/chat);
+- legacy sessions migrated to `engine=claude`; Claude UUID/resume preserved;
+- Codex thread capture/resume readiness; Chat catalog/favorites loaded; Chat
+  history containment intact; independent Chat cap; coordination store writable;
+- both NightWatch listeners; report triplet (Summary/Browse/ZIP) working; footer
+  present on a test reply; cgroup/OOM stable; retention timer active.
+- Observe ≥ 90 seconds. **No real report cleanup runs during the transaction.**
 
-- `OPENROUTER_API_KEY` — **must already exist** in the live `.env`; do NOT modify it.
-- Optional tunables (all have safe defaults; only set if reviewed):
-  `BOT_CHAT_CONCURRENCY`, `BOT_CHAT_CATALOG_TTL`, `BOT_CHAT_FAVORITES`,
-  `BOT_CHAT_HISTORY_MAX_TURNS`, `BOT_CHAT_HISTORY_MAX_CHARS`,
-  `BOT_CODEX_DEFAULT_MODEL`, `BOT_CODEX_SANDBOX`, `BOT_CLAUDE_MODELS`,
-  `BOT_CODEX_MODELS`, `BOT_CHAT_SESSIONS_DIR`, `BOT_COORDINATION_FILE`.
+## Rollback (any post-mutation failure)
 
-## Prerequisites verified at deploy time (booleans / catalogs, no secrets printed)
+Automatically, per the manifest: restore/remove each artifact to its
+`PRESENT_BEFORE` state (entrypoint, Phase-2 modules/package, `.env`, state, Chat +
+coordination data, catalog cache, retention script/config/units, **both** report
+cron files, nightly cleanup, service unit), `systemctl daemon-reload`, restart the
+**old** bot once, and prove old hashes/listeners/sessions/retention state are
+healthy. Newly-created paths that were `PRESENT_BEFORE=absent` (chat-sessions/,
+coordination.json, openrouter-catalog.json) are removed. Retain the backup + worktree.
 
-1. `codex login status` → "Logged in using ChatGPT" (Codex engine usable).
-2. `codex debug models` returns Sol/Terra/Luna slugs.
-3. `GET /api/v1/models` reachable with the existing key (favorites resolvable).
-4. `claude models` catalog visible.
-5. basic-memory / Graphify are **optional** — absence is non-fatal (adapters degrade).
+## Final report
 
-## Validation before restart (immutable worktree at merged SHA)
+Write exactly one of `DEPLOYED` / `ROLLED BACK` / `STOPPED BEFORE MUTATION` to
+`/tmp/phase2-autonomous-deploy-<shortsha>.md` with evidence, hashes, backup path,
+and rollback commands.
 
-```
-python3 -m py_compile bot.py engines/*.py coordination.py resource_footer.py
-python3 -m pytest -q                      # full suite green
-git diff --check
-```
+## New runtime env keys (non-secret; all have safe defaults)
 
-Then a non-executing import smoke with the **live dir on sys.path**, temp state/logs,
-verifying: three engines register; migration of legacy state → engine=claude;
-engine catalogs load; OpenRouter catalog fetch (or last-known-good); no secret in logs.
-
-## Restart + observation
-
-Restart the bot **once**. Within 120s require: stable new PID, no fatal traceback,
-`limits.effective max_sessions=9 ... max_running_agents=2`, dual NightWatch (if enabled),
-`Bot v4 ready`, legacy sessions migrated to `engine=claude`, healthy registry/catalogs,
-no OOM increase. Observe ≥90s.
-
-## Rollback (on any failure)
-
-Restore from the unique root-only backup created before mutation:
-
-```
-# 1. stop new bot
-systemctl stop claude-telegram-bot
-# 2. restore entrypoint + modules + .env + configs from backup manifest
-cp -a <backup>/claude-telegram-bot.py /opt/shahrzad-devops/scripts/
-cp -a <backup>/engines /opt/shahrzad-devops/scripts/
-cp -a <backup>/coordination.py <backup>/resource_footer.py /opt/shahrzad-devops/scripts/
-cp -a <backup>/.env /opt/shahrzad-devops/.env
-# 3. remove Phase-2-created paths if they did not PRESENT_BEFORE
-#    (chat-sessions/, coordination.json, openrouter-catalog.json)
-# 4. restart old bot once and verify PID/ready
-systemctl start claude-telegram-bot
-```
-
-Record `DEPLOYED` / `ROLLED BACK` / `STOPPED BEFORE MUTATION` in
-`/tmp/phase2-autonomous-deploy-<shortsha>.md`. Retain backups + worktree.
-
-## basic-memory MCP (optional, transactional)
-
-Only if reviewed: back up Claude/Codex CLI configs, add the recon-verified
-streamable-HTTP MCP entry transactionally, preserve auth/unrelated config, then
-validate the handshake. Never write secrets/transcripts into memory.
+`BOT_CHAT_SESSIONS_DIR`, `BOT_COORDINATION_FILE`, `BOT_CHAT_CATALOG_TTL`,
+`BOT_CHAT_CONCURRENCY`, `BOT_CHAT_FAVORITES`, `BOT_CHAT_HISTORY_MAX_TURNS`,
+`BOT_CHAT_HISTORY_MAX_CHARS`, `BOT_CODEX_DEFAULT_MODEL`, `BOT_CODEX_SANDBOX`,
+`BOT_CLAUDE_MODELS`, `BOT_CODEX_MODELS`. `OPENROUTER_API_KEY` must already exist
+and is never modified.
