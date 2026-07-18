@@ -18,6 +18,8 @@ import pytest
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "deploy-phase1-phase2.sh"
 _SHA = "0123456789abcdef0123456789abcdef01234567"
+_RHEAD = "1111111111111111111111111111111111111111"   # owner-authorized reviewed PR head
+_RTREE = "2222222222222222222222222222222222222222"   # owner-authorized reviewed tree
 _TOK = "testtoken0123456789abcdef"
 
 _ENV_ORIG = (
@@ -58,7 +60,11 @@ def _mock_bin(d: Path) -> Path:
 case "$*" in
   *"symbolic-ref -q HEAD"*) [ "${{GIT_ON_BRANCH:-0}}" = 1 ] && {{ echo refs/heads/x; exit 0; }} || exit 1 ;;
   *"status --porcelain"*)   [ "${{GIT_DIRTY:-0}}" = 1 ] && echo " M f"; exit 0 ;;
+  *"^{{tree}}"*)             echo "${{GIT_MERGED_TREE:-{_RTREE}}}"; exit 0 ;;
   *"rev-parse HEAD"*)        echo "${{GIT_HEAD_SHA:-{_SHA}}}"; exit 0 ;;
+  *"ls-remote"*"refs/heads/claude/phase2-engines-codex-chat"*)
+    [ "${{GIT_PRBRANCH_DELETED:-0}}" = 1 ] && exit 0
+    printf '%s\\trefs/heads/claude/phase2-engines-codex-chat\\n' "${{GIT_PRBRANCH_SHA:-{_RHEAD}}}"; exit 0 ;;
   *"ls-remote"*)             [ "${{GIT_LSREMOTE_FAIL:-0}}" = 1 ] && exit 0; printf '%s\\trefs/heads/main\\n' "${{GIT_LSREMOTE_SHA:-{_SHA}}}"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -107,8 +113,23 @@ case "$1" in
       if grep -qiE '^Persistent=true' "$DEPLOY_SYSTEMD_DIR/reports-cleanup.timer" 2>/dev/null; then
         echo "start reports-cleanup.service (persistent catch-up)" >> "$SC_LOG"
       fi
+    elif [ "$2" = "claude-telegram-bot" ]; then
+      # prove the service stayed quiesced for the whole mutation window
+      [ -f "$S/svc_down" ] && echo "start-from-quiesced" >> "$SC_LOG"
+      rm -f "$S/svc_down"
+      echo $(( $(cat "$S/pid") + 1000 )) > "$S/pid"; echo 0 > "$S/pidreads"
     fi; exit 0 ;;
-  stop)     rm -f "$S/timer_active"; exit 0 ;;
+  stop)
+    if [ "$2" = "claude-telegram-bot" ]; then
+      [ "${SC_STOP_FAIL:-0}" = 1 ] && exit 1
+      # optionally simulate a state change/turn admitted during shutdown
+      if [ -n "${SC_ON_STOP_INJECT_CONTENT:-}" ]; then
+        printf '%s' "$SC_ON_STOP_INJECT_CONTENT" > "$DEPLOY_STATE_FILE"
+      fi
+      touch "$S/svc_down"
+    else
+      rm -f "$S/timer_active"
+    fi; exit 0 ;;
   daemon-reload) exit 0 ;;
   *) exit 0 ;;
 esac
@@ -124,6 +145,7 @@ case "$*" in
 esac
 has_pid=0; case "$*" in *"_PID="*) has_pid=1 ;; esac
 if [ "$has_pid" = 1 ]; then
+  [ "${JOURNAL_QUERY_FAIL:-0}" = 1 ] && exit 1
   all="$*"; want="${all#*_PID=}"; want="${want%% *}"
   cur="$(cat "$S/pid" 2>/dev/null || echo 0)"
   [ "$want" = "$cur" ] || exit 0            # journal for a different pid: empty
@@ -152,6 +174,8 @@ exit 0
     (b / "ss").write_text("""#!/usr/bin/env bash
 pid="$(cat "$SC_STATE/pid" 2>/dev/null || echo 0)"
 [ -n "${SS_PID_OVERRIDE:-}" ] && pid="$SS_PID_OVERRIDE"
+[ -n "${SS_EXTRA_ENDPOINT:-}" ] && \
+  echo "LISTEN 0 128 ${SS_EXTRA_ENDPOINT}:9091 0.0.0.0:* users:((\"python3\",pid=$pid,fd=9))"
 case "${SS_MODE:-good}" in
   good)
     echo "LISTEN 0 128 127.0.0.1:9091 0.0.0.0:* users:((\\"python3\\",pid=$pid,fd=5))"
@@ -266,6 +290,7 @@ case "${RB_CORRUPT_MODE:-}" in
   mode)    chmod 777 "$RB_TARGET" ;;
   owner)   chown 12345:12345 "$RB_TARGET" ;;
   type)    rm -f "$RB_TARGET"; ln -s /tmp "$RB_TARGET" ;;
+  linkowner) chown -h 12345:12345 "$RB_TARGET" ;;
   extra)   printf 'ghost' > "$RB_EXTRA" ;;
 esac
 exit 0
@@ -303,7 +328,10 @@ def fs(tmp_path):
     for k in ("JOURNAL_MODE", "SS_MODE", "OR_MODE", "CURL_HEALTH_MODE", "CLAUDE_MODE",
               "CODEX_LOGIN_MODE", "CODEX_MODELS_MODE", "CODEX_EXEC_MODE",
               "CODEX_RESUME_MODE", "SVC_USER", "SUDO_FAIL", "SC_PID_CHURN_AFTER",
-              "JOURNAL_CURSOR_EMPTY", "DF_AVAIL_KB", "FREE_MEM_KB", "FREE_SWAP_KB"):
+              "JOURNAL_CURSOR_EMPTY", "DF_AVAIL_KB", "FREE_MEM_KB", "FREE_SWAP_KB",
+              "GIT_MERGED_TREE", "GIT_PRBRANCH_SHA", "GIT_PRBRANCH_DELETED",
+              "SC_STOP_FAIL", "SC_ON_STOP_INJECT_CONTENT", "JOURNAL_QUERY_FAIL",
+              "SS_EXTRA_ENDPOINT"):
         env.pop(k, None)
     env.update({
         "PATH": f"{binp}:{env['PATH']}",
@@ -348,8 +376,11 @@ def _status(fs):
     return _field(fs, "STATUS")
 
 
-def _execute(fs, env_extra=None):
-    return _run(fs, "--execute", "--reviewed-pr", "19", "--merged-sha", _SHA, env_extra=env_extra)
+def _execute(fs, env_extra=None, reviewed=True):
+    args = ["--execute", "--reviewed-pr", "19", "--merged-sha", _SHA]
+    if reviewed:
+        args += ["--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE]
+    return _run(fs, *args, env_extra=env_extra)
 
 
 def _digest(root):
@@ -621,11 +652,22 @@ def test_success_full(fs):
     assert any(l.strip() == "Persistent=false" for l in timer.splitlines())
     log = fs["log"].read_text()
     assert "start reports-cleanup.service" not in log
-    # timer enable happens after the last restart (commit boundary)
+    # Gap 2: exactly ONE controlled old->new transition (one stop, one start),
+    # the service provably stayed quiesced across the whole mutation window,
+    # and the timer activates only after the start (commit boundary)
     lines = log.splitlines()
-    r_idx = max(i for i, l in enumerate(lines) if l.startswith("restart "))
+    stops = [i for i, l in enumerate(lines) if l.strip() == "stop claude-telegram-bot"]
+    starts = [i for i, l in enumerate(lines) if l.strip() == "start claude-telegram-bot"]
+    assert len(stops) == 1 and len(starts) == 1
+    assert stops[0] < starts[0]
+    assert "start-from-quiesced" in log
     e_idx = min(i for i, l in enumerate(lines) if l.startswith("enable reports-cleanup.timer"))
-    assert e_idx > r_idx
+    assert e_idx > starts[0]
+    assert _field(fs, "QUIESCE_STOPS") == "1"
+    # Gap 1: reviewed identities recorded in the transaction report
+    assert _field(fs, "REVIEWED_HEAD") == _RHEAD
+    assert _field(fs, "REVIEWED_TREE") == _RTREE
+    assert _field(fs, "MERGED_TREE") == _RTREE
     # no editor temp remnants
     assert not list(Path(fs["live"]).rglob(".*.deploytmp"))
 
@@ -743,7 +785,7 @@ def test_pid_churn_fails(fs):
 # ═══ §8 verifiable rollback ═════════════════════════════════════════════════
 @pytest.mark.parametrize("stage", [
     "install_artifacts", "edit_env", "migrate_retention", "verify_install",
-    "restart_once", "health_check", "observe", "enable_timer",
+    "start_new", "health_check", "observe", "enable_timer",
 ])
 def test_rollback_each_stage_verified(fs, stage):
     r = _execute(fs, env_extra={"DEPLOY_FAIL_AT": stage})
@@ -824,3 +866,167 @@ def test_nondefault_configs_render_matching_unit(fs):
     # §6: the unit's EnvironmentFile matches the RESOLVED (non-default) config
     assert f"EnvironmentFile=-{alt}/cfg/reports-cleanup.env" in unit
     assert (alt / "cfg" / "reports-cleanup.env").exists()
+
+
+# ═══ Round 6 — Gap 1: reviewed-tree authorization gate ══════════════════════
+def test_reviewed_tree_mismatch_fails_before_mutation(fs):
+    live0 = _digest(fs["live"])
+    r = _execute(fs, env_extra={"GIT_MERGED_TREE": "3" * 40})
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "reviewed tree" in r.stderr
+    assert _digest(fs["live"]) == live0
+
+
+def test_reviewed_identity_missing_fails(fs):
+    r = _execute(fs, reviewed=False)                      # no --reviewed-head/tree
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "40 hex" in r.stderr
+
+
+def test_reviewed_identity_malformed_fails(fs):
+    r = _run(fs, "--execute", "--reviewed-pr", "19", "--merged-sha", _SHA,
+             "--reviewed-head", "abc", "--reviewed-tree", _RTREE)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "40 hex" in r.stderr
+
+
+def test_squash_commit_different_sha_matching_tree_succeeds(fs):
+    # squash merge: merged commit != reviewed head, PR branch deleted post-merge
+    # -> the reviewed-TREE equality is the decisive documented gate
+    r = _execute(fs, env_extra={"GIT_PRBRANCH_DELETED": "1"})
+    assert _status(fs) == "DEPLOYED", r.stderr[-2000:]
+    assert "PR branch deleted post-merge" in r.stderr
+    assert _field(fs, "MERGED_TREE") == _RTREE
+
+
+def test_stale_live_pr_branch_fails(fs):
+    r = _execute(fs, env_extra={"GIT_PRBRANCH_SHA": "4" * 40})
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "stale PR branch" in r.stderr
+
+
+# ═══ Round 6 — Gap 2: fail-closed state + quiescence boundary ═══════════════
+@pytest.mark.parametrize("content,expect", [
+    ("not-json{", "invalid JSON"),
+    ('{"sessions": {"1:a": {"status": "weird"}}}', "unknown session status"),
+    ('["not-an-object"]', "top-level is not an object"),
+    ('{"nosessions": true}', "missing 'sessions'"),
+])
+def test_state_fail_closed_variants(fs, content, expect):
+    (fs["live"] / "configs" / "bot-state.json").write_text(content)
+    r = _execute(fs)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert expect in r.stderr
+
+
+def test_state_missing_fails_closed(fs):
+    (fs["live"] / "configs" / "bot-state.json").unlink()
+    r = _execute(fs)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "state file missing" in r.stderr
+
+
+def test_turn_admitted_during_quiesce_aborts_without_mutation(fs):
+    injected = '{"sessions": {"9:late": {"status": "queued"}}}'
+    env0 = (fs["live"] / ".env").read_text(); cron0 = _digest(fs["cron"])
+    r = _execute(fs, env_extra={"SC_ON_STOP_INJECT_CONTENT": injected})
+    assert r.returncode != 0
+    assert _status(fs) == "STOPPED_BEFORE_MUTATION"       # no file mutation happened
+    assert "turn" in r.stderr.lower() or "quiesce (authoritative post-stop)" in r.stderr
+    # the admitted turn's state is PRESERVED (not lost, not overwritten)
+    assert (fs["live"] / "configs" / "bot-state.json").read_text() == injected
+    assert (fs["live"] / ".env").read_text() == env0 and _digest(fs["cron"]) == cron0
+    # availability restored: old bot started again
+    assert _field(fs, "QUIESCE_RESTORE") == "ok"
+    assert "start claude-telegram-bot" in fs["log"].read_text()
+    assert not (fs["live"] / "scripts" / "claude-telegram-bot.py").exists()
+
+
+def test_quiesce_stop_failure_restores_availability(fs):
+    live0 = _digest(fs["live"])
+    r = _execute(fs, env_extra={"SC_STOP_FAIL": "1"})
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "quiesce" in r.stderr.lower()
+    assert _digest(fs["live"]) == live0                    # live files untouched
+    assert _field(fs, "QUIESCE_RESTORE") == "ok"           # availability restored
+
+
+def test_latest_state_change_preserved_by_rollback(fs):
+    # the bot writes fresh state during shutdown (0 active) -> the backup is the
+    # AUTHORITATIVE post-quiesce state; rollback must restore exactly it
+    latest = '{"sessions": {}, "marker": "LATEST-AT-SHUTDOWN"}'
+    r = _execute(fs, env_extra={"SC_ON_STOP_INJECT_CONTENT": latest,
+                                "DEPLOY_FAIL_AT": "health_check"})
+    assert _status(fs) == "ROLLED_BACK", r.stderr[-1500:]
+    assert (fs["live"] / "configs" / "bot-state.json").read_text() == latest
+
+
+# ═══ Round 6 — Gap 3: rollback uses ORIGINAL listener expectations ══════════
+def test_rollback_listeners_original_bind2_absent(fs):
+    # original env has NO BIND2; forward expects 10.108.0.4 (we write it);
+    # ss offers only the primary endpoint -> forward health fails, rollback
+    # must verify the ORIGINAL endpoints (primary only) and succeed
+    (fs["live"] / ".env").write_text(_ENV_ORIG.replace(
+        "BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4\n", ""))
+    r = _execute(fs, env_extra={"SS_MODE": "nobind2"})
+    assert r.returncode != 0
+    assert "10.108.0.4" in r.stderr                        # forward expectation failed
+    assert _status(fs) == "ROLLED_BACK"                    # original profile passed
+
+
+def test_rollback_listeners_original_different_bind2(fs):
+    (fs["live"] / ".env").write_text(_ENV_ORIG.replace(
+        "BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4", "BOT_NIGHTWATCH_IPC_BIND2=10.99.0.7"))
+    r = _execute(fs, env_extra={"SS_MODE": "nobind2", "SS_EXTRA_ENDPOINT": "10.99.0.7"})
+    assert r.returncode != 0
+    assert "10.108.0.4" in r.stderr                        # forward failed on new BIND2
+    assert _status(fs) == "ROLLED_BACK"                    # original (10.99.0.7) verified
+
+
+def test_rollback_listeners_original_disabled(fs):
+    (fs["live"] / ".env").write_text(
+        _ENV_ORIG + "BOT_NIGHTWATCH_IPC_ENABLED=false\n")
+    # no listeners exist at all; failure comes from stale journal; rollback must
+    # SKIP listener verification because the ORIGINAL config disabled it
+    r = _execute(fs, env_extra={"SS_MODE": "none", "JOURNAL_MODE": "stale"})
+    assert r.returncode != 0
+    assert _status(fs) == "ROLLED_BACK", r.stderr[-1500:]
+
+
+# ═══ Round 6 — hardening: partial write / journal failure / link metadata ═══
+def test_editor_survives_partial_writes(fs, tmp_path):
+    # usercustomize monkeypatches os.write to write at most 3 bytes per call;
+    # the editor's complete-write loop must still produce the exact result
+    hookdir = tmp_path / "hook"; hookdir.mkdir()
+    (hookdir / "usercustomize.py").write_text(
+        "import os\n_real = os.write\n"
+        "os.write = lambda fd, b: _real(fd, bytes(b)[:3])\n")
+    envf = tmp_path / "p.env"
+    envf.write_bytes(b'A=1\r\nBOT_MAX_SESSIONS=6\r\nB="x"\r\n')
+    env = dict(fs["env"]); env["PYTHONPATH"] = str(hookdir)
+    env["DEPLOY_REPORT"] = str(tmp_path / "rep.md")
+    r = subprocess.run(["bash", str(_SCRIPT), "--set-env-key", str(envf),
+                        "BOT_MAX_SESSIONS", "9"],
+                       env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-800:]
+    assert envf.read_bytes() == b'A=1\r\nBOT_MAX_SESSIONS=9\r\nB="x"\r\n'
+
+
+def test_persistent_journal_failure_distinct_fail_closed(fs):
+    r = _execute(fs, env_extra={"JOURNAL_QUERY_FAIL": "1"})
+    assert r.returncode != 0 and _status(fs) == "ROLLED_BACK"
+    assert "journal retrieval persistently failing" in r.stderr
+
+
+def test_restored_symlink_owner_corruption_rollback_failed(fs, tmp_path):
+    outside = tmp_path / "outside.sh"; outside.write_text(_NIGHTLY_OK)
+    fs["nightly"].unlink(); fs["nightly"].symlink_to(outside)
+    # migrate_retention refuses the symlink -> rollback restores the symlink;
+    # the injector then chown -h's it, so link owner/group verification must fail
+    r = _execute(fs, env_extra={
+        "DEPLOY_RB_CORRUPT_CMD": str(fs["binp"] / "rbcorrupt"),
+        "RB_CORRUPT_MODE": "linkowner", "RB_TARGET": str(fs["nightly"]),
+    })
+    assert r.returncode != 0
+    assert _status(fs) == "ROLLBACK_FAILED"
+    assert "symlink owner mismatch" in r.stderr or "symlink group mismatch" in r.stderr

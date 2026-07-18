@@ -27,8 +27,15 @@ Invoke:
 
 ```
 scripts/deploy-phase1-phase2.sh --preflight --merged-sha <40-hex> --source <detached-wt>
-scripts/deploy-phase1-phase2.sh --execute  --reviewed-pr 19 --merged-sha <40-hex> --source <detached-wt>
+scripts/deploy-phase1-phase2.sh --execute --reviewed-pr 19 \
+    --reviewed-head <owner-authorized PR-head 40-hex> \
+    --reviewed-tree <owner-authorized tree 40-hex> \
+    --merged-sha <40-hex> --source <detached-wt>
 ```
+
+The reviewed head/tree come from the owner's review record of PR #19
+(`git rev-parse <reviewed-head>` / `git rev-parse <reviewed-head>^{tree}` at
+review time) — they are the authorization, not something derived at deploy time.
 
 The script performs, in order, exactly:
 
@@ -75,7 +82,28 @@ The script performs, in order, exactly:
 3. **Path resolution** from the validated parse (`BOT_DATA_ROOT`/`BOT_CONFIGS_DIR`/
    `BOT_CHAT_SESSIONS_DIR`/`BOT_COORDINATION_FILE`/`BOT_CHAT_CATALOG_CACHE`),
    contained inside the live root (fail-closed on escape/symlink).
-4. **Execute-only:** require `--reviewed-pr 19`, then the single deploy **flock**.
+4. **Execute-only — reviewed-tree AUTHORIZATION gate (squash/merge-safe):**
+   require `--reviewed-pr 19` **and** the owner-authorized `--reviewed-head` +
+   `--reviewed-tree` (40-hex each). The merged source tree
+   (`git rev-parse <MERGED_SHA>^{tree}`) must equal the reviewed TREE exactly —
+   commit-SHA equality is insufficient under squash merge. If the PR head branch
+   still exists remotely, a read-only `ls-remote` must show it equal to the
+   reviewed head (stale branch fails); if the branch was deleted after merge,
+   the reviewed-tree equality is the decisive immutable gate (documented case).
+   The reviewed head/tree and merged tree are recorded in the transaction
+   report. Then acquire the single deploy **flock**.
+4b. **Quiescence boundary (before ANY file mutation):** re-verify zero
+   running/queued sessions from the STRICT state read (a missing/unreadable/
+   malformed state file or unknown status now fails closed — never "0"), then
+   `systemctl stop` the bot under the already-installed recovery trap, verify
+   the unit is inactive, and re-read the authoritative state — a turn admitted
+   during shutdown aborts before any mutation with its state preserved. Only
+   then is the state backup captured, so rollback can never restore a stale
+   copy over newer session state. The bot is down for the whole mutation
+   window, so no turn can be admitted or execute under mixed code; success
+   performs exactly ONE old→new transition (`start`, not restart); a
+   pre-mutation failure restarts the old bot (availability restore, files
+   untouched); no restart loops.
 5. **Manifest + backup** with full identity per entry — state, type, owner,
    group, mode, and content hash / **full tree manifest** (path+type+bytes+
    symlink target+mode+empty dirs) / link target — for every artifact and the
@@ -102,7 +130,8 @@ The script performs, in order, exactly:
    construction) and probe **read/write/ATOMIC-REPLACE as the service user** in
    the chat-history, coordination, and catalog-cache directories; existing
    mutable files must be service-replaceable.
-10. **Restart exactly once.** Capturing the pre-restart journal cursor is
+10. **Start the new bot exactly once** (the single transition begun by the
+    quiescence stop). Capturing the pre-start journal cursor is
     MANDATORY (empty cursor = pre-restart failure; no stale-journal fallback).
     **Health polls** for a bounded window (60 s production, 2 s interval) and
     reads ONLY `journalctl -u <unit> _PID=<new MainPID> --after-cursor=<cursor>`:
@@ -116,12 +145,15 @@ The script performs, in order, exactly:
     **nonempty** exact `ExecStart`.
 12. Any post-mutation failure → an ordered, **VERIFIED** rollback: stop any newly
     activated timer; restore all entries; **verify every entry** against its
-    recorded type/hash/tree/target/mode/owner/group and every absent-before
-    removal; assert no editor temp files remain; `daemon-reload`; restore the
-    prior timer state; restart the old bot and require it active with a MainPID
-    and exact listeners. All errors accumulate: `ROLLED_BACK` only when every
-    restore and verification passes, otherwise `ROLLBACK_FAILED` (with the
-    failed steps and backup path). The forward exit code is preserved.
+    recorded type/hash/tree/target/mode/owner/group (symlinks: target AND
+    owner/group) and every absent-before removal; assert no editor temp files
+    remain; `daemon-reload`; restore the prior timer state; restart the old bot
+    and require it active with a MainPID and the **ORIGINAL pre-deploy listener
+    endpoints** (an immutable snapshot taken at the single env parse — never the
+    forward values the deploy wrote, including absent/different/disabled BIND2).
+    All errors accumulate: `ROLLED_BACK` only when every restore and
+    verification passes, otherwise `ROLLBACK_FAILED` (with the failed steps and
+    backup path). The forward exit code is preserved.
 
 The remaining sections document acceptance evidence to confirm afterwards.
 
