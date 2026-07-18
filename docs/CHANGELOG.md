@@ -2,6 +2,71 @@
 
 All notable changes to the Shahrzad DevOps Telegram Bot.
 
+## [Unreleased] — 2026-07-17 — Phase 2 architect corrections (PR #19)
+
+Hardening applied after architect review, before merge:
+
+- **Chat history filesystem safety**: history dirs derive from an opaque
+  SHA-256-based key (never raw label/path); canonical containment + `O_NOFOLLOW`
+  reads/writes/purge; migration re-validates a restored `chat_history_ref`;
+  `/kill`, timeout, and duplicate-label replacement purge history; a killed
+  session's late turn can't recreate purged history.
+- **`/model` real catalogs**: every engine renders its own verified adapter
+  catalog (Claude shows Fable 5 / Opus 4.8 / Sonnet 5 / Haiku 4.5 / Default);
+  every button AND free-text choice is validated by the active engine's adapter
+  (cross-engine ids rejected); state saved on model change and on first Codex
+  `thread.started` capture.
+- **Reversible callback codec**: all Phase-2 callbacks use an opaque
+  structured-token registry — arbitrary Unicode / `:` / `|` / `/` / `:free` ids
+  round-trip exactly, 64-byte safe, fail-closed on expiry, re-validated at
+  execution, cross-chat rejected.
+- **Coordination**: `AGENT_COORDINATION.md` write refuses symlink / directory /
+  git-tracked destinations (atomic `O_NOFOLLOW`); truthful lifecycle
+  queued→running→completed/failed/cancelled for BOTH Claude and Codex;
+  session-authorized bounded live-claim helper (`scripts/coord_publish.py`).
+- **Footer**: centralized on `send_message`/`edit_message_text` so every
+  user-visible text gets exactly one footer (uploads/acks/actions excluded);
+  Telegram UTF-16 code-unit limit enforced; footer on the final chunk once.
+- **OpenRouter**: no `Authorization: Bearer None`; model validated against the
+  current/last-known-good catalog before each request; session closed on
+  cancel; history records validated (stored `system` dropped); safe content
+  shapes; unique catalog temp file.
+
+## [Unreleased] — 2026-07-17 — Phase 2: Engines (Claude / Codex / Chat)
+
+Adds a typed engine-adapter layer so a session can run **Claude Code**, **Codex
+CLI**, or a pure **OpenRouter Chat**. All Phase 1 behavior is preserved (Claude
+path unchanged; 152 Phase-1 tests still green). Deployment is gated behind an
+architect review + merged-SHA gate — see `PHASE2_DEPLOY_RUNBOOK.md`.
+
+### Added
+- **Engine abstraction** (`engines/`): registry with exactly `claude`, `codex`,
+  `chat`; each adapter owns catalog, model validation, capabilities, and (code
+  engines) command construction + output parsing. Handlers dispatch through one
+  point (`dispatch_turn`) — no engine conditionals scattered across handlers.
+- **Session schema** (backward-compatible): `engine`, `model`,
+  `provider_session_id` (Codex thread id), `chat_history_ref`. Old sessions
+  migrate to `engine=claude`; Claude UUID/resume + legacy `claude_model` untouched.
+- **Codex adapter**: first turn captures `thread.started` id from `--json` JSONL
+  and resumes it; verified models Sol/Terra/Luna (+5.5/5.4/5.4-mini); same
+  worktree/heavy-cap/tree-kill isolation as Claude; normalized rate-limit/auth/
+  nonzero/timeout/malformed handling; never leaks JSONL/auth.
+- **OpenRouter Chat**: async `aiohttp` client (bounded timeouts, 429/5xx retry
+  honouring `Retry-After`, key redaction), TTL catalog with persistent
+  last-known-good, 10 owner-configured favorites (GLM 5.2 / MiniMax M3 / Qwen +
+  7 alternatives), search; bounded atomic per-session history outside
+  `bot-state.json`; **independent chat concurrency cap** (default 4). No tools,
+  worktree, repo or deploy.
+- **`/new` engine selection** (Claude Code | Codex | Chat); Chat creates under
+  `chat-sessions/<safe-id>` with no worktree/repo/deploy.
+- **Engine-aware `/model`**: renders only the active session's engine catalog,
+  validates + rejects cross-engine ids, per-session persistence.
+- **Shared coordination store** (`coordination.py`): atomic flock-protected
+  central store keyed by canonical repo; renders `AGENT_COORDINATION.md` into
+  each worktree (never committed); startup/shutdown stale reconcile.
+- **Resource footer** (`resource_footer.py`): cached `RAM | Swap | Disk` line on
+  primary agent replies (`/proc`+`statvfs`, 5–10s cache, idempotent, length-safe).
+
 ## [Unreleased] — 2026-07-12 — Phase 1: Stability Foundation
 
 Production remains **Claude-only** after this phase. Codex, OpenRouter Chat mode,

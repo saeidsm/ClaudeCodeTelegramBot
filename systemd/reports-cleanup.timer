@@ -6,9 +6,14 @@ Description=Daily Shahrzad bot report retention cleanup
 Documentation=file:///opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/docs/REPORT_RETENTION_MIGRATION.md
 
 [Timer]
-# Daily, shortly after midnight; catch up if the machine was off (Persistent).
+# Daily, shortly after midnight. Deliberately NON-persistent: a Persistent=true
+# catch-up would fire the (destructive) cleanup service the moment the timer is
+# started — i.e. potentially INSIDE the rollback-capable deployment transaction.
+# With Persistent=false the first execution is the next normal schedule, safely
+# after the deployment has committed. A missed run costs at most one day of
+# retention slack, which the 15-day TTL absorbs.
 OnCalendar=*-*-* 00:20:00
-Persistent=true
+Persistent=false
 RandomizedDelaySec=300
 Unit=reports-cleanup.service
 
