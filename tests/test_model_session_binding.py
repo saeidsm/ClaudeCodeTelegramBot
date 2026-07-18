@@ -157,6 +157,61 @@ async def test_emsearch_killed_session_fails_closed(monkeypatch):
     assert 1 not in bot.CONV_STATE                  # no dangling conv-state
 
 
+# ── same-label / same-engine REPLACEMENT rejection (instance nonce) ─────────
+def _mk_uuid(chat_id, label, engine, uuid, **kw):
+    s = bot.Session(id=f"{chat_id}:{label}", label=label, color_emoji="🔵",
+                    session_uuid=uuid)
+    s.engine = engine
+    for k, v in kw.items():
+        setattr(s, k, v)
+    bot.SM.sessions[s.id] = s
+    return s
+
+
+async def test_emod_rejects_same_label_same_engine_replacement(monkeypatch):
+    # render for the OLD instance
+    old = _mk_uuid(1, "A", "claude", "uuid-OLD", claude_model="x")
+    tok = bot.cb2("emod", 1, session_key=old.id, engine="claude",
+                  uuid="uuid-OLD", model="claude-opus-4-8")
+    # A is killed and recreated with the SAME label + SAME engine (new nonce)
+    new = _mk_uuid(1, "A", "claude", "uuid-NEW", claude_model="keep")
+    q = await _click(tok, 1)
+    assert "replaced by a newer one" in q.message.edits[-1]
+    assert new.claude_model == "keep"           # the replacement is untouched
+
+
+async def test_emsearch_convstate_rejects_replacement(monkeypatch):
+    old = _mk_uuid(1, "A", "chat", "uuid-OLD", model="z-ai/glm-5.2")
+    tok = bot.cb2("emsearch", 1, session_key=old.id, engine="chat", uuid="uuid-OLD")
+    await _click(tok, 1)
+    assert bot.CONV_STATE[1]["uuid"] == "uuid-OLD"
+    # replace the session under the same label/engine, then submit the search text
+    _mk_uuid(1, "A", "chat", "uuid-NEW", model="keep")
+    conv = bot.CONV_STATE[1]
+    target, reason = bot._resolve_rendered_session(1, conv)
+    assert target is None and "replaced by a newer one" in reason
+
+
+async def test_emcustom_convstate_rejects_replacement(monkeypatch):
+    old = _mk_uuid(1, "A", "codex", "uuid-OLD", model="gpt-5.6-sol")
+    tok = bot.cb2("emcustom", 1, session_key=old.id, engine="codex", uuid="uuid-OLD")
+    await _click(tok, 1)
+    conv = bot.CONV_STATE[1]
+    assert conv["uuid"] == "uuid-OLD"
+    _mk_uuid(1, "A", "codex", "uuid-NEW", model="keep")
+    target, reason = bot._resolve_rendered_session(1, conv)
+    assert target is None and "replaced by a newer one" in reason
+
+
+async def test_same_uuid_still_works(monkeypatch):
+    # sanity: matching nonce still permits the change on the same instance
+    s = _mk_uuid(1, "A", "claude", "uuid-SAME", claude_model="")
+    tok = bot.cb2("emod", 1, session_key=s.id, engine="claude",
+                  uuid="uuid-SAME", model="claude-opus-4-8")
+    await _click(tok, 1)
+    assert s.claude_model == "claude-opus-4-8"
+
+
 # ── reserved keys are non-overridable ───────────────────────────────────────
 def test_reserved_keys_cannot_be_overridden():
     # a caller field named cid/k must NOT replace the real binding

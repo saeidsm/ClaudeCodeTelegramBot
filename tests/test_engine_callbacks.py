@@ -116,9 +116,11 @@ async def test_emodset_cross_chat_rejected(monkeypatch, tmp_path):
     bot._apply_engine(s, "chat", "z-ai/glm-5.2")
     bot.SM.sessions[s.id] = s
     # attacker in chat 200 clicks an emodset button referencing 100:c
-    tok = bot.cb2("emodset", 200, session_key="100:c", model="z-ai/glm-5.2")
+    tok = bot.cb2("emodset", 200, session_key="100:c", engine="chat",
+                  uuid="u", model="z-ai/glm-5.2")
     q = await _dispatch(tok, 200)
-    assert "isn't in this chat" in q.message.edits[-1]
+    # rejected (the key does not belong to chat 200) and the target is untouched
+    assert "out of date" in q.message.edits[-1]
     assert s.model == "z-ai/glm-5.2"             # unchanged by the attacker
 
 

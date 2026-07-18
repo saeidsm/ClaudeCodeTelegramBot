@@ -79,8 +79,21 @@ class ChatError(Exception):
 
 
 def _catalog_cache_path() -> str:
-    d = os.environ.get("BOT_CONFIGS_DIR") or os.environ.get("BOT_DATA_ROOT") or "/tmp"
-    return os.path.join(d, "openrouter-catalog.json")
+    """Resolve the OpenRouter catalog cache path.
+
+    Precedence: explicit ``BOT_CHAT_CATALOG_CACHE`` > ``${BOT_CONFIGS_DIR}`` >
+    ``${BOT_DATA_ROOT}/configs`` > ``/tmp/configs``. The default is consistently
+    *under the configs dir* (matching the bot's ``BOT_CONFIGS_DIR`` default of
+    ``$BOT_DATA_ROOT/configs``) so the deploy manifest backs up the exact file the
+    bot actually uses — no more ``BOT_DATA_ROOT/`` vs ``configs/`` mismatch."""
+    explicit = os.environ.get("BOT_CHAT_CATALOG_CACHE")
+    if explicit:
+        return explicit
+    configs = os.environ.get("BOT_CONFIGS_DIR")
+    if not configs:
+        data = os.environ.get("BOT_DATA_ROOT") or "/tmp"
+        configs = os.path.join(data, "configs")
+    return os.path.join(configs, "openrouter-catalog.json")
 
 
 def _model_from_raw(m: dict) -> ModelInfo:

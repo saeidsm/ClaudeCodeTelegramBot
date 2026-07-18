@@ -3231,22 +3231,25 @@ async def cmd_model(u, c):
             if not m.available:
                 continue
             icon = "✅" if cur == m.id else "🔹"
-            # Bind the button to the session the menu is rendered FOR (id+engine),
-            # so switching the active session before a click can't retarget it.
+            # Bind the button to the session the menu is rendered FOR: id + engine
+            # + the immutable per-instance nonce (session_uuid). Switching the
+            # active session — or killing+recreating this same label — before a
+            # click can then never retarget the wrong instance.
             rows.append([InlineKeyboardButton(
                 f"{elabel}: {icon} {m.display()}",
                 callback_data=cb2("emod", cid, session_key=active_session.id,
-                                  engine=active_engine, model=m.id))])
+                                  engine=active_engine, uuid=active_session.session_uuid,
+                                  model=m.id))])
         if active_adapter.caps.is_chat:
             rows.append([InlineKeyboardButton(
                 f"{elabel}: 🔎 Search…" + (" (cached)" if stale else ""),
                 callback_data=cb2("emsearch", cid, session_key=active_session.id,
-                                  engine=active_engine))])
+                                  engine=active_engine, uuid=active_session.session_uuid))])
         else:
             rows.append([InlineKeyboardButton(
                 f"{elabel}: ✏️ Custom model…",
                 callback_data=cb2("emcustom", cid, session_key=active_session.id,
-                                  engine=active_engine))])
+                                  engine=active_engine, uuid=active_session.session_uuid))])
 
     # ── Fallback chain ──
     rows.append([InlineKeyboardButton(
@@ -3524,31 +3527,40 @@ async def error_handler(update, context):
 # ═══════════════════════════════════════════
 #  Handler: Inline Buttons
 # ═══════════════════════════════════════════
-async def _p2_rendered_session(q, cid, p):
-    """Resolve the session a /model menu was rendered FOR — carried in the token
-    as ``session_key`` (+ expected ``engine``) — NOT the current ACTIVE_SESSION.
+def _resolve_rendered_session(cid, p):
+    """Non-async core: resolve the session a /model menu was rendered FOR from the
+    token/conv-state fields (``session_key`` + immutable ``uuid`` nonce + expected
+    ``engine``), NOT the current ACTIVE_SESSION. Returns (session, None) on success
+    or (None, reason) where reason is a short refresh message.
 
-    Fail closed with a refresh hint if the button predates a change: session
-    killed/replaced, migrated to a different engine, or (defence in depth over the
-    central chat gate) a key that isn't in this chat. Returns the Session or None
-    (after sending the refresh message)."""
+    The ``uuid`` (``Session.session_uuid``, freshly minted per instance by
+    SessionManager.create) is what defeats a same-label/same-engine REPLACEMENT: a
+    killed-and-recreated session has a different nonce, so an old button/state is
+    rejected instead of silently retargeting the new session."""
     skey = p.get("session_key", "")
     exp_engine = p.get("engine", "")
-    stale = ("⚠️ This model menu is out of date (the session changed). "
-             "Open /model again for the current session.")
+    exp_uuid = p.get("uuid", "")
     if not skey or not skey.startswith(f"{cid}:"):
-        await q.edit_message_text(stale, parse_mode=ParseMode.HTML)
-        return None
+        return None, ("⚠️ This model menu is out of date (the session changed). "
+                      "Open /model again for the current session.")
     target = SM.sessions.get(skey)
     if target is None:
-        await q.edit_message_text(
-            "⚠️ That session no longer exists. Open /model again.",
-            parse_mode=ParseMode.HTML)
-        return None
+        return None, "⚠️ That session no longer exists. Open /model again."
+    if exp_uuid and target.session_uuid != exp_uuid:
+        # same key can be a different instance (killed + recreated same label)
+        return None, ("⚠️ That session was replaced by a newer one. "
+                      "Open /model again.")
     if exp_engine and target.engine != exp_engine:
-        await q.edit_message_text(
-            "⚠️ That session's engine changed. Open /model again.",
-            parse_mode=ParseMode.HTML)
+        return None, "⚠️ That session's engine changed. Open /model again."
+    return target, None
+
+
+async def _p2_rendered_session(q, cid, p):
+    """Async wrapper: resolve the rendered session or send the refresh hint and
+    return None (fail closed)."""
+    target, reason = _resolve_rendered_session(cid, p)
+    if target is None:
+        await q.edit_message_text(reason, parse_mode=ParseMode.HTML)
         return None
     return target
 
@@ -3742,9 +3754,11 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
             await q.edit_message_text("ℹ️ Model search is for Chat sessions.",
                                       parse_mode=ParseMode.HTML)
             return
-        # Conv-state stays bound to THIS rendered session id; a later active-
-        # session switch cannot retarget the search.
-        CONV_STATE[cid] = {"state": "awaiting_chat_model_change", "session_key": target.id}
+        # Conv-state stays bound to THIS rendered session id + instance nonce; a
+        # later active-session switch OR same-label replacement cannot retarget it.
+        CONV_STATE[cid] = {"state": "awaiting_chat_model_change",
+                           "session_key": target.id, "uuid": target.session_uuid,
+                           "engine": target.engine}
         await q.edit_message_text(
             "🔎 Type part of a model id/name to search OpenRouter "
             "(<code>cancel</code> to abort):", parse_mode=ParseMode.HTML)
@@ -3758,23 +3772,20 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
         adapter = engines.get_adapter(target.engine)
         example = ("sonnet · opus · claude-sonnet-5" if target.engine == engines.ENGINE_CLAUDE
                    else "gpt-5.6-sol · gpt-5.5")
-        CONV_STATE[cid] = {"state": "awaiting_engine_model_input", "session_key": target.id}
+        CONV_STATE[cid] = {"state": "awaiting_engine_model_input",
+                           "session_key": target.id, "uuid": target.session_uuid,
+                           "engine": target.engine}
         await q.edit_message_text(
             f"✏️ Type the {esc(adapter.caps.label)} model for "
             f"<b>{esc(target.label)}</b>.\nExamples: <code>{example}</code>. "
             f"Send <code>cancel</code> to abort.", parse_mode=ParseMode.HTML)
 
     elif kind == "emodset":
-        skey = p.get("session_key", "")
         model_id = p.get("model", "")
-        target = SM.sessions.get(skey)
-        if not target:
-            await q.edit_message_text("Session no longer exists.", parse_mode=ParseMode.HTML)
-            return
-        # Cross-chat guard: the button's session must belong to THIS chat.
-        if not skey.startswith(f"{cid}:"):
-            await q.edit_message_text("⚠️ That session isn't in this chat.",
-                                      parse_mode=ParseMode.HTML)
+        # Same binding as the other /model actions: key + instance nonce + engine
+        # + chat, so a same-label replacement cannot be retargeted by an old pick.
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
             return
         adapter = engines.get_adapter(target.engine)
         if adapter is None or not adapter.validate_model(model_id):
@@ -4585,11 +4596,15 @@ async def on_text(u, c):
             # Custom free-text model for a Claude/Codex session — VALIDATED by
             # the active engine's adapter (rejects cross-engine ids).
             CONV_STATE.pop(cid, None)
-            target_key = conv.get("session_key")
-            target = SM.sessions.get(target_key) if target_key else None
             entry = t.strip()
-            if entry.lower() == "cancel" or not target:
+            if entry.lower() == "cancel":
                 await u.message.reply_text("❌ Cancelled.")
+                return
+            # Revalidate the SAME rendered instance (key + nonce + engine): a
+            # same-label replacement between rendering and submit is refused.
+            target, reason = _resolve_rendered_session(cid, conv)
+            if target is None:
+                await u.message.reply_text(reason, parse_mode=ParseMode.HTML)
                 return
             adapter = engines.get_adapter(target.engine)
             if adapter is None or not adapter.validate_model(entry):
@@ -4613,11 +4628,15 @@ async def on_text(u, c):
             # /model on a Chat session: search → pick to change THIS session's model
             CONV_STATE.pop(cid, None)
             entry = t.strip()
-            skey = conv.get("session_key")
-            target = SM.sessions.get(skey) if skey else None
-            if entry.lower() == "cancel" or not target:
+            if entry.lower() == "cancel":
                 await u.message.reply_text("❌ Cancelled.")
                 return
+            # Revalidate the SAME rendered instance (key + nonce + engine).
+            target, reason = _resolve_rendered_session(cid, conv)
+            if target is None:
+                await u.message.reply_text(reason, parse_mode=ParseMode.HTML)
+                return
+            skey = target.id
             try:
                 results = await CHAT_CATALOG.search(entry, limit=12)
             except Exception:
@@ -4627,7 +4646,9 @@ async def on_text(u, c):
                     f"No models matched <code>{esc(entry)}</code>.", parse_mode=ParseMode.HTML)
                 return
             rows = [[InlineKeyboardButton(f"⭐ {m.display()}",
-                     callback_data=cb2("emodset", cid, session_key=skey, model=m.id))] for m in results]
+                     callback_data=cb2("emodset", cid, session_key=skey,
+                                       uuid=target.session_uuid, engine=target.engine,
+                                       model=m.id))] for m in results]
             await u.message.reply_text(
                 f"🔎 Results for <code>{esc(entry)}</code> — pick one:",
                 parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
@@ -5028,6 +5049,11 @@ async def post_init(app):
     # visible in the journal.
     CONC.init(MAX_RUNNING_AGENTS)
     log.info(f"limits.effective max_sessions={MAX_SESSIONS} max_running_agents={MAX_RUNNING_AGENTS}")
+    # Explicit, machine-readable engine-registration line derived from the ACTUAL
+    # registry — the deploy health gate matches this exact line from the new
+    # process's restart window (see scripts/deploy-phase1-phase2.sh health_check).
+    _eng_names = ",".join(sorted(a.caps.engine for a in engines.all_engines()))
+    log.info(f"engines.registered names={_eng_names}")
     # Restore previous session state before starting handlers
     load_state()
     # Phase 2: reconcile stale coordination entries against restored sessions
