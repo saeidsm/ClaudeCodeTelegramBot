@@ -4,30 +4,66 @@
 # combined Phase-1 + Phase-2 bot deployment. It IS the runbook
 # (docs/PHASE2_DEPLOY_RUNBOOK.md) in executable form.
 #
-# Read-only by default. Mutation is gated behind the reviewed PR + merged SHA and
-# an explicit --execute, runs under one flock from an immutable DETACHED source at
-# the merged SHA, records a full PRESENT_BEFORE manifest, edits .env only through a
-# binary-safe byte-preserving allow-list, migrates all three retention mechanisms,
-# installs from source, verifies, restarts EXACTLY once, activates the retention
-# timer only at the final commit boundary, and on any post-mutation failure a trap
-# performs an ordered, VERIFIED rollback. Terminal status is exactly one of:
+# Round-5 production-safety contract:
+#   * .env is parsed ONCE, non-executingly, into /tmp scratch state; any parser/
+#     read/syntax/duplicate-key failure stops before mutation (no || true).
+#   * Production thresholds (disk/RAM/swap) are HARD-CODED; DEPLOY_MIN_* and all
+#     other seams are refused outside the --test-root harness. The cgroup/OOM
+#     gate fails closed when the cgroup path or memory.events is unreadable.
+#   * The systemd service user must EXIST (no UID-0 fallback); root probes run
+#     directly, non-root probes require proven noninteractive sudo. Claude/Codex
+#     capability checks validate CONTENT contracts (catalog ids, logged-in,
+#     Sol/Terra/Luna, --json, resume-by-session-id), not just exit status.
+#   * Listener readiness verifies the EXACT expected bind:port endpoints (no
+#     wildcard/wrong-IP/unrelated-process), binds evidence to the service PID
+#     where the platform reports it, and performs the bot's /healthz contract.
+#     The OpenRouter probe requires HTTP 200 + a minimally valid catalog payload
+#     and never prints the key/headers/bodies.
+#   * Installed-tree integrity uses a full manifest (path+type+bytes+symlink
+#     target+mode bits+empty dirs); escaping symlinks are rejected.
+#   * Atomic editors create unpredictable O_CREAT|O_EXCL|O_NOFOLLOW temp files,
+#     preserve owner/group/mode or fail, fsync file+dir, refuse symlinked
+#     targets and duplicate (incl. `export KEY=`) safety-critical keys.
+#   * The retention service unit is RENDERED to the resolved config/script/guard
+#     paths and verified (incl. script hash) before activation; the timer is
+#     non-persistent so no catch-up can fire real cleanup inside the
+#     transaction; activation happens only at the final commit boundary.
+#   * Health is new-PID-only: a mandatory pre-restart journal cursor, bounded
+#     startup polling, journal evidence filtered by _PID=<new MainPID>, exact
+#     engine set, exact listeners; observation retains the same PID.
+#   * Rollback VERIFIES every restore (type/hash/tree/target/mode/owner/group)
+#     and old-bot health; any failure yields ROLLBACK_FAILED, never a false
+#     ROLLED_BACK. The forward failure exit code is preserved.
+#
+# Terminal status (exactly one):
 #   DEPLOYED | ROLLED_BACK | ROLLBACK_FAILED | STOPPED_BEFORE_MUTATION
 #
-# Preflight writes ONLY under /tmp: it never mutates Git metadata (read-only
-# ls-remote, GIT_OPTIONAL_LOCKS=0), takes no lock, and leaves no source caches.
+# Usage:
+#   deploy-phase1-phase2.sh --preflight --merged-sha <40-hex> --source <detached-wt>
+#   deploy-phase1-phase2.sh --execute  --reviewed-pr 19 --merged-sha <40-hex> --source <detached-wt>
+#   deploy-phase1-phase2.sh --tree-manifest <dir>       # print tree manifest (test/verify utility)
 #
-# Test seams (honoured ONLY with a --test-root beneath /tmp; a production run — no
-# --test-root — refuses if ANY is set): GIT SYSTEMCTL JOURNALCTL DEPLOY_CRON_DIR
-# DEPLOY_SYSTEMD_DIR DEPLOY_BACKUP_ROOT DEPLOY_LOCK DEPLOY_PYTHON DEPLOY_PYTEST
-# DEPLOY_STATE_FILE DEPLOY_NIGHTLY_CLEANUP DEPLOY_CLAUDE_CMD DEPLOY_CODEX_CMD
-# DEPLOY_LISTENER_CMD DEPLOY_CAPACITY_CMD DEPLOY_OPENROUTER_CMD DEPLOY_CGROUP_BASE
-# DEPLOY_SERVICE_USER DEPLOY_OBSERVE_SECONDS DEPLOY_FAIL_AT DEPLOY_EXPECTED_TESTS.
+# Test seams (honoured ONLY with --test-root beneath /tmp; production refuses
+# every one): GIT SYSTEMCTL JOURNALCTL DEPLOY_CRON_DIR DEPLOY_SYSTEMD_DIR
+# DEPLOY_BACKUP_ROOT DEPLOY_LOCK DEPLOY_PYTHON DEPLOY_PYTEST DEPLOY_STATE_FILE
+# DEPLOY_NIGHTLY_CLEANUP DEPLOY_CLAUDE_CMD DEPLOY_CODEX_CMD DEPLOY_LISTENER_CMD
+# DEPLOY_CAPACITY_CMD DEPLOY_OPENROUTER_CMD DEPLOY_CGROUP_BASE DEPLOY_SERVICE_USER
+# DEPLOY_OBSERVE_SECONDS DEPLOY_FAIL_AT DEPLOY_EXPECTED_TESTS DEPLOY_MIN_DISK_MB
+# DEPLOY_MIN_RAM_MB DEPLOY_MIN_SWAP_MB DEPLOY_HEALTH_DEADLINE DEPLOY_HEALTH_POLL
+# DEPLOY_RB_CORRUPT_CMD.
 set -euo pipefail
 
 PROD_ROOT="/opt/shahrzad-devops"
 SERVICE="claude-telegram-bot"
+# HARD-CODED production minima — not overridable outside the test harness.
+PROD_MIN_DISK_MB=500
+PROD_MIN_RAM_MB=150
+PROD_MIN_SWAP_MB=64
+PROD_HEALTH_DEADLINE=60          # seconds of bounded startup polling
+PROD_HEALTH_POLL=2               # seconds between polls
+PROD_OBSERVE_SECONDS=90
 
-MODE="preflight"; REVIEWED_PR=""; MERGED_SHA=""; TEST_ROOT=""
+MODE="preflight"; REVIEWED_PR=""; MERGED_SHA=""; TEST_ROOT=""; TREE_DIR=""
 SOURCE="${DEPLOY_SOURCE:-}"
 
 ALLOWLIST=" BOT_MAX_SESSIONS BOT_MAX_RUNNING_AGENTS BOT_NIGHTWATCH_IPC_BIND2 \
@@ -35,12 +71,17 @@ BOT_CHAT_SESSIONS_DIR BOT_COORDINATION_FILE BOT_CHAT_CATALOG_TTL \
 BOT_CHAT_CONCURRENCY BOT_CHAT_HISTORY_MAX_TURNS BOT_CHAT_HISTORY_MAX_CHARS \
 BOT_CODEX_DEFAULT_MODEL BOT_CODEX_SANDBOX BOT_CLAUDE_MODELS BOT_CODEX_MODELS \
 BOT_REPORT_RETENTION_DAYS BOT_COORD_PUBLISHER BOT_CHAT_CATALOG_CACHE "
+# Safety-critical keys for duplicate detection = allow-list + path/identity keys.
+CRITICAL_KEYS="$ALLOWLIST OPENROUTER_API_KEY TELEGRAM_BOT_TOKEN BOT_DATA_ROOT \
+BOT_CONFIGS_DIR BOT_NIGHTWATCH_IPC_PORT BOT_NIGHTWATCH_IPC_BIND BOT_NIGHTWATCH_IPC_ENABLED"
 
 TEST_SEAM_VARS="GIT SYSTEMCTL JOURNALCTL DEPLOY_CRON_DIR DEPLOY_SYSTEMD_DIR \
 DEPLOY_BACKUP_ROOT DEPLOY_LOCK DEPLOY_PYTHON DEPLOY_PYTEST DEPLOY_STATE_FILE \
 DEPLOY_NIGHTLY_CLEANUP DEPLOY_CLAUDE_CMD DEPLOY_CODEX_CMD DEPLOY_LISTENER_CMD \
 DEPLOY_CAPACITY_CMD DEPLOY_OPENROUTER_CMD DEPLOY_CGROUP_BASE DEPLOY_SERVICE_USER \
-DEPLOY_OBSERVE_SECONDS DEPLOY_FAIL_AT DEPLOY_EXPECTED_TESTS"
+DEPLOY_OBSERVE_SECONDS DEPLOY_FAIL_AT DEPLOY_EXPECTED_TESTS DEPLOY_MIN_DISK_MB \
+DEPLOY_MIN_RAM_MB DEPLOY_MIN_SWAP_MB DEPLOY_HEALTH_DEADLINE DEPLOY_HEALTH_POLL \
+DEPLOY_RB_CORRUPT_CMD"
 
 log()  { echo "[deploy] $*" >&2; }
 die()  { echo "[deploy] NO-GO: $*" >&2; exit 3; }
@@ -50,6 +91,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --preflight|--dry-run) MODE="preflight" ;;
     --execute)             MODE="execute" ;;
+    --tree-manifest) MODE="tree"; TREE_DIR="${2:-}"; shift ;;
     --reviewed-pr) REVIEWED_PR="${2:-}"; shift ;;
     --merged-sha)  MERGED_SHA="${2:-}"; shift ;;
     --source)      SOURCE="${2:-}"; shift ;;
@@ -59,6 +101,62 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# ── tree manifest (utility + install/rollback verification core) ────────────
+PYTHON="${DEPLOY_PYTHON:-python3}"
+tree_manifest() {   # tree_manifest <dir>  -> deterministic manifest on stdout
+  "$PYTHON" - "$1" <<'PY'
+import hashlib, os, stat, sys
+root = sys.argv[1]
+if not os.path.isdir(root):
+    sys.exit(f"not a directory: {root}")
+rows = []
+for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    dirnames.sort(); filenames.sort()
+    rel = os.path.relpath(dirpath, root)
+    if rel != ".":
+        st = os.lstat(dirpath)
+        rows.append(("d", rel, oct(stat.S_IMODE(st.st_mode)), "-"))
+    for n in filenames + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+        p = os.path.join(dirpath, n)
+        r = os.path.relpath(p, root)
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            rows.append(("l", r, oct(stat.S_IMODE(st.st_mode)), os.readlink(p)))
+        elif stat.S_ISREG(st.st_mode):
+            h = hashlib.sha256()
+            with open(p, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            rows.append(("f", r, oct(stat.S_IMODE(st.st_mode)), h.hexdigest()))
+        else:
+            rows.append(("?", r, oct(stat.S_IMODE(st.st_mode)), "special"))
+rows.sort(key=lambda t: (t[1], t[0]))
+for t, r, m, x in rows:
+    print(f"{t}\t{r}\t{m}\t{x}")
+PY
+}
+tree_hash() { tree_manifest "$1" | sha256sum | awk '{print $1}'; }
+tree_symlinks_safe() {   # fail if any symlink target escapes the tree
+  "$PYTHON" - "$1" <<'PY'
+import os, sys
+root = os.path.realpath(sys.argv[1])
+for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+    for n in dirnames + filenames:
+        p = os.path.join(dirpath, n)
+        if os.path.islink(p):
+            tgt = os.path.realpath(p)
+            if not (tgt + os.sep).startswith(root + os.sep) and tgt != root:
+                sys.exit(f"escaping symlink: {p} -> {os.readlink(p)}")
+PY
+}
+
+if [ "$MODE" = "tree" ]; then
+  [ -n "$TREE_DIR" ] || die "--tree-manifest requires a directory"
+  tree_manifest "$TREE_DIR"
+  exit 0
+fi
+
+# ── resolve live root; production refuses ALL test seams ────────────────────
 if [ -n "$TEST_ROOT" ]; then
   case "$(readlink -f "$TEST_ROOT" 2>/dev/null || echo "$TEST_ROOT")" in
     /tmp/*) : ;; *) die "--test-root must resolve under /tmp";;
@@ -74,81 +172,118 @@ fi
 LIVE_SCRIPTS="$LIVE_ROOT/scripts"
 LIVE_ENGINES="$LIVE_SCRIPTS/engines"
 ENV_FILE="$LIVE_ROOT/.env"
-CONFIGS="$LIVE_ROOT/configs"          # hardcoded default; overridable resolved paths validated to stay inside LIVE_ROOT
+CONFIGS="$LIVE_ROOT/configs"
 CRON_DIR="${DEPLOY_CRON_DIR:-/etc/cron.d}"
 SYSTEMD_DIR="${DEPLOY_SYSTEMD_DIR:-/etc/systemd/system}"
 NIGHTLY="${DEPLOY_NIGHTLY_CLEANUP:-$LIVE_SCRIPTS/nightly-cleanup.sh}"
 BACKUP_ROOT="${DEPLOY_BACKUP_ROOT:-$LIVE_ROOT/backups}"
 LOCK="${DEPLOY_LOCK:-$LIVE_ROOT/.deploy.lock}"
-PYTHON="${DEPLOY_PYTHON:-python3}"
 GITCMD="${GIT:-git}"
 SYSTEMCTL="${SYSTEMCTL:-systemctl}"
 JOURNALCTL="${JOURNALCTL:-journalctl}"
 CGROUP_BASE="${DEPLOY_CGROUP_BASE:-/sys/fs/cgroup}"
 REPORT="${DEPLOY_REPORT:-/tmp/phase12-deploy-report.md}"
-OBSERVE="${DEPLOY_OBSERVE_SECONDS:-90}"
 EXPECTED_TESTS="${DEPLOY_EXPECTED_TESTS:-}"
 SERVICE_USER="${DEPLOY_SERVICE_USER:-}"
-MIN_DISK_MB="${DEPLOY_MIN_DISK_MB:-500}"
-MIN_RAM_MB="${DEPLOY_MIN_RAM_MB:-150}"
+
+# Thresholds: hard-coded in production; overridable ONLY inside the test harness.
+if [ -n "$TEST_ROOT" ]; then
+  MIN_DISK_MB="${DEPLOY_MIN_DISK_MB:-$PROD_MIN_DISK_MB}"
+  MIN_RAM_MB="${DEPLOY_MIN_RAM_MB:-$PROD_MIN_RAM_MB}"
+  MIN_SWAP_MB="${DEPLOY_MIN_SWAP_MB:-$PROD_MIN_SWAP_MB}"
+  HEALTH_DEADLINE="${DEPLOY_HEALTH_DEADLINE:-$PROD_HEALTH_DEADLINE}"
+  HEALTH_POLL="${DEPLOY_HEALTH_POLL:-$PROD_HEALTH_POLL}"
+  OBSERVE="${DEPLOY_OBSERVE_SECONDS:-$PROD_OBSERVE_SECONDS}"
+else
+  MIN_DISK_MB=$PROD_MIN_DISK_MB
+  MIN_RAM_MB=$PROD_MIN_RAM_MB
+  MIN_SWAP_MB=$PROD_MIN_SWAP_MB
+  HEALTH_DEADLINE=$PROD_HEALTH_DEADLINE
+  HEALTH_POLL=$PROD_HEALTH_POLL
+  OBSERVE=$PROD_OBSERVE_SECONDS
+fi
 
 case "$REPORT" in /tmp/*) : ;; *) [ -n "$TEST_ROOT" ] || die "report must be under /tmp";; esac
 [ -n "$SOURCE" ] || SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 [ -d "$SOURCE" ] || die "source dir not found: $SOURCE"
 
-# Scratch strictly under /tmp — never the source/live tree.
 SCRATCH="$(mktemp -d /tmp/deploy-scratch.XXXXXX)"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPYCACHEPREFIX="$SCRATCH/pycache"
-export GIT_OPTIONAL_LOCKS=0            # git status must never write the index during preflight
+export GIT_OPTIONAL_LOCKS=0
 
 STATUS="STOPPED_BEFORE_MUTATION"
 ARMED=0; RESTARTED_FWD=0; TIMER_ACTIVATED=0
 MANIFEST=""; BACKUP=""; OLD_PID=""; NEW_PID=""; RESTART_CURSOR=""
 TIMER_WAS_ENABLED=""; TIMER_WAS_ACTIVE=""
 ROLLBACK_ERRORS=""
-
-# Resolved (env-aware) paths — filled by resolve_paths().
+SVC_UID=""; SVC_GID=""
 R_STATE=""; R_CHAT=""; R_COORD=""; R_COORDLOCK=""; R_CACHE=""; R_TOKEN=""; R_RETENTION_ENV=""
+NW_ENABLED=""; NW_BIND=""; NW_BIND2=""; NW_PORT=""
 
 sha() { [ -f "$1" ] && sha256sum "$1" | awk '{print $1}' || echo "-"; }
-# deterministic recursive tree hash (path+content), order-independent
-tree_hash() {
-  [ -d "$1" ] || { echo "-"; return; }
-  ( cd "$1" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum 2>/dev/null ) \
-    | sha256sum | awk '{print $1}'
-}
 
-# ── non-executing .env parse (dotenv_values) ────────────────────────────────
-env_get() {   # env_get KEY  -> prints value (empty if unset); never source/eval
-  [ -f "$ENV_FILE" ] || return 0
-  "$PYTHON" - "$ENV_FILE" "$1" <<'PY' 2>/dev/null || true
-import sys
-from dotenv import dotenv_values
-v=dotenv_values(sys.argv[1]).get(sys.argv[2])
-sys.stdout.write(v if v else "")
+# ── ONE fail-closed, non-executing .env parse into /tmp scratch ─────────────
+ENV_TSV="$SCRATCH/env.tsv"
+parse_env_once() {
+  [ -f "$ENV_FILE" ] || die ".env missing: $ENV_FILE"
+  [ -L "$ENV_FILE" ] && die ".env is a symlink (ambiguous): $ENV_FILE"
+  # single python pass: dotenv import, readability, strict syntax, duplicate
+  # detection (export KEY= and KEY= are the SAME key), base64-encoded output.
+  "$PYTHON" - "$ENV_FILE" "$ENV_TSV" "$CRITICAL_KEYS" <<'PY' || die "env parse failed (fail-closed; see reason above)"
+import base64, re, sys
+path, out, crit_raw = sys.argv[1], sys.argv[2], sys.argv[3]
+critical = set(crit_raw.split())
+try:
+    from dotenv import dotenv_values
+except Exception as e:
+    sys.exit(f"python-dotenv parser unavailable: {e}")
+try:
+    raw = open(path, "rb").read()
+except OSError as e:
+    sys.exit(f".env unreadable: {e}")
+text = raw.decode("utf-8", errors="strict") if True else ""
+line_re = re.compile(r"^\s*(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\s*=")
+seen = {}
+for i, line in enumerate(text.splitlines(), 1):
+    s = line.strip()
+    if not s or s.startswith("#"):
+        continue
+    if not line_re.match(line):
+        sys.exit(f".env syntax error at line {i}: {s[:60]!r}")
+    key = re.sub(r"^\s*(?:export[ \t]+)?", "", line).split("=", 1)[0].strip()
+    if key in critical:
+        seen.setdefault(key, []).append(i)
+for key, lines in seen.items():
+    if len(lines) > 1:
+        sys.exit(f"duplicate safety-critical key {key} at lines {lines} (export/plain count as the same key)")
+vals = dotenv_values(path)
+with open(out, "w", encoding="utf-8") as f:
+    for k, v in vals.items():
+        if v is None:
+            v = ""
+        f.write(f"{k}\t{base64.b64encode(v.encode()).decode()}\n")
 PY
+  [ -s "$ENV_TSV" ] || [ -f "$ENV_TSV" ] || die "env scratch state missing after parse"
+  log "env parsed once into scratch (fail-closed): $ENV_TSV"
 }
 
-# validate a resolved path is inside an allowed root and not a symlink-escape
-inside_root() {   # inside_root <path> <root>
+env_get() {   # env_get KEY -> value from the ONE validated parse (no re-parsing)
+  [ -f "$ENV_TSV" ] || die "internal: env_get before parse_env_once"
+  local line
+  line="$(grep -m1 "^${1}$(printf '\t')" "$ENV_TSV" || true)"
+  [ -n "$line" ] || { printf ''; return 0; }
+  printf '%s' "$line" | cut -f2 | base64 -d
+}
+
+inside_root() {
   local p r
-  p="$($PYTHON - "$1" <<'PY'
-import os,sys
-print(os.path.realpath(os.path.dirname(sys.argv[1])))
-PY
-)"
-  r="$($PYTHON - "$2" <<'PY'
-import os,sys
-print(os.path.realpath(sys.argv[1]))
-PY
-)"
+  p="$("$PYTHON" -c 'import os,sys; print(os.path.realpath(os.path.dirname(sys.argv[1])))' "$1")"
+  r="$("$PYTHON" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$2")"
   case "$p/" in "$r/"*) return 0;; *) return 1;; esac
 }
 
 resolve_paths() {
-  # Resolve the EXACT paths the running/old bot uses, from the non-executed live
-  # env (defaults mirror bot.py). Everything must stay inside LIVE_ROOT.
   local data configs chat coord cache
   data="$(env_get BOT_DATA_ROOT)";    data="${data:-$LIVE_ROOT}"
   configs="$(env_get BOT_CONFIGS_DIR)"; configs="${configs:-$data/configs}"
@@ -160,16 +295,21 @@ resolve_paths() {
   R_CACHE="$cache"; R_TOKEN="$configs/reports-token.env"
   R_RETENTION_ENV="$configs/reports-cleanup.env"
   CONFIGS="$configs"
-  # containment: every resolved path must be inside LIVE_ROOT (fail closed)
   local p
   for p in "$R_STATE" "$R_CHAT" "$R_COORD" "$R_COORDLOCK" "$R_CACHE" "$R_TOKEN" "$R_RETENTION_ENV"; do
     inside_root "$p" "$LIVE_ROOT" || die "resolved path escapes live root: $p"
     [ -L "$p" ] && die "resolved path is a symlink (ambiguous): $p"
   done
-  log "resolved live paths: state=$R_STATE chat=$R_CHAT coord=$R_COORD cache=$R_CACHE configs=$CONFIGS"
+  # listener expectation from the SAME validated parse
+  NW_ENABLED="$(env_get BOT_NIGHTWATCH_IPC_ENABLED)"; NW_ENABLED="${NW_ENABLED:-true}"
+  NW_BIND="$(env_get BOT_NIGHTWATCH_IPC_BIND)"; NW_BIND="${NW_BIND:-127.0.0.1}"
+  NW_BIND2="$(env_get BOT_NIGHTWATCH_IPC_BIND2)"
+  NW_PORT="$(env_get BOT_NIGHTWATCH_IPC_PORT)"; NW_PORT="${NW_PORT:-9091}"
+  echo "$NW_PORT" | grep -Eq '^[0-9]+$' || die "invalid BOT_NIGHTWATCH_IPC_PORT: $NW_PORT"
+  log "resolved: state=$R_STATE chat=$R_CHAT coord=$R_COORD cache=$R_CACHE configs=$CONFIGS nw=$NW_ENABLED@$NW_BIND${NW_BIND2:+,+$NW_BIND2}:$NW_PORT"
 }
 
-# ── artifact table: "<abs dest>|<abs source>|<'file'|'dir'>" ────────────────
+# ── artifact table ──────────────────────────────────────────────────────────
 artifacts() {
   echo "$LIVE_SCRIPTS/claude-telegram-bot.py|$SOURCE/bot.py|file"
   echo "$LIVE_SCRIPTS/coordination.py|$SOURCE/coordination.py|file"
@@ -179,25 +319,24 @@ artifacts() {
   echo "$LIVE_ENGINES|$SOURCE/engines|dir"
   echo "$LIVE_SCRIPTS/video_module|$SOURCE/video_module|dir"
   echo "$LIVE_SCRIPTS/cleanup-reports.sh|$SOURCE/scripts/cleanup-reports.sh|file"
-  echo "$SYSTEMD_DIR/reports-cleanup.service|$SOURCE/systemd/reports-cleanup.service|file"
+  echo "$SYSTEMD_DIR/reports-cleanup.service|$SOURCE/systemd/reports-cleanup.service|render"
   echo "$SYSTEMD_DIR/reports-cleanup.timer|$SOURCE/systemd/reports-cleanup.timer|file"
 }
-backup_only() {   # live data/config the bot ACTUALLY uses (resolved) + retention files
+backup_only() {
   echo "$ENV_FILE"; echo "$R_STATE"; echo "$R_COORD"; echo "$R_COORDLOCK"
   echo "$R_CACHE"; echo "$R_CHAT"; echo "$R_RETENTION_ENV"
   echo "$CRON_DIR/cleanup-reports"; echo "$CRON_DIR/nightwatch-reports-cleanup"; echo "$NIGHTLY"
 }
 
-# ── manifest / backup (state,type,owner,group,mode,hash) ────────────────────
+# ── manifest (state,type,owner,group,mode,hash|tree|target) + backup ────────
 record() {
   local p="$1" key state typ owner group mode hash
   key="$(printf '%s' "$p" | sha256sum | awk '{print $1}')"
   if [ -e "$p" ] || [ -L "$p" ]; then
     state="present"
-    if   [ -L "$p" ]; then typ="link"
-    elif [ -d "$p" ]; then typ="dir"; hash="$(tree_hash "$p")"
+    if   [ -L "$p" ]; then typ="link"; hash="$(readlink "$p")"
+    elif [ -d "$p" ]; then typ="dir";  hash="$(tree_hash "$p")"
     else typ="file"; hash="$(sha "$p")"; fi
-    [ -d "$p" ] || [ "${hash:-}" ] || hash="-"
     owner="$(stat -c '%u' "$p" 2>/dev/null || echo -)"
     group="$(stat -c '%g' "$p" 2>/dev/null || echo -)"
     mode="$(stat -c '%a' "$p" 2>/dev/null || echo -)"
@@ -226,13 +365,37 @@ build_manifest() {
 
 rb_err() { ROLLBACK_ERRORS="${ROLLBACK_ERRORS}${ROLLBACK_ERRORS:+; }$1"; log "rollback-error: $1"; }
 
+verify_manifest_entry() {   # after restore: prove the entry matches its record
+  local state="$1" typ="$2" owner="$3" group="$4" mode="$5" hash="$6" path="$7"
+  if [ "$state" = "absent" ]; then
+    { [ -e "$path" ] || [ -L "$path" ]; } && rb_err "absent-before still exists: $path"
+    return 0
+  fi
+  if [ -L "$path" ]; then
+    [ "$typ" = "link" ] || { rb_err "type mismatch (now link): $path"; return 0; }
+    [ "$(readlink "$path")" = "$hash" ] || rb_err "symlink target mismatch: $path"
+    return 0
+  fi
+  [ -e "$path" ] || { rb_err "present-before missing after restore: $path"; return 0; }
+  local t
+  if [ -d "$path" ]; then t="dir"; elif [ -f "$path" ]; then t="file"; else t="?"; fi
+  [ "$t" = "$typ" ] || { rb_err "type mismatch: $path ($typ -> $t)"; return 0; }
+  case "$typ" in
+    file) [ "$(sha "$path")" = "$hash" ] || rb_err "content mismatch after restore: $path";;
+    dir)  [ "$(tree_hash "$path")" = "$hash" ] || rb_err "tree mismatch after restore: $path";;
+  esac
+  [ "$(stat -c '%a' "$path")" = "$mode" ]  || rb_err "mode mismatch after restore: $path"
+  [ "$(stat -c '%u' "$path")" = "$owner" ] || rb_err "owner mismatch after restore: $path"
+  [ "$(stat -c '%g' "$path")" = "$group" ] || rb_err "group mismatch after restore: $path"
+}
+
 rollback() {
   log "ROLLING BACK from $MANIFEST"
-  # 1) stop any newly-activated timer FIRST so no cleanup can run mid-restore
+  # 1) stop any newly-activated timer FIRST (no cleanup can run mid-restore)
   if [ "$TIMER_ACTIVATED" -eq 1 ]; then
     $SYSTEMCTL stop reports-cleanup.timer >/dev/null 2>&1 || rb_err "stop new timer"
   fi
-  # 2) restore files/content/metadata; remove absent-before
+  # 2) restore every entry; remove absent-before
   local state typ owner group mode hash key path
   while IFS=$'\t' read -r state typ owner group mode hash key path; do
     [ -n "$path" ] || continue
@@ -243,7 +406,20 @@ rollback() {
       rm -rf -- "$path" || rb_err "remove absent-before $path"
     fi
   done < "$MANIFEST"
-  # 3) daemon-reload, then restore prior timer enabled/active in order
+  # 2b) test-only corruption injection point (verifies the verification)
+  if [ -n "$TEST_ROOT" ] && [ -n "${DEPLOY_RB_CORRUPT_CMD:-}" ]; then
+    "$DEPLOY_RB_CORRUPT_CMD" || rb_err "rb-corrupt-cmd failed"
+  fi
+  # 3) VERIFY every entry against its recorded type/hash/target/mode/owner/group
+  while IFS=$'\t' read -r state typ owner group mode hash key path; do
+    [ -n "$path" ] || continue
+    verify_manifest_entry "$state" "$typ" "$owner" "$group" "$mode" "$hash" "$path"
+  done < "$MANIFEST"
+  # 3b) no editor temp files / partial artifacts may remain
+  if find "$LIVE_ROOT" "$(dirname "$NIGHTLY")" -maxdepth 3 -name '.*.deploytmp' 2>/dev/null | grep -q .; then
+    rb_err "editor temp files left behind"
+  fi
+  # 4) daemon-reload, restore prior timer state in order
   $SYSTEMCTL daemon-reload >/dev/null 2>&1 || rb_err "daemon-reload"
   if [ "$TIMER_WAS_ENABLED" = "enabled" ]; then
     $SYSTEMCTL enable reports-cleanup.timer >/dev/null 2>&1 || rb_err "re-enable timer"
@@ -255,10 +431,13 @@ rollback() {
   else
     $SYSTEMCTL stop reports-cleanup.timer >/dev/null 2>&1 || rb_err "re-stop timer"
   fi
-  # 4) restart the OLD bot and VERIFY it came back
+  # 5) restart the OLD bot and verify it is genuinely back
   $SYSTEMCTL restart "$SERVICE" >/dev/null 2>&1 || rb_err "restart old bot"
   $SYSTEMCTL is-active --quiet "$SERVICE" || rb_err "old bot not active after restore"
-  check_listeners || rb_err "listeners unhealthy after restore"
+  local rbpid
+  rbpid="$($SYSTEMCTL show "$SERVICE" -p MainPID --value 2>/dev/null || echo '')"
+  [ -n "$rbpid" ] && [ "$rbpid" != "0" ] || rb_err "old bot has no MainPID after restore"
+  check_listeners "$rbpid" || rb_err "listeners unhealthy after restore"
 }
 
 on_exit() {
@@ -287,7 +466,6 @@ on_exit() {
   } > "$REPORT"
   rm -rf -- "$SCRATCH" 2>/dev/null || true
   log "STATUS=$STATUS forward_rc=$rc report=$REPORT"
-  # preserve the original forward failure exit code
   exit "$rc"
 }
 trap on_exit EXIT
@@ -297,7 +475,6 @@ date +%Y%m%d-%H%M%S > "$SCRATCH/stamp"
 gate_source() {
   fail_at gate_source && die "forced: gate_source"
   echo "$MERGED_SHA" | grep -Eq '^[0-9a-f]{40}$' || die "merged SHA must be 40 hex"
-  # DETACHED (no branch), fully clean; GIT_OPTIONAL_LOCKS=0 keeps status read-only
   if $GITCMD -C "$SOURCE" symbolic-ref -q HEAD >/dev/null 2>&1; then
     die "source is on a branch; a detached worktree at the merged SHA is required"
   fi
@@ -306,7 +483,6 @@ gate_source() {
   local head remote
   head="$($GITCMD -C "$SOURCE" rev-parse HEAD 2>/dev/null || echo x)"
   [ "$head" = "$MERGED_SHA" ] || die "source HEAD ($head) != merged SHA"
-  # READ-ONLY fresh remote check — ls-remote never updates local refs/objects
   remote="$($GITCMD -C "$SOURCE" ls-remote origin refs/heads/main 2>/dev/null | awk 'NR==1{print $1}')"
   [ -n "$remote" ] || die "git ls-remote origin refs/heads/main failed/empty (fail-closed)"
   [ "$remote" = "$MERGED_SHA" ] || die "origin/main ($remote) != merged SHA (not merged?)"
@@ -342,59 +518,137 @@ print(sum(1 for s in vals if isinstance(s,dict) and s.get("status") in ("running
 PY
 }
 
-# built-in production gates (each replaceable by a seam ONLY under --test-root;
-# the built-in itself uses PATH tools that tests shadow via PATH)
+# ── capacity: disk + RAM + swap + MANDATORY cgroup/OOM (fail closed) ────────
 check_capacity() {
   if [ -n "${DEPLOY_CAPACITY_CMD:-}" ]; then "$DEPLOY_CAPACITY_CMD"; return $?; fi
-  local avail_kb ram_kb cg oom
+  local avail_kb ram_kb swap_kb cg evfile oom
   avail_kb="$(df -Pk "$LIVE_ROOT" 2>/dev/null | awk 'NR==2{print $4}')"
   [ "${avail_kb:-0}" -ge $((MIN_DISK_MB*1024)) ] || { log "disk low: ${avail_kb:-0}KB < ${MIN_DISK_MB}MB"; return 1; }
   ram_kb="$(free -k 2>/dev/null | awk '/^Mem:/{print $7}')"
-  [ "${ram_kb:-0}" -ge $((MIN_RAM_MB*1024)) ] || { log "available RAM low"; return 1; }
+  [ "${ram_kb:-0}" -ge $((MIN_RAM_MB*1024)) ] || { log "available RAM low: ${ram_kb:-0}KB < ${MIN_RAM_MB}MB"; return 1; }
+  swap_kb="$(free -k 2>/dev/null | awk '/^Swap:/{print $4}')"
+  [ "${swap_kb:-0}" -ge $((MIN_SWAP_MB*1024)) ] || { log "free swap low: ${swap_kb:-0}KB < ${MIN_SWAP_MB}MB"; return 1; }
+  # cgroup gate is MANDATORY: unresolvable path / unreadable events = fail closed
   cg="$($SYSTEMCTL show "$SERVICE" -p ControlGroup --value 2>/dev/null || true)"
-  if [ -n "$cg" ] && [ -r "${CGROUP_BASE}${cg}/memory.events" ]; then
-    oom="$(awk '/^oom_kill /{print $2}' "${CGROUP_BASE}${cg}/memory.events" 2>/dev/null || echo 0)"
-    [ "${oom:-0}" = "0" ] || { log "prior OOM kill=$oom in cgroup"; return 1; }
-  fi
+  [ -n "$cg" ] || { log "cgroup path unresolvable for $SERVICE (fail-closed)"; return 1; }
+  evfile="${CGROUP_BASE}${cg}/memory.events"
+  [ -r "$evfile" ] || { log "memory.events unreadable: $evfile (fail-closed)"; return 1; }
+  oom="$(awk '/^oom_kill /{print $2}' "$evfile" 2>/dev/null)"
+  [ -n "$oom" ] || { log "oom_kill missing in $evfile (fail-closed)"; return 1; }
+  [ "$oom" = "0" ] || { log "prior OOM kill=$oom in cgroup"; return 1; }
   return 0
 }
-check_listeners() {
-  if [ -n "${DEPLOY_LISTENER_CMD:-}" ]; then "$DEPLOY_LISTENER_CMD"; return $?; fi
-  local port bind2
-  port="$(env_get BOT_NIGHTWATCH_IPC_PORT)"; port="${port:-9091}"
-  bind2="$(env_get BOT_NIGHTWATCH_IPC_BIND2)"
-  ss -ltn 2>/dev/null | grep -q ":$port " || { log "primary NightWatch listener :$port down"; return 1; }
-  if [ -n "$bind2" ]; then
-    ss -ltn 2>/dev/null | grep -q "$bind2:$port" || { log "BIND2 listener $bind2:$port down"; return 1; }
+
+# ── EXACT listener endpoints + authenticated healthz, PID-bound ─────────────
+check_listeners() {   # check_listeners <expected_pid>
+  local want_pid="${1:-}"
+  if [ -n "${DEPLOY_LISTENER_CMD:-}" ]; then "$DEPLOY_LISTENER_CMD" "$want_pid"; return $?; fi
+  [ "$NW_ENABLED" = "true" ] || { log "listeners: disabled by env (skipping by contract)"; return 0; }
+  local out line body code
+  out="$(ss -ltnp 2>/dev/null || true)"
+  _endpoint_ok() {   # _endpoint_ok <ip> <port> <pid>
+    local ip="$1" port="$2" pid="$3" hit
+    # EXACT endpoint — a wildcard or different address must NOT satisfy it
+    hit="$(printf '%s\n' "$out" | grep -F " ${ip}:${port} " || true)"
+    [ -n "$hit" ] || { log "listener missing exact endpoint ${ip}:${port}"; return 1; }
+    if [ -n "$pid" ] && printf '%s' "$out" | grep -q "pid="; then
+      printf '%s\n' "$hit" | grep -q "pid=${pid}," || \
+        { log "endpoint ${ip}:${port} owned by a different process (want pid=$pid)"; return 1; }
+    fi
+    return 0
+  }
+  _endpoint_ok "$NW_BIND" "$NW_PORT" "$want_pid" || return 1
+  if [ -n "$NW_BIND2" ]; then
+    _endpoint_ok "$NW_BIND2" "$NW_PORT" "$want_pid" || return 1
   fi
+  # the bot's own health contract — an unrelated listener cannot fake this
+  body="$(curl -s --max-time 10 "http://$NW_BIND:$NW_PORT/healthz" 2>/dev/null || true)"
+  printf '%s' "$body" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true' \
+    || { log "healthz contract failed on $NW_BIND:$NW_PORT"; return 1; }
   return 0
 }
+
+# ── OpenRouter: authenticated + minimally valid catalog; never leak the key ──
 check_openrouter() {
   if [ -n "${DEPLOY_OPENROUTER_CMD:-}" ]; then "$DEPLOY_OPENROUTER_CMD"; return $?; fi
-  local key code
+  local key code bodyf
   key="$(env_get OPENROUTER_API_KEY)"
   [ -n "$key" ] || { log "OpenRouter key empty"; return 1; }
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 \
-          -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/key 2>/dev/null || echo 000)"
+  bodyf="$SCRATCH/or_body.json"
+  code="$(curl -s -o "$bodyf" -w '%{http_code}' --max-time 15 \
+          -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/models 2>/dev/null || echo 000)"
   [ "$code" = "200" ] || { log "OpenRouter authenticated check http=$code"; return 1; }
+  "$PYTHON" - "$bodyf" <<'PY' || { log "OpenRouter catalog payload invalid/empty"; return 1; }
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: sys.exit(1)
+data=d.get("data")
+sys.exit(0 if isinstance(data,list) and len(data)>0 else 1)
+PY
+  rm -f "$bodyf"
   return 0
 }
-run_as_service_user() { sudo -n -u "$SERVICE_USER" -H "$@"; }
-check_service_cli() {
-  if [ -n "${DEPLOY_CLAUDE_CMD:-}" ]; then "${DEPLOY_CLAUDE_CMD}" models >/dev/null 2>&1 || { log "Claude CLI"; return 1; }
-  else run_as_service_user claude models >/dev/null 2>&1 || { log "Claude CLI (svc user)"; return 1; }; fi
-  local codex; codex="${DEPLOY_CODEX_CMD:-}"
-  if [ -n "$codex" ]; then
-    "$codex" login status >/dev/null 2>&1 || { log "Codex login"; return 1; }
-    "$codex" debug models >/dev/null 2>&1 || { log "Codex models"; return 1; }
-    "$codex" exec --help    >/dev/null 2>&1 || { log "codex exec --help"; return 1; }
-    "$codex" exec resume --help >/dev/null 2>&1 || { log "codex exec resume --help"; return 1; }
-  else
-    run_as_service_user codex login status >/dev/null 2>&1 || { log "Codex login (svc user)"; return 1; }
-    run_as_service_user codex debug models >/dev/null 2>&1 || { log "Codex models (svc user)"; return 1; }
-    run_as_service_user codex exec --help >/dev/null 2>&1 || { log "codex exec --help (svc user)"; return 1; }
-    run_as_service_user codex exec resume --help >/dev/null 2>&1 || { log "codex resume --help (svc user)"; return 1; }
+
+# ── service user: MUST exist; probes as that user; content contracts ────────
+run_as_svc() {
+  if [ "$SERVICE_USER" = "root" ]; then "$@"; else sudo -n -u "$SERVICE_USER" -H "$@"; fi
+}
+resolve_service_user() {
+  [ -n "$SERVICE_USER" ] || SERVICE_USER="$($SYSTEMCTL show "$SERVICE" -p User --value 2>/dev/null || echo '')"
+  [ -n "$SERVICE_USER" ] || SERVICE_USER="root"   # systemd User= empty means root (by definition)
+  SVC_UID="$(id -u "$SERVICE_USER" 2>/dev/null)" || die "service user '$SERVICE_USER' does not exist (no UID fallback)"
+  SVC_GID="$(id -g "$SERVICE_USER" 2>/dev/null)" || die "service group for '$SERVICE_USER' unresolvable"
+  [ -n "$SVC_UID" ] && [ -n "$SVC_GID" ] || die "service uid/gid empty for '$SERVICE_USER'"
+  if [ "$SERVICE_USER" != "root" ]; then
+    sudo -n -u "$SERVICE_USER" true 2>/dev/null || die "noninteractive sudo -u $SERVICE_USER unavailable (required for probes)"
   fi
+  log "service user resolved: $SERVICE_USER (uid=$SVC_UID gid=$SVC_GID)"
+}
+_claude_expected_ids() {
+  local ov; ov="$(env_get BOT_CLAUDE_MODELS)"
+  if [ -n "$ov" ]; then
+    printf '%s' "$ov" | tr ',' '\n' | cut -d: -f1 | sed '/^$/d'
+  else
+    printf '%s\n' claude-fable-5 claude-opus-4-8 claude-sonnet-5 claude-haiku-4-5-20251001
+  fi
+}
+_codex_expected_ids() {
+  local ov; ov="$(env_get BOT_CODEX_MODELS)"
+  if [ -n "$ov" ]; then
+    printf '%s' "$ov" | tr ',' '\n' | cut -d: -f1 | sed '/^$/d'
+  else
+    printf '%s\n' gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna
+  fi
+}
+check_service_cli() {
+  local claude_bin codex_bin out id
+  claude_bin="${DEPLOY_CLAUDE_CMD:-claude}"; codex_bin="${DEPLOY_CODEX_CMD:-codex}"
+  # Claude: catalog CONTENT contract (the adapter's selectable ids must appear)
+  if [ -n "${DEPLOY_CLAUDE_CMD:-}" ]; then out="$("$claude_bin" models 2>&1)" || { log "claude models failed"; return 1; }
+  else out="$(run_as_svc "$claude_bin" models 2>&1)" || { log "claude models failed (svc user)"; return 1; }; fi
+  while IFS= read -r id; do
+    printf '%s' "$out" | grep -qF "$id" || { log "claude catalog missing expected id: $id"; return 1; }
+  done < <(_claude_expected_ids)
+  # Codex: authenticated login, model discovery, exec/resume contracts
+  if [ -n "${DEPLOY_CODEX_CMD:-}" ]; then
+    out="$("$codex_bin" login status 2>&1)" || { log "codex login status failed"; return 1; }
+  else
+    out="$(run_as_svc "$codex_bin" login status 2>&1)" || { log "codex login status failed (svc user)"; return 1; }
+  fi
+  # "Not logged in" contains "logged in" — reject the negative form explicitly
+  printf '%s' "$out" | grep -qiE 'not[ -]+logged[ -]?in' && { log "codex not authenticated"; return 1; }
+  printf '%s' "$out" | grep -qiE 'logged[ -]?in' || { log "codex not authenticated"; return 1; }
+  if [ -n "${DEPLOY_CODEX_CMD:-}" ]; then out="$("$codex_bin" debug models 2>&1)" || { log "codex debug models failed"; return 1; }
+  else out="$(run_as_svc "$codex_bin" debug models 2>&1)" || { log "codex debug models failed (svc user)"; return 1; }; fi
+  while IFS= read -r id; do
+    printf '%s' "$out" | grep -qF "$id" || { log "codex catalog missing expected id: $id"; return 1; }
+  done < <(_codex_expected_ids)
+  if [ -n "${DEPLOY_CODEX_CMD:-}" ]; then out="$("$codex_bin" exec --help 2>&1)" || { log "codex exec --help failed"; return 1; }
+  else out="$(run_as_svc "$codex_bin" exec --help 2>&1)" || { log "codex exec --help failed (svc user)"; return 1; }; fi
+  printf '%s' "$out" | grep -qF -- '--json' || { log "codex exec lacks --json contract"; return 1; }
+  if [ -n "${DEPLOY_CODEX_CMD:-}" ]; then out="$("$codex_bin" exec resume --help 2>&1)" || { log "codex exec resume --help failed"; return 1; }
+  else out="$(run_as_svc "$codex_bin" exec resume --help 2>&1)" || { log "codex exec resume --help failed (svc user)"; return 1; }; fi
+  printf '%s' "$out" | grep -qiE 'session[_ -]?id' || { log "codex resume lacks session-id contract"; return 1; }
   return 0
 }
 
@@ -402,13 +656,10 @@ gate_readiness() {
   fail_at gate_readiness && die "forced: gate_readiness"
   $SYSTEMCTL is-active --quiet "$SERVICE" || die "bot service not active"
   OLD_PID="$($SYSTEMCTL show "$SERVICE" -p MainPID --value 2>/dev/null || echo '')"
-  [ -z "$SERVICE_USER" ] && SERVICE_USER="$($SYSTEMCTL show "$SERVICE" -p User --value 2>/dev/null || echo root)"
-  [ -n "$SERVICE_USER" ] || SERVICE_USER=root
-  log "service active: PID=$OLD_PID user=$SERVICE_USER"
+  resolve_service_user
   [ "$(_active_sessions)" = "0" ] || die "refusing: running/queued session(s) present"
   check_capacity   || die "capacity/OOM readiness failed"
-  check_listeners  || die "NightWatch listener readiness failed"
-  [ -f "$ENV_FILE" ] || die ".env missing"
+  check_listeners "$OLD_PID" || die "NightWatch listener readiness failed"
   check_openrouter || die "OpenRouter authenticated readiness failed"
   check_service_cli || die "service-user CLI/capability readiness failed"
   PYTHONPATH="$SOURCE" "$PYTHON" -c "import telegram, aiohttp, dotenv, engines.base, coordination, resource_footer" \
@@ -422,18 +673,19 @@ gate_readiness() {
   log "readiness gates OK"
 }
 
-# ── binary-safe, atomic, byte-preserving allow-listed .env editor ───────────
+# ── SECURE atomic editors (O_EXCL|O_NOFOLLOW random temp, fsync, preserve) ──
 set_env_key() {
   local key="$1" val="$2"
   case " $ALLOWLIST " in *" $key "*) : ;; *) die "env key '$key' not allow-listed";; esac
   "$PYTHON" - "$ENV_FILE" "$key" "$val" <<'PY' || die "env edit failed for $key"
-import os, sys
+import os, secrets, sys
 path, key, val = sys.argv[1], sys.argv[2], sys.argv[3]
 if "\n" in val or "\r" in val:
     sys.exit("value has newline")
+if os.path.islink(path):
+    sys.exit(".env is a symlink; refusing to edit through it")
 with open(path, "rb") as f:
     data = f.read()
-# split into physical lines PRESERVING each line's own terminator
 lines, i, n = [], 0, len(data)
 while i < n:
     j = data.find(b"\n", i)
@@ -441,23 +693,34 @@ while i < n:
         lines.append(data[i:]); break
     lines.append(data[i:j+1]); i = j+1
 kb = key.encode()
-# uncommented "KEY=" lines (allow leading blanks); fail closed on duplicates
-hits = [idx for idx, ln in enumerate(lines)
-        if ln.lstrip(b" \t").startswith(kb + b"=")]
+def is_key(ln):
+    s = ln.lstrip(b" \t")
+    if s.startswith(b"export ") or s.startswith(b"export\t"):
+        s = s[7:].lstrip(b" \t")
+    return s.startswith(kb + b"=")
+hits = [idx for idx, ln in enumerate(lines) if is_key(ln)]
 if len(hits) > 1:
-    sys.exit(f"duplicate allow-listed key {key} (ambiguous)")
+    sys.exit(f"duplicate allow-listed key {key} (export/plain forms count as one; ambiguous)")
 newval = val.encode()
 if len(hits) == 1:
     idx = hits[0]; ln = lines[idx]
-    # keep trailing CR/LF terminator bytes exactly
-    term = b""
-    body = ln
+    term = b""; body = ln
     while body[-1:] in (b"\n", b"\r"):
         term = body[-1:] + term; body = body[:-1]
     lead = body[:len(body) - len(body.lstrip(b" \t"))]
-    lines[idx] = lead + kb + b"=" + newval + term
+    # preserve an existing `export ` prefix verbatim
+    rest = body[len(lead):]
+    prefix = b""
+    if rest.startswith(b"export ") or rest.startswith(b"export\t"):
+        prefix = rest[:7]
+        rest2 = rest[7:]
+        extra = rest2[:len(rest2) - len(rest2.lstrip(b" \t"))]
+        prefix += extra
+    lines[idx] = lead + prefix + kb + b"=" + newval + term
 else:
-    # append; first normalize a missing final newline, preserving dominant style
+    # Documented sole structural change: appending a key to a file with no final
+    # newline first terminates the last line (dominant newline style), then
+    # appends `KEY=value` + newline. All other bytes are preserved verbatim.
     crlf = sum(1 for ln in lines if ln.endswith(b"\r\n"))
     lf   = sum(1 for ln in lines if ln.endswith(b"\n")) - crlf
     nl = b"\r\n" if crlf > lf else b"\n"
@@ -465,19 +728,23 @@ else:
         lines[-1] = lines[-1] + nl
     lines.append(kb + b"=" + newval + nl)
 out = b"".join(lines)
-d = os.path.dirname(path) or "."
-fd, tmp = None, path + ".deploytmp"
-f = open(tmp, "wb")
-try:
-    f.write(out); f.flush(); os.fsync(f.fileno())
-finally:
-    f.close()
-# preserve mode/owner of the original
 st = os.stat(path)
-os.chmod(tmp, st.st_mode)
-try: os.chown(tmp, st.st_uid, st.st_gid)
-except PermissionError: pass
-os.replace(tmp, path)
+d = os.path.dirname(path) or "."
+tmp = os.path.join(d, f".{secrets.token_hex(8)}.deploytmp")
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.write(fd, out)
+    os.fchmod(fd, st.st_mode & 0o7777)
+    os.fchown(fd, st.st_uid, st.st_gid)      # preservation REQUIRED: failure aborts
+    os.fsync(fd)
+finally:
+    os.close(fd)
+try:
+    os.replace(tmp, path)
+except BaseException:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
 dfd = os.open(d, os.O_RDONLY)
 try: os.fsync(dfd)
 finally: os.close(dfd)
@@ -485,47 +752,55 @@ PY
 }
 
 # ─────────────────────── mutation stages ───────────────────────────────────
-resolve_service_ids() {   # sets SVC_UID/SVC_GID for the service user (numeric)
-  if [ "$SERVICE_USER" = "root" ]; then SVC_UID=0; SVC_GID=0; return; fi
-  SVC_UID="$(id -u "$SERVICE_USER" 2>/dev/null || echo 0)"
-  SVC_GID="$(id -g "$SERVICE_USER" 2>/dev/null || echo 0)"
-}
-
 install_artifacts() {
   fail_at install_artifacts && die "forced: install_artifacts"
-  resolve_service_ids
   mkdir -p "$LIVE_SCRIPTS" "$SYSTEMD_DIR" "$CONFIGS"
   local line dest src typ
   while IFS= read -r line; do
     dest="${line%%|*}"; src="${line#*|}"; typ="${src##*|}"; src="${src%|*}"
-    if [ "$typ" = "dir" ]; then
-      [ -d "$src" ] || die "source dir missing: $src"
-      rm -rf -- "$dest"; cp -a "$src" "$dest"
-      # RECURSIVE tree hash: source vs installed must match exactly
-      [ "$(tree_hash "$src")" = "$(tree_hash "$dest")" ] || die "tree hash mismatch after install: $dest"
-    else
-      [ -f "$src" ] || die "source file missing: $src"
-      install -D -m 0644 "$src" "$dest"
-      [ "$(sha "$dest")" = "$(sha "$src")" ] || die "hash mismatch after install: $dest"
-    fi
+    case "$typ" in
+      dir)
+        [ -d "$src" ] || die "source dir missing: $src"
+        tree_symlinks_safe "$src" || die "source tree has escaping symlinks: $src"
+        rm -rf -- "$dest"; cp -a "$src" "$dest"
+        [ "$(tree_hash "$src")" = "$(tree_hash "$dest")" ] || die "tree manifest mismatch after install: $dest"
+        ;;
+      render)
+        [ -f "$src" ] || die "source unit missing: $src"
+        # render the service unit to the RESOLVED retention config/script/guard
+        sed -e "s|^EnvironmentFile=.*$|EnvironmentFile=-$R_RETENTION_ENV|" \
+            -e "s|^Environment=REPORTS_ROOT_GUARD=.*$|Environment=REPORTS_ROOT_GUARD=$LIVE_ROOT/reports|" \
+            -e "s|^ExecStart=.*$|ExecStart=$LIVE_SCRIPTS/cleanup-reports.sh|" \
+            "$src" > "$SCRATCH/unit.rendered"
+        install -D -m 0644 "$SCRATCH/unit.rendered" "$dest"
+        grep -qF "EnvironmentFile=-$R_RETENTION_ENV" "$dest" || die "rendered unit missing resolved EnvironmentFile"
+        grep -qF "ExecStart=$LIVE_SCRIPTS/cleanup-reports.sh" "$dest" || die "rendered unit missing resolved ExecStart"
+        grep -qF "REPORTS_ROOT_GUARD=$LIVE_ROOT/reports" "$dest" || die "rendered unit missing resolved root guard"
+        ;;
+      *)
+        [ -f "$src" ] || die "source file missing: $src"
+        install -D -m 0644 "$src" "$dest"
+        [ "$(sha "$dest")" = "$(sha "$src")" ] || die "hash mismatch after install: $dest"
+        ;;
+    esac
     [ -e "$dest" ] || die "install failed: $dest"
   done < <(artifacts)
-  # executable helpers stay root/service-owned + executable (coord_publish is
-  # preflighted by _valid_coord_publisher as root/service-owned non-symlink)
-  chmod 0755 "$LIVE_SCRIPTS/cleanup-reports.sh" "$LIVE_SCRIPTS/coord_publish.py" \
-     || die "chmod helpers failed"
-  # writable runtime dirs owned by the SERVICE user (fail on chown/chmod error)
+  # transaction safety: the installed timer must NOT be persistent (a catch-up
+  # would fire real cleanup inside the rollback-capable window)
+  grep -qiE '^Persistent=true' "$SYSTEMD_DIR/reports-cleanup.timer" \
+    && die "timer is Persistent=true (catch-up could run cleanup mid-transaction)"
+  chmod 0755 "$LIVE_SCRIPTS/cleanup-reports.sh" "$LIVE_SCRIPTS/coord_publish.py" || die "chmod helpers failed"
+  # runtime dirs + EVERY existing mutable artifact owned by the service user
   mkdir -p "$R_CHAT" "$(dirname "$R_COORD")" "$(dirname "$R_CACHE")"
   chmod 0700 "$R_CHAT" || die "chmod chat dir failed"
-  chown "$SVC_UID:$SVC_GID" "$R_CHAT" || die "chown chat dir to service user failed"
+  chown "$SVC_UID:$SVC_GID" "$R_CHAT" || die "chown chat dir failed"
   chown "$SVC_UID:$SVC_GID" "$(dirname "$R_COORD")" || die "chown coord dir failed"
-  # writability AS the service user (not the deploy root user)
-  if [ "$SERVICE_USER" != "root" ]; then
-    sudo -n -u "$SERVICE_USER" test -w "$R_CHAT" || die "chat dir not writable by $SERVICE_USER"
-  else
-    [ -w "$R_CHAT" ] || die "chat dir not writable"
-  fi
-  log "artifacts installed (recursive-hash verified) + service-user ($SERVICE_USER) ownership"
+  chown "$SVC_UID:$SVC_GID" "$(dirname "$R_CACHE")" || die "chown cache dir failed"
+  local f
+  for f in "$R_COORD" "$R_COORDLOCK" "$R_CACHE" "$R_STATE"; do
+    if [ -f "$f" ]; then chown "$SVC_UID:$SVC_GID" "$f" || die "chown existing artifact failed: $f"; fi
+  done
+  log "artifacts installed (tree-manifest verified) + service-user ownership applied"
 }
 
 edit_env() {
@@ -533,6 +808,9 @@ edit_env() {
   set_env_key BOT_MAX_SESSIONS 9
   set_env_key BOT_MAX_RUNNING_AGENTS 2
   set_env_key BOT_NIGHTWATCH_IPC_BIND2 10.108.0.4
+  # the post-restart listener expectation = validated parse PLUS our own applied
+  # allow-listed edit (BIND2 is now guaranteed for the new process)
+  NW_BIND2="10.108.0.4"
   set_env_key BOT_CHAT_SESSIONS_DIR "$R_CHAT"
   set_env_key BOT_COORDINATION_FILE "$R_COORD"
   set_env_key BOT_CHAT_CATALOG_CACHE "$R_CACHE"
@@ -544,11 +822,11 @@ migrate_retention() {
   fail_at migrate_retention && die "forced: migrate_retention"
   rm -f -- "$CRON_DIR/cleanup-reports" "$CRON_DIR/nightwatch-reports-cleanup"
   if [ -f "$NIGHTLY" ]; then
-    # byte-preserving surgical comment-out (Python keepends); fail closed on an
-    # entangled report-deletion (shares a line with &&/||/;/continuation)
     "$PYTHON" - "$NIGHTLY" <<'PY' || die "nightly-cleanup migration failed (ambiguous or unsafe)"
-import re, sys
+import os, re, secrets, sys
 p=sys.argv[1]
+if os.path.islink(p):
+    sys.exit("nightly-cleanup is a symlink; refusing")
 data=open(p,"rb").read()
 lines, i, n = [], 0, len(data)
 while i<n:
@@ -570,16 +848,28 @@ for ln in lines:
         out.append(b"# [phase1-2 retention migration: removed report-deletion] "+body+term)
     else:
         out.append(ln)
-# safety: no ACTIVE report-deletion may remain
 for ln in out:
     if isdel(ln): sys.exit("active report-deletion remains after migration")
-import os
-tmp=p+".deploytmp"
-f=open(tmp,"wb"); f.write(b"".join(out)); f.flush(); os.fsync(f.fileno()); f.close()
-st=os.stat(p); os.chmod(tmp,st.st_mode)
-try: os.chown(tmp,st.st_uid,st.st_gid)
-except PermissionError: pass
-os.replace(tmp,p)
+st=os.stat(p)
+d=os.path.dirname(p) or "."
+tmp=os.path.join(d, f".{secrets.token_hex(8)}.deploytmp")
+fd=os.open(tmp, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600)
+try:
+    os.write(fd, b"".join(out))
+    os.fchmod(fd, st.st_mode & 0o7777)
+    os.fchown(fd, st.st_uid, st.st_gid)     # preservation REQUIRED
+    os.fsync(fd)
+finally:
+    os.close(fd)
+try:
+    os.replace(tmp, p)
+except BaseException:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
+dfd=os.open(d, os.O_RDONLY)
+try: os.fsync(dfd)
+finally: os.close(dfd)
 PY
   fi
   printf 'BOT_REPORT_RETENTION_DAYS=15\n' > "$R_RETENTION_ENV"
@@ -610,86 +900,127 @@ assert isinstance(app.bot, ExtBot) and isinstance(app.bot, m.FooterBot)
 assert callable(app.bot.send_message) and callable(app.bot.edit_message_text)
 print("live-smoke-ok")
 PY
-  log "live-dir import + FooterBot/Application smoke OK"
+  # service-user read/write/ATOMIC-REPLACE probes in every mutable runtime dir
+  local d
+  for d in "$R_CHAT" "$(dirname "$R_COORD")" "$(dirname "$R_CACHE")"; do
+    run_as_svc "$PYTHON" - "$d" <<'PY' || die "service-user write/replace probe failed in $d"
+import os, secrets, sys
+d = sys.argv[1]
+a = os.path.join(d, f".{secrets.token_hex(6)}.probe")
+b = os.path.join(d, f".{secrets.token_hex(6)}.probe")
+fd = os.open(a, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+os.write(fd, b"probe"); os.fsync(fd); os.close(fd)
+os.replace(a, b)                       # atomic replace capability
+assert open(b, "rb").read() == b"probe"
+os.unlink(b)
+PY
+  done
+  # existing mutable files must be replaceable by the service (owner check)
+  local f o
+  for f in "$R_COORD" "$R_COORDLOCK" "$R_CACHE"; do
+    if [ -f "$f" ]; then
+      o="$(stat -c '%u' "$f")"
+      [ "$o" = "$SVC_UID" ] || die "mutable artifact not service-owned after install: $f (uid=$o)"
+    fi
+  done
+  log "live-dir smoke + service-user write/replace probes OK"
 }
 
-_journal_since_restart() {   # only the NEW process's evidence, from the restart cursor
-  if [ -n "$RESTART_CURSOR" ]; then
-    $JOURNALCTL -u "$SERVICE" --after-cursor="$RESTART_CURSOR" --no-pager 2>/dev/null || true
-  else
-    $JOURNALCTL -u "$SERVICE" --no-pager 2>/dev/null || true
-  fi
+_journal_new_pid() {   # journal evidence for the NEW process only (cursor + _PID)
+  $JOURNALCTL -u "$SERVICE" _PID="$NEW_PID" --after-cursor="$RESTART_CURSOR" --no-pager 2>/dev/null || true
 }
 
 restart_once() {
   fail_at restart_once && die "forced: restart_once"
   [ "$(_active_sessions)" = "0" ] || die "busy sessions appeared before restart"
-  # capture a journal cursor BEFORE restart so health reads only the new window
+  # MANDATORY cursor: empty/failed capture is a pre-restart failure (no stale fallback)
   RESTART_CURSOR="$($JOURNALCTL -u "$SERVICE" --show-cursor -n0 --no-pager 2>/dev/null \
                     | sed -n 's/^-- cursor: //p' | tail -1)"
+  [ -n "$RESTART_CURSOR" ] || die "journal cursor capture failed (mandatory; refusing to restart)"
   $SYSTEMCTL daemon-reload || die "daemon-reload failed"
   $SYSTEMCTL restart "$SERVICE" || die "restart failed"
   RESTARTED_FWD=$((RESTARTED_FWD+1))
   NEW_PID="$($SYSTEMCTL show "$SERVICE" -p MainPID --value 2>/dev/null || echo '')"
-  [ -n "$NEW_PID" ] && [ "$NEW_PID" != "$OLD_PID" ] || die "PID did not change after restart"
-  log "service restarted once: pid $OLD_PID -> $NEW_PID"
+  [ -n "$NEW_PID" ] && [ "$NEW_PID" != "0" ] && [ "$NEW_PID" != "$OLD_PID" ] || die "no new MainPID after restart"
+  log "service restarted once: pid $OLD_PID -> $NEW_PID (cursor captured)"
 }
 
-_health_assert() {   # shared by health_check and observe
-  local ctx="$1" jrl pid
+_health_assert() {   # one full health assertion against NEW-PID evidence only
+  local ctx="$1" jrl pid names
   pid="$($SYSTEMCTL show "$SERVICE" -p MainPID --value 2>/dev/null || echo '')"
-  [ "$pid" = "$NEW_PID" ] || { log "$ctx: PID changed ($NEW_PID -> $pid)"; return 1; }
-  $SYSTEMCTL is-active --quiet "$SERVICE" || { log "$ctx: service not active"; return 1; }
-  jrl="$(_journal_since_restart)"
-  echo "$jrl" | grep -qiE 'traceback|fatal' && { log "$ctx: fatal/traceback in new-process journal"; return 1; }
-  echo "$jrl" | grep -q 'Bot v4 ready' || { log "$ctx: 'Bot v4 ready' not seen (new process)"; return 1; }
-  echo "$jrl" | grep -Eq 'max_sessions=9' && echo "$jrl" | grep -Eq 'max_running_agents=2' \
-     || { log "$ctx: effective limits not 9/2"; return 1; }
-  # exact three engines from the real registration line
-  local names; names="$(echo "$jrl" | sed -n 's/.*engines\.registered names=//p' | tail -1)"
-  echo ",$names," | grep -q ',claude,' && echo ",$names," | grep -q ',codex,' && echo ",$names," | grep -q ',chat,' \
-     || { log "$ctx: engines.registered names missing an engine (got '$names')"; return 1; }
-  check_listeners || { log "$ctx: listeners unhealthy"; return 1; }
-  check_capacity  || { log "$ctx: cgroup/OOM/capacity unstable"; return 1; }
-  # writable paths AS the service user
-  if [ "$SERVICE_USER" != "root" ]; then
-    sudo -n -u "$SERVICE_USER" test -w "$R_CHAT" || { log "$ctx: chat not writable by svc user"; return 1; }
-    sudo -n -u "$SERVICE_USER" test -w "$(dirname "$R_COORD")" || { log "$ctx: coord dir not writable by svc user"; return 1; }
-  else
-    [ -w "$R_CHAT" ] && [ -w "$(dirname "$R_COORD")" ] || { log "$ctx: paths not writable"; return 1; }
+  [ "$pid" = "$NEW_PID" ] || { log "$ctx: PID changed ($NEW_PID -> $pid)"; return 2; }
+  $SYSTEMCTL is-active --quiet "$SERVICE" || { log "$ctx: service not active"; return 2; }
+  jrl="$(_journal_new_pid)"
+  if printf '%s' "$jrl" | grep -qiE 'traceback|fatal'; then
+    log "$ctx: fatal/traceback in NEW-pid journal"; return 2
   fi
+  printf '%s' "$jrl" | grep -q 'Bot v4 ready' || { log "$ctx: ready marker not yet seen (new pid)"; return 1; }
+  printf '%s' "$jrl" | grep -Eq 'max_sessions=9' && printf '%s' "$jrl" | grep -Eq 'max_running_agents=2' \
+     || { log "$ctx: effective limits not 9/2"; return 1; }
+  names="$(printf '%s' "$jrl" | sed -n 's/.*engines\.registered names=//p' | tail -1 | tr -d '[:space:]')"
+  [ "$names" = "chat,claude,codex" ] || { log "$ctx: engine set mismatch (got '$names', want exactly chat,claude,codex)"; return 2; }
+  check_listeners "$NEW_PID" || { log "$ctx: exact listeners unhealthy"; return 1; }
+  check_capacity  || { log "$ctx: capacity/cgroup unstable"; return 2; }
+  local d
+  for d in "$R_CHAT" "$(dirname "$R_COORD")" "$(dirname "$R_CACHE")"; do
+    if [ "$SERVICE_USER" != "root" ]; then
+      sudo -n -u "$SERVICE_USER" test -w "$d" || { log "$ctx: $d not writable by svc user"; return 2; }
+    else
+      [ -w "$d" ] || { log "$ctx: $d not writable"; return 2; }
+    fi
+  done
   return 0
 }
 
 health_check() {
   fail_at health_check && die "forced: health_check"
-  _health_assert "health" || die "post-restart health failed"
-  log "health OK (new pid $NEW_PID): ready, 9/2, engines, listeners, paths, cgroup"
+  # bounded startup polling: retry transient (rc=1) conditions until deadline;
+  # hard (rc=2) conditions — fatal log, PID churn, engine mismatch — abort now.
+  local waited=0 rc
+  while :; do
+    set +e; _health_assert "health"; rc=$?; set -e
+    [ "$rc" -eq 0 ] && break
+    [ "$rc" -eq 2 ] && die "post-restart health failed (hard condition)"
+    [ "$waited" -ge "$HEALTH_DEADLINE" ] && die "post-restart health not ready within ${HEALTH_DEADLINE}s"
+    sleep "$HEALTH_POLL"; waited=$((waited+HEALTH_POLL))
+  done
+  log "health OK (new pid $NEW_PID) after ${waited}s: ready, 9/2, exact engines, exact listeners, paths"
 }
 
 observe() {
   fail_at observe && die "forced: observe"
   [ "$OBSERVE" -gt 0 ] && sleep "$OBSERVE"
-  # repeat the FULL health assertion, and require the SAME new PID (no churn)
-  _health_assert "observe" || die "post-observation health failed (PID churn or degraded)"
+  local rc
+  set +e; _health_assert "observe"; rc=$?; set -e
+  [ "$rc" -eq 0 ] || die "post-observation health failed (PID churn or degraded)"
   log "observation window ($OBSERVE s) passed; PID stable at $NEW_PID"
 }
 
 enable_timer() {
-  # activate ONLY at the final commit boundary, after bot observation
   fail_at enable_timer && die "forced: enable_timer"
+  # pre-activation verification: exact unit config, script hash, root guard
+  local unit="$SYSTEMD_DIR/reports-cleanup.service"
+  grep -qF "EnvironmentFile=-$R_RETENTION_ENV" "$unit" || die "unit EnvironmentFile != resolved retention config"
+  grep -qF "ExecStart=$LIVE_SCRIPTS/cleanup-reports.sh" "$unit" || die "unit ExecStart != stable live cleanup path"
+  grep -qF "REPORTS_ROOT_GUARD=$LIVE_ROOT/reports" "$unit" || die "unit root guard != resolved reports root"
+  [ -f "$R_RETENTION_ENV" ] || die "resolved retention config missing: $R_RETENTION_ENV"
+  [ "$(sha "$LIVE_SCRIPTS/cleanup-reports.sh")" = "$(sha "$SOURCE/scripts/cleanup-reports.sh")" ] \
+    || die "installed cleanup script hash != source"
+  grep -qiE '^Persistent=true' "$SYSTEMD_DIR/reports-cleanup.timer" \
+    && die "timer became Persistent=true before activation"
   $SYSTEMCTL enable reports-cleanup.timer >/dev/null 2>&1 || die "timer enable failed"
   $SYSTEMCTL start  reports-cleanup.timer >/dev/null 2>&1 || die "timer start failed"
   TIMER_ACTIVATED=1
   $SYSTEMCTL is-enabled --quiet reports-cleanup.timer || die "timer not enabled"
   $SYSTEMCTL is-active  --quiet reports-cleanup.timer || die "timer not active"
   local ex; ex="$($SYSTEMCTL show reports-cleanup.service -p ExecStart --value 2>/dev/null || echo '')"
-  [ -n "$ex" ] || die "timer ExecStart is empty"                        # no empty-bypass
+  [ -n "$ex" ] || die "timer ExecStart is empty"
   case "$ex" in *"$LIVE_SCRIPTS/cleanup-reports.sh"*) : ;; *) die "timer ExecStart not the stable live path: $ex";; esac
   log "retention timer activated at commit boundary; ExecStart=$ex"
 }
 
 # ─────────────────────── main ──────────────────────────────────────────────
+parse_env_once
 resolve_paths
 gate_source
 gate_suite

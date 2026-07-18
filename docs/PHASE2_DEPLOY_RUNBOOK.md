@@ -32,81 +32,96 @@ scripts/deploy-phase1-phase2.sh --execute  --reviewed-pr 19 --merged-sha <40-hex
 
 The script performs, in order, exactly:
 
-1. **Read-only preflight (both modes), writing only under `/tmp` and NEVER
+1. **One fail-closed, non-executing `.env` parse into `/tmp` scratch** — never
+   `source`/eval. A missing `python-dotenv`, unreadable/symlinked/malformed file,
+   or a **duplicate safety-critical key** (`export KEY=` and `KEY=` count as the
+   SAME key) stops before any mutation with an explicit reason. Every later
+   consumer (path resolution, listeners, health, rollback) reuses this single
+   validated result.
+2. **Read-only preflight (both modes), writing only under `/tmp` and NEVER
    mutating Git metadata** — no lock, no mutation, no `__pycache__`/`.pytest_cache`
    in the source (bytecode disabled, caches + basetemp under a `/tmp` scratch
    dir), `GIT_OPTIONAL_LOCKS=0` so `git status` never writes the index:
-   - **source gate:** the source is a **detached** worktree (no branch), fully
-     clean (no staged/unstaged/untracked), its HEAD equals the 40-hex merged
-     SHA, and a **read-only** `git ls-remote origin refs/heads/main` (never a
-     `fetch` — no local ref/object update) returns exactly the merged SHA
-     (fail-closed on stale/missing/failed ls-remote);
-   - **suite gate:** `py_compile` all runtime modules, `bash -n` all shell
-     scripts, and the complete offline suite from the immutable source
-     (`pytest -p no:cacheprovider`, temp cache/basetemp); optional documented total;
-   - **built-in readiness gates (records, never prints secrets):** bot service
-     active (capture unit/user/PID); **zero** running/queued sessions from the
-     resolved state file; **capacity** — disk/RAM thresholds + cgroup
-     `memory.events` `oom_kill==0`; **listeners** — NightWatch primary + `BIND2`
-     from the non-executingly parsed env; **OpenRouter** — an *authenticated*
-     read-only key check (HTTP 200; nonempty alone is insufficient; key never
-     printed); **service-user** — the exact systemd `User`, running Claude
-     `models`, `codex login status` / `debug models` / `exec --help` / `exec
-     resume --help` **as that user**, plus PTB/aiohttp/dotenv + module imports;
-     the report-cleanup **dry-run** (no `|| true`). Each gate has a real built-in;
-     a test seam may replace it ONLY under `--test-root`. `basic-memory`/Graphify
-     are inspected and reported as **optional follow-ups (not integrated)**.
-   - In production mode (no `--test-root`) every test-seam variable is **refused**.
-2. **Path resolution:** the exact state / chat-history / coordination(+`.lock`) /
-   OpenRouter-cache / reports-token+config paths the running bot uses are resolved
-   from the **non-executed** live env (`BOT_DATA_ROOT`/`BOT_CONFIGS_DIR`/
+   - **source gate:** detached clean worktree at the exact merged SHA; a
+     **read-only** `git ls-remote origin refs/heads/main` (never `fetch`) must
+     return exactly the merged SHA (fail-closed on stale/missing/failure);
+   - **suite gate:** `py_compile`, `bash -n`, and the complete offline suite from
+     the immutable source (temp cache/basetemp); optional documented total;
+   - **built-in readiness gates (never print secrets):**
+     * service active; **zero** running/queued sessions from the resolved state;
+     * **capacity** — disk **and RAM and swap** against **hard-coded production
+       minima** (500/150/64 MB — `DEPLOY_MIN_*` overrides are refused outside the
+       test harness), plus a **mandatory** cgroup gate: an unresolvable
+       `ControlGroup` or unreadable `memory.events` fails closed; `oom_kill` must
+       be exactly 0;
+     * **service user** — the systemd `User` must EXIST (`id` lookup; **no UID-0
+       fallback**); root probes run directly, non-root probes require proven
+       noninteractive `sudo -u`;
+     * **capability contracts (content, not just exit status):** Claude `models`
+       must list the adapter's selectable ids; `codex login status` must say
+       logged-in; `codex debug models` must contain Sol/Terra/Luna (or the
+       configured override ids); `codex exec --help` must prove `--json`;
+       `codex exec resume --help` must prove resume-by-session-id;
+     * **listeners** — the EXACT `bind:port` endpoints from the validated env
+       (wildcard/wrong-IP/missing endpoints rejected), socket evidence bound to
+       the expected service PID where the platform reports it, plus the bot's
+       own `/healthz` contract (`"ok": true`) so an unrelated listener can never
+       satisfy readiness;
+     * **OpenRouter** — authenticated HTTP 200 **and** a minimally valid catalog
+       payload (`data` non-empty); the key/headers/bodies are never printed;
+     * the report-cleanup **dry-run** (no `|| true`); `basic-memory`/Graphify
+       reported as optional follow-ups (NOT integrated).
+   - In production mode (no `--test-root`) every test-seam variable is refused.
+3. **Path resolution** from the validated parse (`BOT_DATA_ROOT`/`BOT_CONFIGS_DIR`/
    `BOT_CHAT_SESSIONS_DIR`/`BOT_COORDINATION_FILE`/`BOT_CHAT_CATALOG_CACHE`),
-   validated to stay inside the live root (fail-closed on escape/symlink).
-3. **Execute-only, after all read-only gates:** require `--reviewed-pr 19`, then
-   acquire the single deploy **flock**.
-4. **Manifest + backup** of every artifact and the RESOLVED live data
-   (state/type/owner/group/mode/hash; recursive tree hash for package dirs):
-   runtime artifacts/package, `.env`, resolved `bot-state.json`, coordination
-   store + `.lock`, OpenRouter cache, chat-history root, cleanup config/**both**
-   systemd units, **both** conflicting crons, `nightly-cleanup.sh`, and the
-   timer's prior enabled/active state.
-5. **Install** from the detached source: files hash-verified, `engines/` and
-   `video_module/` **recursive tree-hash** verified source-vs-installed; writable
-   runtime dirs `chown`ed to the **service user** and writability tested **as
-   that user** (fail on any `chown`/`chmod` error — no `|| true`); executable
-   helpers kept root/service-owned for `_valid_coord_publisher`.
-6. **`.env`** binary-safe, atomic, fsync-backed allow-list edit: `BOT_MAX_SESSIONS=9`,
-   `BOT_MAX_RUNNING_AGENTS=2`, `BOT_NIGHTWATCH_IPC_BIND2=10.108.0.4`, resolved
-   Phase-2 paths (chat sessions, coordination store, catalog cache, absolute
-   coordination publisher). Changes only the exact records; preserves every other
-   byte, newline style (incl. CRLF), comments, quoting and final-newline state;
-   **fails closed on a duplicate allow-listed key**.
-7. **All three retention migrations:** remove `/etc/cron.d/cleanup-reports` and
-   `/etc/cron.d/nightwatch-reports-cleanup`, and **surgically** (byte-preserving,
-   Python) comment only the report-deletion command(s) inside `nightly-cleanup.sh`
-   (fail closed if a deletion is entangled with `&&`/`||`/`;`/continuation);
-   install the canonical cleanup config and require its **dry-run** — no real
-   deletion runs during the transaction.
-8. **Verify** the live directory: compile/import closure + real offline
-   `FooterBot`/`Application` construction with the live dir on `sys.path`.
-9. **Restart exactly once** (after re-checking the busy-session gate; a journal
-   cursor is captured first). **Health uses ONLY the new process's evidence**
-   (`journalctl --after-cursor` from the restart window): stable **new** PID, no
-   fatal traceback, `Bot v4 ready`, effective limits 9/2, exactly three engines
-   from the real `engines.registered names=…` line, both listeners, writable
-   paths **as the service user**, stable cgroup/OOM. **`observe`** repeats the
-   full health assertion and requires the SAME new PID (no churn).
-10. **Only at the final commit boundary, after observation,** enable + start
-    `reports-cleanup.timer`; verify enabled + active + a **nonempty** exact stable
-    `ExecStart` (no empty-output bypass).
-11. Any post-mutation failure → an ordered, **verified** rollback: stop any newly
-    activated timer, restore files/content/metadata + remove absent-before,
-    `daemon-reload`, restore the prior timer enabled/active state, restart the old
-    bot and re-check it is active with healthy listeners. Every rollback error is
-    accumulated: `ROLLED_BACK` only if ALL restores/verifications pass, else
-    `ROLLBACK_FAILED` (with the failed steps + backup path). The original forward
-    exit code is preserved. Success → `DEPLOYED`; pre-mutation stop →
-    `STOPPED_BEFORE_MUTATION`.
+   contained inside the live root (fail-closed on escape/symlink).
+4. **Execute-only:** require `--reviewed-pr 19`, then the single deploy **flock**.
+5. **Manifest + backup** with full identity per entry — state, type, owner,
+   group, mode, and content hash / **full tree manifest** (path+type+bytes+
+   symlink target+mode+empty dirs) / link target — for every artifact and the
+   resolved live data, plus the timer's prior enabled/active state.
+6. **Install** from the detached source: file hashes and **full tree manifests**
+   verified source-vs-installed (extra/missing/type/mode/link-target changes all
+   fail; escaping symlinks rejected); the retention **service unit is RENDERED**
+   to the resolved `EnvironmentFile`/`ExecStart`/`REPORTS_ROOT_GUARD` paths and
+   verified; the installed timer must be **non-persistent** (a `Persistent=true`
+   catch-up could fire real cleanup inside the transaction); runtime dirs AND
+   every existing mutable artifact (coordination store/lock, catalog cache,
+   state) are `chown`ed to the service user — any `chown`/`chmod` failure aborts.
+7. **`.env` secure atomic edit** (allow-list only): unpredictable temp file with
+   `O_CREAT|O_EXCL|O_NOFOLLOW` in the destination directory, owner/group/mode
+   preserved or the edit fails, fsync of file and directory, symlinked targets
+   refused, duplicates (incl. `export` form) refused. Preserves every unrelated
+   byte and newline style (incl. CRLF); the ONLY documented structural change is
+   that appending a key to a file lacking a final newline first terminates the
+   last line. The nightly-cleanup surgical editor follows the same contract.
+8. **All three retention migrations** (both cron files + surgical nightly edit,
+   fail-closed on entangled deletions); canonical config written to the SAME
+   resolved path the rendered unit reads; cleanup runs **only** `--dry-run`.
+9. **Verify** the live dir (import closure + offline `FooterBot`/`Application`
+   construction) and probe **read/write/ATOMIC-REPLACE as the service user** in
+   the chat-history, coordination, and catalog-cache directories; existing
+   mutable files must be service-replaceable.
+10. **Restart exactly once.** Capturing the pre-restart journal cursor is
+    MANDATORY (empty cursor = pre-restart failure; no stale-journal fallback).
+    **Health polls** for a bounded window (60 s production, 2 s interval) and
+    reads ONLY `journalctl -u <unit> _PID=<new MainPID> --after-cursor=<cursor>`:
+    ready marker, 9/2 limits, **exactly** `chat,claude,codex`, exact listeners
+    (new PID), stable cgroup, service-user-writable paths. A stale ready line,
+    old traceback, missing/extra engine, or PID churn cannot pass. **`observe`**
+    (90 s production) repeats the full assertion with the SAME PID.
+11. **Only at the final commit boundary, after observation,** verify the rendered
+    unit paths + installed script hash + root guard + non-persistent timer, then
+    enable + start `reports-cleanup.timer` and require enabled + active + a
+    **nonempty** exact `ExecStart`.
+12. Any post-mutation failure → an ordered, **VERIFIED** rollback: stop any newly
+    activated timer; restore all entries; **verify every entry** against its
+    recorded type/hash/tree/target/mode/owner/group and every absent-before
+    removal; assert no editor temp files remain; `daemon-reload`; restore the
+    prior timer state; restart the old bot and require it active with a MainPID
+    and exact listeners. All errors accumulate: `ROLLED_BACK` only when every
+    restore and verification passes, otherwise `ROLLBACK_FAILED` (with the
+    failed steps and backup path). The forward exit code is preserved.
 
 The remaining sections document acceptance evidence to confirm afterwards.
 
