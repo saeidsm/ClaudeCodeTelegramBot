@@ -64,8 +64,16 @@ The script performs, in order, exactly:
      * **service user** — the systemd `User` must EXIST (`id` lookup; **no UID-0
        fallback**); root probes run directly, non-root probes require proven
        noninteractive `sudo -u`;
-     * **capability contracts (content, not just exit status):** Claude `models`
-       must list the adapter's selectable ids; `codex login status` must say
+     * **capability contracts (deterministic, read-only, zero model calls):**
+       Claude is validated ONLY via documented non-generative CLI contracts —
+       `claude --version` (semantic version), `claude --help` (must document
+       `--model` and `--print`), and `claude auth status --json` (must report
+       `"loggedIn": true`). `claude models` is NOT a subcommand — Claude Code
+       interprets it as a prompt and returns nondeterministic LLM text — so it
+       is banned from readiness and can neither pass nor fail the gate. The
+       Claude catalog is validated from the adapter's static source plus a
+       well-formedness check of `BOT_CLAUDE_MODELS` from the validated parse.
+       Codex (real subcommands, unchanged): `codex login status` must say
        logged-in; `codex debug models` must contain Sol/Terra/Luna (or the
        configured override ids); `codex exec --help` must prove `--json`;
        `codex exec resume --help` must prove resume-by-session-id;
