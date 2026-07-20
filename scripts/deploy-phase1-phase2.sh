@@ -703,23 +703,32 @@ check_service_cli() {
   # call). It is therefore BANNED from readiness: a text answer can never pass
   # or fail this gate. Capability is proven via documented, non-generative
   # contracts, run as the service user, with zero model consumption:
-  #   1. `claude --version`            -> semantic version string
+  #   1. `claude --version`            -> the ENTIRE output must be exactly a
+  #      semver, optionally suffixed " (Claude Code)" — never merely contain one
   #   2. `claude --help`               -> documents --model and --print
-  #   3. `claude auth status --json`   -> documented non-interactive status,
-  #      must report "loggedIn": true
+  #   3. `claude auth status --json`   -> the ENTIRE output must be one valid
+  #      JSON object whose top-level `loggedIn` is boolean true (strict parse,
+  #      never grep; output is never printed)
   _claude_run() {
     if [ -n "${DEPLOY_CLAUDE_CMD:-}" ]; then "$claude_bin" "$@" 2>&1
     else run_as_svc "$claude_bin" "$@" 2>&1; fi
   }
+  local ver_re='^[0-9]+\.[0-9]+\.[0-9]+( \(Claude Code\))?$'
   out="$(_claude_run --version)" || { log "claude --version failed"; return 1; }
-  printf '%s' "$out" | grep -qE '[0-9]+\.[0-9]+\.[0-9]+' \
+  [[ "$out" =~ $ver_re ]] \
     || { log "claude --version output is not a version (contract failed)"; return 1; }
   out="$(_claude_run --help)" || { log "claude --help failed"; return 1; }
   printf '%s' "$out" | grep -qF -- '--model' || { log "claude --help lacks --model (contract failed)"; return 1; }
   printf '%s' "$out" | grep -qF -- '--print' || { log "claude --help lacks --print (contract failed)"; return 1; }
   out="$(_claude_run auth status --json)" || { log "claude auth status failed"; return 1; }
-  printf '%s' "$out" | grep -qE '"loggedIn"[[:space:]]*:[[:space:]]*true' \
-    || { log "claude not authenticated (auth status)"; return 1; }
+  printf '%s' "$out" | "$PYTHON" -c '
+import json, sys
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if isinstance(doc, dict) and doc.get("loggedIn") is True else 1)
+' || { log "claude not authenticated (auth status contract failed)"; return 1; }
   # Catalog validity comes from the DETERMINISTIC adapter source + the validated
   # BOT_CLAUDE_MODELS override from the single env parse — never from LLM text,
   # and no Claude request is made.
