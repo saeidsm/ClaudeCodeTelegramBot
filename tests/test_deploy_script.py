@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -17,9 +18,12 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "deploy-phase1-phase2.sh"
+_REAL_GIT = shutil.which("git") or "git"
 _SHA = "0123456789abcdef0123456789abcdef01234567"
 _RHEAD = "1111111111111111111111111111111111111111"   # owner-authorized reviewed PR head
 _RTREE = "2222222222222222222222222222222222222222"   # owner-authorized reviewed tree
+_RPR = "19"                                            # owner-authorized reviewed PR number
+_RREF = "refs/heads/some-reviewed-branch"               # owner-authorized reviewed PR ref
 _TOK = "testtoken0123456789abcdef"
 
 _ENV_ORIG = (
@@ -60,12 +64,16 @@ def _mock_bin(d: Path) -> Path:
 case "$*" in
   *"symbolic-ref -q HEAD"*) [ "${{GIT_ON_BRANCH:-0}}" = 1 ] && {{ echo refs/heads/x; exit 0; }} || exit 1 ;;
   *"status --porcelain"*)   [ "${{GIT_DIRTY:-0}}" = 1 ] && echo " M f"; exit 0 ;;
+  *"check-ref-format"*)     exec "{_REAL_GIT}" "$@" ;;
   *"^{{tree}}"*)             echo "${{GIT_MERGED_TREE:-{_RTREE}}}"; exit 0 ;;
   *"rev-parse HEAD"*)        echo "${{GIT_HEAD_SHA:-{_SHA}}}"; exit 0 ;;
-  *"ls-remote"*"refs/heads/claude/phase2-engines-codex-chat"*)
+  *"ls-remote"*"refs/heads/main"*)
+    [ "${{GIT_LSREMOTE_FAIL:-0}}" = 1 ] && exit 0
+    printf '%s\\trefs/heads/main\\n' "${{GIT_LSREMOTE_SHA:-{_SHA}}}"; exit 0 ;;
+  *"ls-remote"*)
+    # generic reviewed-ref lookup: reply with the queried ref (no hard-coded branch)
     [ "${{GIT_PRBRANCH_DELETED:-0}}" = 1 ] && exit 0
-    printf '%s\\trefs/heads/claude/phase2-engines-codex-chat\\n' "${{GIT_PRBRANCH_SHA:-{_RHEAD}}}"; exit 0 ;;
-  *"ls-remote"*)             [ "${{GIT_LSREMOTE_FAIL:-0}}" = 1 ] && exit 0; printf '%s\\trefs/heads/main\\n' "${{GIT_LSREMOTE_SHA:-{_SHA}}}"; exit 0 ;;
+    printf '%s\\t%s\\n' "${{GIT_PRBRANCH_SHA:-{_RHEAD}}}" "${{@: -1}}"; exit 0 ;;
   *) exit 0 ;;
 esac
 """)
@@ -411,9 +419,9 @@ def _status(fs):
 
 
 def _execute(fs, env_extra=None, reviewed=True):
-    args = ["--execute", "--reviewed-pr", "19", "--merged-sha", _SHA]
+    args = ["--execute", "--reviewed-pr", _RPR, "--merged-sha", _SHA]
     if reviewed:
-        args += ["--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE]
+        args += ["--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE, "--reviewed-ref", _RREF]
     return _run(fs, *args, env_extra=env_extra)
 
 
@@ -933,7 +941,7 @@ def test_reviewed_identity_missing_fails(fs):
 
 
 def test_reviewed_identity_malformed_fails(fs):
-    r = _run(fs, "--execute", "--reviewed-pr", "19", "--merged-sha", _SHA,
+    r = _run(fs, "--execute", "--reviewed-pr", _RPR, "--merged-sha", _SHA,
              "--reviewed-head", "abc", "--reviewed-tree", _RTREE)
     assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
     assert "40 hex" in r.stderr
@@ -952,6 +960,61 @@ def test_stale_live_pr_branch_fails(fs):
     r = _execute(fs, env_extra={"GIT_PRBRANCH_SHA": "4" * 40})
     assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
     assert "stale PR branch" in r.stderr
+
+
+# ═══ Hotfix — dynamic reviewed PR/ref identity (no hard-coded PR/branch) ════
+def test_reviewed_ref_dynamic_branch_succeeds(fs):
+    # a DIFFERENT PR number and a DIFFERENT branch than any other test's
+    # default prove nothing in the gate is hard-coded
+    other_ref = "refs/heads/totally-different-reviewed-branch"
+    r = _run(fs, "--execute", "--reviewed-pr", "777", "--merged-sha", _SHA,
+             "--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE,
+             "--reviewed-ref", other_ref)
+    assert _status(fs) == "DEPLOYED", r.stderr[-2000:]
+    assert _field(fs, "REVIEWED_PR") == "777"
+    assert _field(fs, "REVIEWED_REF") == other_ref
+
+
+@pytest.mark.parametrize("pr", ["", "0", "-1", "abc", "1.5", "01", " 19", "19 ", "19\n"])
+def test_reviewed_pr_invalid_rejected(fs, pr):
+    live0 = _digest(fs["live"])
+    r = _run(fs, "--execute", "--reviewed-pr", pr, "--merged-sha", _SHA,
+             "--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE,
+             "--reviewed-ref", _RREF)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "positive decimal integer" in r.stderr
+    assert _digest(fs["live"]) == live0
+
+
+def test_reviewed_ref_missing_fails(fs):
+    live0 = _digest(fs["live"])
+    r = _run(fs, "--execute", "--reviewed-pr", _RPR, "--merged-sha", _SHA,
+             "--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "refs/heads/" in r.stderr
+    assert _digest(fs["live"]) == live0
+
+
+@pytest.mark.parametrize("ref,expect", [
+    ("claude/fix-something", "refs/heads/"),           # missing refs/heads/ prefix
+    ("refs/tags/v1", "refs/heads/"),                   # wrong ref namespace
+    ("--reviewed-pr", "refs/heads/"),                  # option-like value
+    ("refs/heads/", "invalid"),                        # empty name after prefix
+    ("refs/heads/foo;rm -rf /", "invalid"),            # shell metacharacter (;)
+    ("refs/heads/foo|bar", "invalid"),                 # shell metacharacter (|)
+    ("refs/heads/$(whoami)", "invalid"),                # command substitution
+    ("refs/heads/foo bar", "invalid"),                 # embedded whitespace
+    ("refs/heads/foo\tbar", "invalid"),                # embedded control char
+    ("refs/heads/../etc/passwd", "check-ref-format"),  # ref traversal
+])
+def test_reviewed_ref_malformed_rejected(fs, ref, expect):
+    live0 = _digest(fs["live"])
+    r = _run(fs, "--execute", "--reviewed-pr", _RPR, "--merged-sha", _SHA,
+             "--reviewed-head", _RHEAD, "--reviewed-tree", _RTREE,
+             "--reviewed-ref", ref)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert expect in r.stderr
+    assert _digest(fs["live"]) == live0
 
 
 # ═══ Round 6 — Gap 2: fail-closed state + quiescence boundary ═══════════════
