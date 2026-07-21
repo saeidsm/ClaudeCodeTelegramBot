@@ -244,14 +244,48 @@ done
 exec "$@"
 """)
 
-    (b / "claude").write_text(f"""#!/usr/bin/env bash
+    (b / "claude").write_text("""#!/usr/bin/env bash
+# ANY `models` invocation is recorded — the gate must NEVER call it (it is a
+# prompt, not a subcommand; the reply is nondeterministic LLM text)
 case "$*" in
-  models*)
-    case "${{CLAUDE_MODE:-ok}}" in
-      ok)      printf '%s\\n' {" ".join(_CLAUDE_IDS)} ;;
-      partial) printf '%s\\n' claude-fable-5 claude-opus-4-8 ;;
-      fail)    exit 1 ;;
-    esac; exit 0 ;;
+  *models*)
+    touch "$SC_STATE/claude_models_called"
+    # even an answer containing every id must not be able to pass the gate
+    echo "Here are the models: claude-fable-5 claude-opus-4-8 claude-sonnet-5 claude-haiku-4-5-20251001"
+    exit 0 ;;
+  "--version")
+    case "${CLAUDE_MODE:-ok}" in
+      noversion)   exit 1 ;;
+      badversion)  echo "not-a-version"; exit 0 ;;
+      emptyversion) exit 0 ;;
+      embeddedversion) echo "Claude Code version 2.1.214 build 9"; exit 0 ;;
+      multilineversion) echo "2.1.214 (Claude Code)"; echo "extra line"; exit 0 ;;
+      bareversion) echo "2.1.214"; exit 0 ;;
+      *)           echo "2.1.214 (Claude Code)"; exit 0 ;;
+    esac ;;
+  "--help")
+    case "${CLAUDE_MODE:-ok}" in
+      nomodel) echo "Usage: claude [options]"; echo "  --print   run and exit"; exit 0 ;;
+      noprint) echo "Usage: claude [options]"; echo "  --model <model>  choose model"; exit 0 ;;
+      *) echo "Usage: claude [options] [command] [prompt]"
+         echo "  --model <model>   Model for the current session"
+         echo "  -p, --print       Print response and exit"
+         exit 0 ;;
+    esac ;;
+  "auth status --json")
+    case "${CLAUDE_MODE:-ok}" in
+      authfail)    exit 1 ;;
+      noauth)      printf '{"loggedIn": false}'; exit 0 ;;
+      authbadjson) printf 'not json {'; exit 0 ;;
+      authprefix)  printf 'note: {"loggedIn": true}'; exit 0 ;;
+      authsuffix)  printf '{"loggedIn": true} trailing'; exit 0 ;;
+      authnested)  printf '{"auth": {"loggedIn": true}}'; exit 0 ;;
+      authstring)  printf '{"loggedIn": "true"}'; exit 0 ;;
+      authnumeric) printf '{"loggedIn": 1}'; exit 0 ;;
+      authmissing) printf '{"authMethod": "claude.ai"}'; exit 0 ;;
+      autharray)   printf '[{"loggedIn": true}]'; exit 0 ;;
+      *)           printf '{"loggedIn": true, "authMethod": "claude.ai"}'; exit 0 ;;
+    esac ;;
 esac
 exit 0
 """)
@@ -514,8 +548,23 @@ def test_root_service_no_sudo_needed(fs):
 
 
 @pytest.mark.parametrize("mode_env,expect", [
-    ({"CLAUDE_MODE": "partial"}, "claude catalog missing"),
-    ({"CLAUDE_MODE": "fail"}, "claude models failed"),
+    ({"CLAUDE_MODE": "noversion"}, "claude --version failed"),
+    ({"CLAUDE_MODE": "badversion"}, "not a version"),
+    ({"CLAUDE_MODE": "emptyversion"}, "not a version"),
+    ({"CLAUDE_MODE": "embeddedversion"}, "not a version"),
+    ({"CLAUDE_MODE": "multilineversion"}, "not a version"),
+    ({"CLAUDE_MODE": "nomodel"}, "lacks --model"),
+    ({"CLAUDE_MODE": "noprint"}, "lacks --print"),
+    ({"CLAUDE_MODE": "noauth"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authfail"}, "claude auth status failed"),
+    ({"CLAUDE_MODE": "authbadjson"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authprefix"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authsuffix"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authnested"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authstring"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authnumeric"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "authmissing"}, "claude not authenticated"),
+    ({"CLAUDE_MODE": "autharray"}, "claude not authenticated"),
     ({"CODEX_LOGIN_MODE": "anon"}, "not authenticated"),
     ({"CODEX_LOGIN_MODE": "fail"}, "login status failed"),
     ({"CODEX_MODELS_MODE": "missing"}, "codex catalog missing"),
@@ -1030,3 +1079,49 @@ def test_restored_symlink_owner_corruption_rollback_failed(fs, tmp_path):
     assert r.returncode != 0
     assert _status(fs) == "ROLLBACK_FAILED"
     assert "symlink owner mismatch" in r.stderr or "symlink group mismatch" in r.stderr
+
+
+# ═══ Hotfix — deterministic Claude CLI gate (no LLM text in readiness) ══════
+def test_claude_models_is_never_invoked(fs):
+    # success run: the gate must pass WITHOUT ever calling `claude models`
+    r = _execute(fs)
+    assert _status(fs) == "DEPLOYED", r.stderr[-1500:]
+    assert not (fs["sc"] / "claude_models_called").exists()
+
+
+def test_llm_text_cannot_satisfy_the_gate(fs):
+    # `claude models` (if it were called) returns text containing EVERY adapter
+    # id — yet with auth failing, the gate must still fail closed, proving the
+    # LLM answer has no path into the readiness decision
+    r = _execute(fs, env_extra={"CLAUDE_MODE": "noauth"})
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "claude not authenticated" in r.stderr
+    assert not (fs["sc"] / "claude_models_called").exists()
+
+
+def test_claude_bare_version_output_accepted(fs):
+    # `2.1.214` with no suffix is a valid contract answer (default-mode runs
+    # already prove `2.1.214 (Claude Code)` passes)
+    r = _execute(fs, env_extra={"CLAUDE_MODE": "bareversion"})
+    assert _status(fs) == "DEPLOYED", r.stderr[-1500:]
+
+
+def test_claude_auth_response_never_printed(fs):
+    # strict-JSON rejection must not leak the auth payload into any output
+    r = _execute(fs, env_extra={"CLAUDE_MODE": "authnested"})
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "loggedIn" not in r.stdout + r.stderr
+
+
+def test_bot_claude_models_override_validated(fs):
+    # well-formed override passes; malformed (empty id) fails closed
+    (fs["live"] / ".env").write_text(
+        _ENV_ORIG + "BOT_CLAUDE_MODELS=claude-opus-4-8:Opus,claude-sonnet-5:Sonnet\n")
+    r = _execute(fs)
+    assert _status(fs) == "DEPLOYED", r.stderr[-1500:]
+
+    (fs["live"] / ".env").write_text(
+        _ENV_ORIG + "BOT_CLAUDE_MODELS=:NoId,claude-sonnet-5:Sonnet\n")
+    r = _execute(fs)
+    assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
+    assert "catalog validation failed" in r.stderr

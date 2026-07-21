@@ -686,14 +686,6 @@ resolve_service_user() {
   fi
   log "service user resolved: $SERVICE_USER (uid=$SVC_UID gid=$SVC_GID)"
 }
-_claude_expected_ids() {
-  local ov; ov="$(env_get BOT_CLAUDE_MODELS)"
-  if [ -n "$ov" ]; then
-    printf '%s' "$ov" | tr ',' '\n' | cut -d: -f1 | sed '/^$/d'
-  else
-    printf '%s\n' claude-fable-5 claude-opus-4-8 claude-sonnet-5 claude-haiku-4-5-20251001
-  fi
-}
 _codex_expected_ids() {
   local ov; ov="$(env_get BOT_CODEX_MODELS)"
   if [ -n "$ov" ]; then
@@ -705,12 +697,61 @@ _codex_expected_ids() {
 check_service_cli() {
   local claude_bin codex_bin out id
   claude_bin="${DEPLOY_CLAUDE_CMD:-claude}"; codex_bin="${DEPLOY_CODEX_CMD:-codex}"
-  # Claude: catalog CONTENT contract (the adapter's selectable ids must appear)
-  if [ -n "${DEPLOY_CLAUDE_CMD:-}" ]; then out="$("$claude_bin" models 2>&1)" || { log "claude models failed"; return 1; }
-  else out="$(run_as_svc "$claude_bin" models 2>&1)" || { log "claude models failed (svc user)"; return 1; }; fi
-  while IFS= read -r id; do
-    printf '%s' "$out" | grep -qF "$id" || { log "claude catalog missing expected id: $id"; return 1; }
-  done < <(_claude_expected_ids)
+  # ── Claude: DETERMINISTIC, read-only CLI contracts ONLY.
+  # `claude models` is NOT a real subcommand — Claude Code interprets it as a
+  # PROMPT and returns nondeterministic LLM-generated text (and consumes a model
+  # call). It is therefore BANNED from readiness: a text answer can never pass
+  # or fail this gate. Capability is proven via documented, non-generative
+  # contracts, run as the service user, with zero model consumption:
+  #   1. `claude --version`            -> the ENTIRE output must be exactly a
+  #      semver, optionally suffixed " (Claude Code)" — never merely contain one
+  #   2. `claude --help`               -> documents --model and --print
+  #   3. `claude auth status --json`   -> the ENTIRE output must be one valid
+  #      JSON object whose top-level `loggedIn` is boolean true (strict parse,
+  #      never grep; output is never printed)
+  _claude_run() {
+    if [ -n "${DEPLOY_CLAUDE_CMD:-}" ]; then "$claude_bin" "$@" 2>&1
+    else run_as_svc "$claude_bin" "$@" 2>&1; fi
+  }
+  local ver_re='^[0-9]+\.[0-9]+\.[0-9]+( \(Claude Code\))?$'
+  out="$(_claude_run --version)" || { log "claude --version failed"; return 1; }
+  [[ "$out" =~ $ver_re ]] \
+    || { log "claude --version output is not a version (contract failed)"; return 1; }
+  out="$(_claude_run --help)" || { log "claude --help failed"; return 1; }
+  printf '%s' "$out" | grep -qF -- '--model' || { log "claude --help lacks --model (contract failed)"; return 1; }
+  printf '%s' "$out" | grep -qF -- '--print' || { log "claude --help lacks --print (contract failed)"; return 1; }
+  out="$(_claude_run auth status --json)" || { log "claude auth status failed"; return 1; }
+  printf '%s' "$out" | "$PYTHON" -c '
+import json, sys
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if isinstance(doc, dict) and doc.get("loggedIn") is True else 1)
+' || { log "claude not authenticated (auth status contract failed)"; return 1; }
+  # Catalog validity comes from the DETERMINISTIC adapter source + the validated
+  # BOT_CLAUDE_MODELS override from the single env parse — never from LLM text,
+  # and no Claude request is made.
+  local ov
+  ov="$(env_get BOT_CLAUDE_MODELS)"
+  BOT_CLAUDE_MODELS_OVERRIDE="$ov" PYTHONPATH="$SOURCE" PYTHONDONTWRITEBYTECODE=1 \
+    "$PYTHON" - <<'PYCAT' || { log "claude catalog validation failed (adapter source / BOT_CLAUDE_MODELS)"; return 1; }
+import os, sys
+from engines import claude_adapter as ca
+ids = [m.id for m in ca._DEFAULT_CATALOG if m.id]
+if not ids:
+    sys.exit("adapter default catalog empty")
+ov = os.environ.get("BOT_CLAUDE_MODELS_OVERRIDE", "").strip()
+if ov:
+    pairs = [p for p in ov.split(",") if p.strip()]
+    if not pairs:
+        sys.exit("BOT_CLAUDE_MODELS set but contains no entries")
+    for p in pairs:
+        mid = p.split(":", 1)[0].strip()
+        if not mid:
+            sys.exit(f"BOT_CLAUDE_MODELS malformed entry: {p!r}")
+print("claude-catalog-ok")
+PYCAT
   # Codex: authenticated login, model discovery, exec/resume contracts
   if [ -n "${DEPLOY_CODEX_CMD:-}" ]; then
     out="$("$codex_bin" login status 2>&1)" || { log "codex login status failed"; return 1; }

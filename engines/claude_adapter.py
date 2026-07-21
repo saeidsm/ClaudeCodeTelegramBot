@@ -12,9 +12,10 @@ import os
 
 from .base import Capabilities, EngineAdapter, ModelInfo, ENGINE_CLAUDE
 
-# Account-visible catalog verified via `claude models` (Phase A recon).
-# Env-overridable if the account catalog changes, so we never hardcode a
-# marketing label as an unverified id long-term.
+# Static catalog of known `--model` ids, overridable via BOT_CLAUDE_MODELS if
+# the account catalog changes. There is no `claude models` subcommand and
+# readiness never issues a Claude prompt/model call to verify this list — it
+# is validated purely from this source plus the env override.
 _DEFAULT_CATALOG = [
     ModelInfo("", "Default (CLI default)"),
     ModelInfo("claude-fable-5", "Fable 5"),
