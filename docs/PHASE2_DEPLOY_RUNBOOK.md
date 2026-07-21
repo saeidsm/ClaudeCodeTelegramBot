@@ -27,15 +27,26 @@ Invoke:
 
 ```
 scripts/deploy-phase1-phase2.sh --preflight --merged-sha <40-hex> --source <detached-wt>
-scripts/deploy-phase1-phase2.sh --execute --reviewed-pr 19 \
+scripts/deploy-phase1-phase2.sh --execute --reviewed-pr <owner-authorized PR number> \
     --reviewed-head <owner-authorized PR-head 40-hex> \
     --reviewed-tree <owner-authorized tree 40-hex> \
+    --reviewed-ref refs/heads/<owner-authorized PR branch> \
     --merged-sha <40-hex> --source <detached-wt>
 ```
 
-The reviewed head/tree come from the owner's review record of PR #19
-(`git rev-parse <reviewed-head>` / `git rev-parse <reviewed-head>^{tree}` at
-review time) — they are the authorization, not something derived at deploy time.
+The reviewed PR/ref/head/tree come from the owner's review record of the PR
+being deployed (`git rev-parse <reviewed-head>` / `git rev-parse
+<reviewed-head>^{tree}` at review time) — they are the authorization, not
+something derived at deploy time or hard-coded in the script. Each is
+strictly validated: `--reviewed-pr` a positive decimal integer, `--reviewed-
+head`/`--reviewed-tree` lowercase 40-hex, `--reviewed-ref` an exact
+`refs/heads/...` value validated against a restrictive charset and `git
+check-ref-format` (rejects traversal, malformed refs, and option-like/shell-
+metacharacter values).
+
+(Historical: the Phase 2 rollout that first exercised this gate was PR #19 on
+branch `claude/phase2-engines-codex-chat` — the script no longer hard-codes
+either value; every subsequent reviewed PR supplies its own.)
 
 The script performs, in order, exactly:
 
@@ -91,15 +102,19 @@ The script performs, in order, exactly:
    `BOT_CHAT_SESSIONS_DIR`/`BOT_COORDINATION_FILE`/`BOT_CHAT_CATALOG_CACHE`),
    contained inside the live root (fail-closed on escape/symlink).
 4. **Execute-only — reviewed-tree AUTHORIZATION gate (squash/merge-safe):**
-   require `--reviewed-pr 19` **and** the owner-authorized `--reviewed-head` +
-   `--reviewed-tree` (40-hex each). The merged source tree
+   require a strictly validated `--reviewed-pr` (positive integer, no hard-
+   coded number) **and** the owner-authorized `--reviewed-head` +
+   `--reviewed-tree` (40-hex each) **and** `--reviewed-ref` (an exact
+   `refs/heads/...` value — no hard-coded branch — validated against a
+   restrictive charset and `git check-ref-format`). The merged source tree
    (`git rev-parse <MERGED_SHA>^{tree}`) must equal the reviewed TREE exactly —
-   commit-SHA equality is insufficient under squash merge. If the PR head branch
-   still exists remotely, a read-only `ls-remote` must show it equal to the
-   reviewed head (stale branch fails); if the branch was deleted after merge,
-   the reviewed-tree equality is the decisive immutable gate (documented case).
-   The reviewed head/tree and merged tree are recorded in the transaction
-   report. Then acquire the single deploy **flock**.
+   commit-SHA equality is insufficient under squash merge. A read-only
+   `ls-remote` of ONLY the supplied `--reviewed-ref` must show it equal to the
+   reviewed head if the branch still exists remotely (stale branch fails); if
+   the branch was deleted after merge, the reviewed-tree equality is the
+   decisive immutable gate (documented case). The reviewed PR/ref/head/tree
+   and merged tree are recorded in the transaction report. Then acquire the
+   single deploy **flock**.
 4b. **Quiescence boundary (before ANY file mutation):** re-verify zero
    running/queued sessions from the STRICT state read (a missing/unreadable/
    malformed state file or unknown status now fails closed — never "0"), then
@@ -170,12 +185,17 @@ The remaining sections document acceptance evidence to confirm afterwards.
 ## Gate 0 — do not mutate until all true
 
 ```
-GO PHASE2 DEPLOY
-REVIEWED_PR=19
+GO DEPLOY
+REVIEWED_PR=<owner-authorized PR number>
+REVIEWED_REF=refs/heads/<owner-authorized PR branch>
 MERGED_SHA=<full 40-char SHA>
 ```
 
-- PR #19 is **merged**; `MERGED_SHA == origin/main` (fetch read-only to confirm).
+(Historical: the first run of this gate used `REVIEWED_PR=19`,
+`REVIEWED_REF=refs/heads/claude/phase2-engines-codex-chat` — neither is
+hard-coded in the script; every reviewed PR supplies its own values.)
+
+- The reviewed PR is **merged**; `MERGED_SHA == origin/main` (fetch read-only to confirm).
 - The reviewed head tree equals the merge tree (supports **squash** merge: compare
   `git rev-parse <MERGED_SHA>^{tree}` against the reviewed tree, not the commit).
 - The implementation-report gates passed.
@@ -236,7 +256,13 @@ Run as the exact service user determined in Gate 2:
 - `codex login status` → must be logged in (ChatGPT). `codex debug models` → Sol/
   Terra/Luna present. `codex exec --help` / `codex exec resume --help` → the
   `--json` + `resume <SESSION_ID>` contract still holds.
-- `claude models` → catalog visible.
+- Claude readiness is version/help/strict-auth-JSON ONLY — `claude --version`
+  (exact semver, optionally suffixed ` (Claude Code)`), `claude --help` (must
+  document `--model` and `--print`), `claude auth status --json` (strict
+  Python JSON parse of the complete output; top-level `loggedIn` must be
+  exactly boolean `true`). `claude models` is **not** a subcommand — it is
+  interpreted as a prompt, returns nondeterministic LLM text, and is banned
+  from readiness; it is never invoked and can neither pass nor fail this gate.
 - OpenRouter reachable (`GET /api/v1/models`) with the **existing** key.
   **A missing/invalid `OPENROUTER_API_KEY` is a pre-mutation NO-GO** — never
   invent or edit the secret.

@@ -40,7 +40,9 @@
 #
 # Usage:
 #   deploy-phase1-phase2.sh --preflight --merged-sha <40-hex> --source <detached-wt>
-#   deploy-phase1-phase2.sh --execute  --reviewed-pr 19 --merged-sha <40-hex> --source <detached-wt>
+#   deploy-phase1-phase2.sh --execute --reviewed-pr <positive-int> \
+#       --reviewed-head <40-hex> --reviewed-tree <40-hex> --reviewed-ref refs/heads/<name> \
+#       --merged-sha <40-hex> --source <detached-wt>
 #   deploy-phase1-phase2.sh --tree-manifest <dir>       # print tree manifest (test/verify utility)
 #
 # Test seams (honoured ONLY with --test-root beneath /tmp; production refuses
@@ -64,7 +66,7 @@ PROD_HEALTH_POLL=2               # seconds between polls
 PROD_OBSERVE_SECONDS=90
 
 MODE="preflight"; REVIEWED_PR=""; MERGED_SHA=""; TEST_ROOT=""; TREE_DIR=""
-REVIEWED_HEAD=""; REVIEWED_TREE=""; MERGED_TREE=""
+REVIEWED_HEAD=""; REVIEWED_TREE=""; REVIEWED_REF=""; MERGED_TREE=""
 SET_FILE=""; SET_KEY=""; SET_VAL=""
 SOURCE="${DEPLOY_SOURCE:-}"
 
@@ -98,6 +100,7 @@ while [ $# -gt 0 ]; do
     --reviewed-pr) REVIEWED_PR="${2:-}"; shift ;;
     --reviewed-head) REVIEWED_HEAD="${2:-}"; shift ;;
     --reviewed-tree) REVIEWED_TREE="${2:-}"; shift ;;
+    --reviewed-ref) REVIEWED_REF="${2:-}"; shift ;;
     --merged-sha)  MERGED_SHA="${2:-}"; shift ;;
     --source)      SOURCE="${2:-}"; shift ;;
     --test-root)   TEST_ROOT="${2:-}"; shift ;;
@@ -490,6 +493,8 @@ on_exit() {
     echo "FORWARD_RESTARTS: $RESTARTED_FWD"
     echo "QUIESCE_STOPS: $QUIESCE_STOPS"
     echo "QUIESCE_RESTORE: $QUIESCE_RESTORE"
+    echo "REVIEWED_PR: ${REVIEWED_PR:-<none>}"
+    echo "REVIEWED_REF: ${REVIEWED_REF:-<none>}"
     echo "REVIEWED_HEAD: ${REVIEWED_HEAD:-<none>}"
     echo "REVIEWED_TREE: ${REVIEWED_TREE:-<none>}"
     echo "MERGED_TREE: ${MERGED_TREE:-<none>}"
@@ -1223,26 +1228,40 @@ if [ "$MODE" = "preflight" ]; then
 fi
 
 # ── Gap 1: reviewed-tree AUTHORIZATION gate (squash/merge-safe) ─────────────
-# Typing --reviewed-pr 19 is not authorization. Execute mode must prove the
+# Typing --reviewed-pr <N> is not authorization. Execute mode must prove the
 # merged SOURCE TREE is byte-identical to the owner-authorized reviewed tree:
 # commit-SHA equality is insufficient because squash merge rewrites the commit.
+# There is no hard-coded PR number or branch: the reviewed PR/ref/head/tree are
+# ALWAYS supplied identities, strictly validated below, never assumed.
 gate_reviewed_identity() {
   fail_at gate_reviewed_identity && die "forced: gate_reviewed_identity"
-  echo "$REVIEWED_HEAD" | grep -Eq '^[0-9a-f]{40}$' \
+  # [[ =~ ]] anchors ^/$ on the WHOLE string; `echo | grep` would match a
+  # valid token on any ONE line and let embedded-newline junk slip through.
+  [[ "$REVIEWED_PR" =~ ^[1-9][0-9]*$ ]] \
+    || die "reviewed PR must be a positive decimal integer (--reviewed-pr)"
+  [[ "$REVIEWED_HEAD" =~ ^[0-9a-f]{40}$ ]] \
     || die "reviewed head must be 40 hex (--reviewed-head; owner-authorized PR head)"
-  echo "$REVIEWED_TREE" | grep -Eq '^[0-9a-f]{40}$' \
+  [[ "$REVIEWED_TREE" =~ ^[0-9a-f]{40}$ ]] \
     || die "reviewed tree must be 40 hex (--reviewed-tree; owner-authorized tree id)"
+  case "$REVIEWED_REF" in
+    refs/heads/*) : ;;
+    *) die "reviewed ref must start with refs/heads/ (--reviewed-ref)" ;;
+  esac
+  [[ "$REVIEWED_REF" =~ ^refs/heads/[A-Za-z0-9._/-]+$ ]] \
+    || die "reviewed ref contains invalid/control/shell-metacharacter bytes (--reviewed-ref)"
+  $GITCMD check-ref-format "$REVIEWED_REF" \
+    || die "reviewed ref fails git check-ref-format (--reviewed-ref; malformed/traversal ref)"
   MERGED_TREE="$($GITCMD -C "$SOURCE" rev-parse "${MERGED_SHA}^{tree}" 2>/dev/null | head -1)"
   [ -n "$MERGED_TREE" ] || die "cannot resolve merged tree for $MERGED_SHA"
   [ "$MERGED_TREE" = "$REVIEWED_TREE" ] \
     || die "merged tree ($MERGED_TREE) != owner-authorized reviewed tree ($REVIEWED_TREE) — squash-safe gate"
-  # If the PR head branch still exists remotely, its head must equal the
-  # reviewed head (read-only ls-remote; never a fetch). DOCUMENTED CASE: if the
-  # branch was deleted after merge, ls-remote returns nothing and the reviewed-
-  # TREE equality above remains the decisive, immutable authorization.
-  local ref lrout
-  ref="refs/heads/claude/phase2-engines-codex-chat"
-  lrout="$($GITCMD -C "$SOURCE" ls-remote origin "$ref" 2>/dev/null | awk 'NR==1{print $1}')"
+  # If the reviewed ref still exists remotely, its head must equal the
+  # reviewed head (read-only ls-remote of ONLY the supplied ref; never a
+  # fetch). DOCUMENTED CASE: if the branch was deleted after merge, ls-remote
+  # returns nothing and the reviewed-TREE equality above remains the decisive,
+  # immutable authorization.
+  local lrout
+  lrout="$($GITCMD -C "$SOURCE" ls-remote origin "$REVIEWED_REF" 2>/dev/null | awk 'NR==1{print $1}')"
   if [ -n "$lrout" ]; then
     [ "$lrout" = "$REVIEWED_HEAD" ] \
       || die "live PR branch head ($lrout) != reviewed head ($REVIEWED_HEAD) — stale PR branch"
@@ -1252,7 +1271,6 @@ gate_reviewed_identity() {
   fi
 }
 
-[ "$REVIEWED_PR" = "19" ] || die "reviewed PR must be 19"
 gate_reviewed_identity
 exec 9>"$LOCK"; flock -n 9 || die "another deploy holds the lock"
 
