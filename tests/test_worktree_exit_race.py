@@ -41,7 +41,13 @@ class FakeWork:
         self.exit_started = threading.Event()
         self.exit_gate = threading.Event()
         self.enter_calls = 0
-        self.exit_calls = 0
+        self.exit_calls = 0  # counts COMPLETED exit_sync calls (post-rmtree), not merely started ones
+        # Snapshot, taken synchronously inside exit_sync itself, of whether THIS
+        # cleanup left the path absent at the moment it ran. A same-path
+        # successor (e.g. B in the race tests) may legitimately recreate the
+        # path the instant completion is observed, so re-checking the live path
+        # afterward is racy against that successor — this field is not.
+        self.removed_own_path = False
         self.fail_enter = fail_enter
 
     def enter_sync(self):
@@ -56,8 +62,14 @@ class FakeWork:
     def exit_sync(self, *a):
         self.exit_started.set()
         self.exit_gate.wait(timeout=5)
-        self.exit_calls += 1
+        # rmtree, then the removal snapshot, MUST both finish before exit_calls
+        # increments: waiters poll exit_calls as a completion signal, and a
+        # same-path successor cannot start until this call returns (it is only
+        # unblocked by this thread's OWN asyncio.to_thread future completing) —
+        # so nothing else can touch self.path between rmtree and this snapshot.
         shutil.rmtree(self.path, ignore_errors=True)
+        self.removed_own_path = not os.path.exists(self.path)
+        self.exit_calls += 1
         return False
 
 
@@ -76,6 +88,18 @@ async def _drive_until(pred, tries=300, delay=0.01):
             return True
         await asyncio.sleep(delay)
     return False
+
+
+def test_fakework_exit_calls_counts_only_after_rmtree_returns(tmp_path):
+    """Direct, synchronous guard on FakeWork's own completion signal — pins the
+    exact ordering bug fixed in exit_sync, independent of asyncio scheduling."""
+    fake = FakeWork(tmp_path / "wt" / "direct")
+    os.makedirs(fake.path)
+    fake.exit_gate.set()
+    fake.exit_sync()
+    assert fake.exit_calls == 1
+    assert fake.removed_own_path
+    assert not os.path.exists(fake.path)
 
 
 # ── steps 1-8: the real production-shaped race, repeated for flakiness ──────
@@ -132,9 +156,13 @@ async def test_exit_cancel_race_B_blocked_until_A_exit_completes(tmp_path):
 
         # (5) Release A's exit — it completes exactly once, even though the
         # outer task has already unwound from its second cancellation.
+        # B shares A's exact path and is unblocked to enter (and recreate that
+        # path via os.makedirs) the instant A's barrier resolves — so we must
+        # assert on A's OWN removal snapshot, taken synchronously inside its
+        # exit_sync, never by re-checking the live (shared, racing) path here.
         fakeA.exit_gate.set()
         assert await _drive_until(lambda: fakeA.exit_calls == 1)
-        assert not os.path.exists(fakeA.path)
+        assert fakeA.removed_own_path, "A's cleanup did not remove its own tree before reporting completion"
 
         # (6) B then enters; A's (already-finished) exit never touches B's tree.
         await tB
@@ -217,7 +245,6 @@ async def test_second_cancellation_delivered_mid_exit_is_idempotent(tmp_path):
     # cancellations our await received; releasing it completes exactly once.
     fakeA.exit_gate.set()
     assert await _drive_until(lambda: fakeA.exit_calls >= 1)
-    await asyncio.sleep(0.05)
     assert fakeA.exit_calls == 1, "double cancellation caused _exit_sync to run more than once"
     assert not os.path.exists(fakeA.path)
     canonical = bot._canonical_worktree_path(fakeA.path)
