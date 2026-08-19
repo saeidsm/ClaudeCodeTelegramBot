@@ -29,18 +29,19 @@ from .base import Capabilities, EngineAdapter, ModelInfo, ENGINE_CHAT
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Ten owner-configured favorites (verified live). Override via BOT_CHAT_FAVORITES.
+# Ten owner-configured favorites — newest model of each family, verified live
+# against GET /api/v1/models. Override via BOT_CHAT_FAVORITES.
 _DEFAULT_FAVORITES = [
-    "z-ai/glm-5.2",                  # GLM 5.2  (required)
-    "minimax/minimax-m3",            # MiniMax M3 (required)
-    "qwen/qwen3.7-max",              # Qwen     (required)
-    "anthropic/claude-opus-4.8",
+    "z-ai/glm-5.3",                  # GLM      (required)
+    "minimax/minimax-m3",            # MiniMax  (required)
+    "qwen/qwen3.8-max",              # Qwen     (required)
+    "moonshotai/kimi-k3",            # Kimi
+    "anthropic/claude-opus-5",
     "anthropic/claude-sonnet-5",
-    "openai/gpt-5.6-luna",
+    "openai/gpt-5.6-sol",
     "google/gemini-3.1-pro-preview",
-    "x-ai/grok-4.5",
-    "deepseek/deepseek-v4-pro",
-    "meta-llama/llama-4-maverick",
+    "x-ai/grok-4.6",
+    "deepseek/deepseek-v4-pro-0813",
 ]
 
 CHAT_SYSTEM_PROMPT = (

@@ -113,6 +113,6 @@ async def test_emod_no_active_session_fails_closed(monkeypatch):
 
 def test_claude_catalog_has_named_models():
     ids = [m.id for m in eb.get_adapter("claude").list_models()]
-    for want in ("", "claude-fable-5", "claude-opus-4-8", "claude-sonnet-5",
-                 "claude-haiku-4-5-20251001"):
+    for want in ("", "claude-opus-5", "claude-opus-5[1m]", "claude-sonnet-5",
+                 "claude-sonnet-5[1m]", "claude-fable-5", "claude-haiku-4-5"):
         assert want in ids
