@@ -225,8 +225,8 @@ def load_prompts():
             return json.load(f)
     except Exception:
         return {
-            "transcribe": {"model": "gemini-2.5-flash", "prompt": "Transcribe this voice message exactly. Farsi or English. Return ONLY the transcription."},
-            "refine": {"model": "gemini-2.5-flash", "prompt": "Convert this casual command into a structured Claude Code prompt:\n\"{text}\"\n\nReturn ONLY the prompt."},
+            "transcribe": {"model": "gemini-3.7-flash", "prompt": "Transcribe this voice message exactly. Farsi or English. Return ONLY the transcription."},
+            "refine": {"model": "gemini-3.1-pro-preview", "prompt": "Convert this casual command into a structured Claude Code prompt:\n\"{text}\"\n\nReturn ONLY the prompt."},
             "voice_commands": {}
         }
 
@@ -492,7 +492,7 @@ async def gemini_fallback(prompt: str, project: str) -> str:
     try:
         # Use refine model from gemini-prompts.json (most capable)
         cfg = load_prompts().get("refine", {})
-        model = cfg.get("model", "gemini-2.5-flash")
+        model = cfg.get("model", "gemini-3.7-flash")
         r = gemini_client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text":
@@ -2402,7 +2402,7 @@ async def transcribe(path):
         cfg = load_prompts().get("transcribe", {})
         with open(path, "rb") as f: data = f.read()
         r = gemini_client.models.generate_content(
-            model=cfg.get("model", "gemini-2.5-flash"),
+            model=cfg.get("model", "gemini-3.7-flash"),
             contents=[{"role": "user", "parts": [
                 {"text": cfg.get("prompt", "Transcribe this voice message.")},
                 {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(data).decode()}}
@@ -2418,7 +2418,7 @@ async def refine_prompt(text):
         template = cfg.get("prompt", "Refine: \"{text}\"")
         filled = template.replace("{text}", text)
         r = gemini_client.models.generate_content(
-            model=cfg.get("model", "gemini-2.5-flash"),
+            model=cfg.get("model", "gemini-3.7-flash"),
             contents=[{"role": "user", "parts": [{"text": filled}]}])
         return r.text.strip()
     except Exception as e:
@@ -3214,8 +3214,8 @@ async def cmd_model(u, c):
     prov = ACTIVE_FALLBACK["provider"]
     model = ACTIVE_FALLBACK.get("model", "")
     prompts_cfg = load_prompts()
-    gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-2.5-flash")
-    gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-2.5-flash")
+    gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-3.7-flash")
+    gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-3.1-pro-preview")
     current_fb = f"{prov}" + (f" ({model or gemini_refine})" if prov == "gemini" else f" ({model})" if model else "")
 
     rows = []
