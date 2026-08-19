@@ -34,7 +34,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, ExtBot
+    TypeHandler, ApplicationHandlerStop, filters, ContextTypes, ExtBot
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import BadRequest
@@ -4859,6 +4859,40 @@ _PERSISTED_SESSION_FIELDS = (
     "engine", "model", "provider_session_id", "chat_history_ref",
 )
 
+# ── Telegram update_id dedup (Phase 0 A3 — risk R3) ──
+# Telegram's update_id increases strictly per bot token; the only way a
+# handler ever sees the same one twice is a transport-level retry (the
+# getUpdates response was lost/timed out client-side, so PTB re-requests the
+# same offset and Telegram resends the same update). This Application never
+# calls .concurrent_updates(...) in main(), so PTB's default
+# max_concurrent_updates=1 applies: process_update() dispatches exactly one
+# update at a time, in delivery order — no other update's dedup check can
+# interleave with this one (single-threaded event loop, no `await` inside
+# _is_duplicate_update). Given those two guarantees, a plain monotonic
+# high-water mark is both correct and O(1):
+#   - it is at least as good as a bounded LRU of seen ids at catching a
+#     retry, since Telegram never reuses or reorders ids for this bot, and
+#   - unlike a bounded LRU, it can NEVER be tricked by a slow retry that
+#     arrives after enough intervening traffic would have evicted the
+#     original id from a capped cache — the ceiling never forgets.
+# A "recent set" alongside the HWM was considered and dropped: it would not
+# add real protection here (any id <= HWM is a genuine duplicate today), and
+# if concurrent_updates is ever turned on later, a small LRU wouldn't fix the
+# resulting race either (a lower id could legitimately arrive after a higher
+# one already advanced the ceiling) — that would need a real windowed/bitmap
+# scheme, not a bigger cache. Flag for revisit if concurrent_updates changes.
+_UPDATE_ID_HWM = 0
+
+
+def _is_duplicate_update(update_id: int) -> bool:
+    """Synchronous check-and-set against the high-water mark. Returns True
+    (and does NOT advance the mark) if `update_id` was already accepted."""
+    global _UPDATE_ID_HWM
+    if update_id <= _UPDATE_ID_HWM:
+        return True
+    _UPDATE_ID_HWM = update_id
+    return False
+
 
 def save_state():
     """Dump SessionManager + ACTIVE_SESSION to disk atomically.
@@ -4876,6 +4910,7 @@ def save_state():
             "msg_to_session": {str(mid): sk for mid, sk in SM.msg_to_session.items()},
             "color_index": {str(cid): idx for cid, idx in SM.color_index.items()},
             "active_session": {str(cid): sk for cid, sk in ACTIVE_SESSION.items()},
+            "update_dedup_hwm": _UPDATE_ID_HWM,
         }
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -4954,8 +4989,17 @@ def load_state():
                 ACTIVE_SESSION[int(cid_str)] = sk
             except ValueError:
                 pass
+        # Restore the update_id dedup ceiling. max(...) with the in-memory
+        # value (0 at boot) is defensive only — belt-and-suspenders in case
+        # load_state is ever called more than once in a process lifetime.
+        global _UPDATE_ID_HWM
+        try:
+            _UPDATE_ID_HWM = max(_UPDATE_ID_HWM, int(state.get("update_dedup_hwm", 0) or 0))
+        except (TypeError, ValueError):
+            pass
         saved_ago = int(time.time() - state.get("saved_at", 0))
-        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old)")
+        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old); "
+                 f"update_dedup_hwm={_UPDATE_ID_HWM}")
     except Exception as e:
         log.error(f"load_state restore error: {e}")
 
@@ -5499,6 +5543,27 @@ async def cmd_nightwatch_last(update, context):
         parse_mode=ParseMode.HTML)
 
 
+async def _dedup_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """group=-1 chokepoint — every Update (each CommandHandler, MessageHandler,
+    and the CallbackQueryHandler included) passes through here first, since
+    PTB evaluates handler groups in ascending order and ApplicationHandlerStop
+    halts ALL later groups for this update. This is deliberately the ONE
+    place update_id dedup happens — patching each handler individually would
+    leave any handler someone adds later (or one of the 18 that already exist)
+    unprotected.
+
+    Dedup is on the transport-level `update_id` ONLY. A user double-tapping
+    the same inline button produces two Updates with two DIFFERENT update_ids
+    and both are legitimate, distinct user actions — that is NOT deduped
+    here, same as before this change. Only an exact retry of one already-seen
+    update_id (e.g. Telegram resending because our getUpdates ack was lost)
+    is suppressed.
+    """
+    if _is_duplicate_update(update.update_id):
+        log.warning(f"update_dedup.duplicate update_id={update.update_id}")
+        raise ApplicationHandlerStop
+
+
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
     log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
@@ -5528,6 +5593,9 @@ def main():
     BOT = app.bot
     APPLICATION = app
     # The footer is applied by FooterBot (built above); no instance patching.
+    # Dedup gate runs in group -1 — before every other handler below, for
+    # every update kind (see _dedup_gate docstring for why one chokepoint).
+    app.add_handler(TypeHandler(Update, _dedup_gate), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))
