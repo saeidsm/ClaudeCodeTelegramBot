@@ -5124,6 +5124,10 @@ async def post_init(app):
         await _nw_ipc_start(app)
     else:
         log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
+    # Session query API: same "quiet no-op without a secret" gate as NightWatch
+    # IPC above, so a second bot instance (no BOT_SESSION_API_TOKEN set) never
+    # fights over the port.
+    await _sessapi_start(app)
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | Consult(GPT)={'\u2705' if OPENAI_API_KEY else '\u274c'} | Sonnet1M={SONNET_1M_MODEL}")
 
 # Bounded deadline for awaiting cancelled run tasks during shutdown. Kept well
@@ -5283,6 +5287,7 @@ async def graceful_shutdown(app):
                 log.info(f"bg_task.cancelled name={task_name} err={type(e).__name__}")
     if BOT_NIGHTWATCH_IPC_ENABLED:
         await _nw_ipc_stop()
+    await _sessapi_stop()
     # Collect active sessions info before killing (running OR queued/waiting).
     active = [(k, s) for k, s in SM.sessions.items() if s.status in ("running", "queued")]
     # Cancel queued/in-flight execution tasks AND await their real cleanup under
@@ -5485,6 +5490,108 @@ async def _nw_ipc_stop():
     if _NW_RUNNER is None: return
     try: await asyncio.wait_for(_NW_RUNNER.cleanup(), timeout=5.0)
     except asyncio.TimeoutError: log.warning("nightwatch_ipc.cleanup_timeout")
+
+
+# ── Session query API (Phase 0 A3 Task 2 — read-only console prerequisite) ──
+# A SECOND aiohttp Application/AppRunner in this same process/event loop —
+# same library, same lifecycle wiring (started in post_init, stopped in
+# graceful_shutdown, right alongside the NightWatch IPC listener) — but
+# deliberately its own `web.Application()`, not a new route on `a` above.
+# aiohttp shares one router across every TCPSite bound to an AppRunner: adding
+# a 172.17.0.1 bind to the NightWatch app would also put /inject (a WRITE
+# endpoint, HMAC-gated, VPC+loopback only today) on the docker bridge — an
+# exposure change to an existing endpoint nobody asked for. A separate
+# Application keeps that change scoped to this brand-new, GET-only endpoint,
+# which is the "does not entangle the two auth schemes" judgment call the
+# task asked for. What IS reused from the NightWatch pattern: AppRunner/
+# TCPSite setup, hmac.compare_digest for the auth check, and the post_init/
+# graceful_shutdown lifecycle hooks.
+#
+# Auth: a plain shared-secret bearer token compared with hmac.compare_digest,
+# not an HMAC-over-body signature like _nw_inject's. _nw_inject signs a POST
+# body because it needs to authenticate THAT payload; a GET has no body worth
+# signing, so borrowing hmac.compare_digest for a timing-safe token compare is
+# the correct-sized version of the same pattern, not a shortcut around it.
+BOT_SESSION_API_TOKEN = os.environ.get("BOT_SESSION_API_TOKEN", "").strip()
+BOT_SESSION_API_PORT = _positive_int_env("BOT_SESSION_API_PORT", 9092)
+# 172.17.0.1 = docker0 bridge — reachable from the Caddy container via
+# host.docker.internal, unreachable from the public internet without an
+# explicit ufw allow (see docs/phase0/a3-*.md for the proposed rule). Same
+# posture as gfrc (:8088) and hermes-dashboard (:8642).
+BOT_SESSION_API_BIND = os.environ.get("BOT_SESSION_API_BIND", "172.17.0.1").strip()
+_SESSAPI_RUNNER = None
+
+
+def _sessapi_authorized(req) -> bool:
+    token = req.headers.get("X-Session-API-Token", "")
+    return bool(token) and bool(BOT_SESSION_API_TOKEN) and hmac.compare_digest(
+        token.encode(), BOT_SESSION_API_TOKEN.encode())
+
+
+async def _sessapi_sessions(req):
+    """Read-only snapshot of live SessionManager state.
+
+    Exposes exactly: id/label/engine/model/project, created (started_at) and
+    last-active timestamps, running state (status), active_session per chat,
+    and summary counts. Deliberately excludes session_uuid/provider_session_id
+    (thread ids), message_ids, anchor_message_id, chat_history_ref, and
+    anything from worktree paths, prompts, or transcripts — none of that is
+    on this response.
+    """
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    sessions = [
+        {
+            "id": s.id,
+            "label": s.label,
+            "engine": s.engine,
+            "model": (s.claude_model if s.engine == engines.ENGINE_CLAUDE else s.model) or "",
+            "project": s.project,
+            "status": s.status,
+            "started_at": s.started_at,
+            "last_active": s.last_active,
+        }
+        for s in SM.sessions.values()
+    ]
+    counts: dict = defaultdict(int)
+    counts["total"] = len(sessions)
+    for s in SM.sessions.values():
+        counts[s.status] += 1
+    return _aw.json_response({
+        "ok": True,
+        "sessions": sessions,
+        "active_session": {str(cid): key for cid, key in ACTIVE_SESSION.items()},
+        "counts": dict(counts),
+    })
+
+
+async def _sessapi_start(app):
+    global _SESSAPI_RUNNER
+    if not BOT_SESSION_API_TOKEN:
+        log.warning("session_api.disabled reason=missing_secret")
+        return
+    a = _aw.Application()
+    a.router.add_get("/sessions", _sessapi_sessions)
+    runner = _aw.AppRunner(a)
+    await runner.setup()
+    try:
+        await _aw.TCPSite(runner, BOT_SESSION_API_BIND, BOT_SESSION_API_PORT).start()
+    except Exception as ex:
+        log.error(f"session_api.bind_failed bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}: {ex}")
+        await runner.cleanup()
+        return
+    _SESSAPI_RUNNER = runner
+    log.info(f"session_api.listening bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}")
+
+
+async def _sessapi_stop():
+    if _SESSAPI_RUNNER is None:
+        return
+    try:
+        await asyncio.wait_for(_SESSAPI_RUNNER.cleanup(), timeout=5.0)
+    except asyncio.TimeoutError:
+        log.warning("session_api.cleanup_timeout")
+
 
 @authorized
 async def cmd_nightwatch_ping(update, context):
