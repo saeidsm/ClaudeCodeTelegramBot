@@ -149,7 +149,7 @@ BOT_MAX_SESSIONS=4                  # concurrent sessions per chat
 # "" = CLI default (latest Sonnet/Opus per your plan)
 # "sonnet" = explicit Sonnet
 # "opus" = explicit Opus
-# "claude-sonnet-4-6" = pinned model name
+# "claude-opus-5" = pinned model name
 BOT_DEFAULT_CLAUDE_MODEL=
 ```
 

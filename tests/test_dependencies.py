@@ -48,5 +48,8 @@ def test_required_openrouter_favorites_present():
     # defaults drift so a live-catalog divergence is caught at review, not runtime.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from engines.openrouter_chat import _DEFAULT_FAVORITES
-    for want in ("z-ai/glm-5.2", "minimax/minimax-m3", "qwen/qwen3.7-max"):
-        assert want in _DEFAULT_FAVORITES, f"required default favorite missing: {want}"
+    # Family-level, not version-pinned: a catalog refresh may bump GLM 5.2 → 5.3,
+    # but silently dropping one of the three required families still fails closed.
+    for family in ("z-ai/glm", "minimax/minimax", "qwen/qwen"):
+        assert any(f.startswith(family) for f in _DEFAULT_FAVORITES), \
+            f"required default favorite missing: {family}"

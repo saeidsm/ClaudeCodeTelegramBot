@@ -125,8 +125,8 @@ BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
 # Sonnet-1M model offered as an immediate switch when Claude (Opus) is
 # overloaded. The "[1m]" suffix selects the 1M-context variant (same syntax the
-# CLI uses for claude-opus-4-8[1m]). Override via env if the id ever changes.
-SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "claude-sonnet-4-6[1m]")
+# CLI uses for claude-opus-5[1m]). Override via env if the id ever changes.
+SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "claude-sonnet-5[1m]")
 # Seconds to wait before the single automatic retry on a Claude rate-limit.
 try:
     RATE_LIMIT_RETRY_DELAY = int(os.environ.get("BOT_RATE_LIMIT_RETRY_DELAY", "60"))
@@ -158,10 +158,10 @@ os.makedirs(WORKTREE_ROOT, exist_ok=True)
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-GPT_FALLBACK_MODEL = "gpt-4o"
+GPT_FALLBACK_MODEL = os.environ.get("BOT_GPT_FALLBACK_MODEL", "gpt-5.6-luna")
 
 # Active fallback model (can be changed at runtime via /model)
-# "gemini" = use Gemini from gemini-prompts.json, "openai" = GPT-4o, "openrouter:<model>" = custom
+# "gemini" = use Gemini from gemini-prompts.json, "openai" = GPT_FALLBACK_MODEL, "openrouter:<model>" = custom
 ACTIVE_FALLBACK = {"provider": "gemini", "model": ""}
 
 # Module-level Bot reference, populated in main() so non-handler code paths
@@ -225,8 +225,8 @@ def load_prompts():
             return json.load(f)
     except Exception:
         return {
-            "transcribe": {"model": "gemini-2.5-flash", "prompt": "Transcribe this voice message exactly. Farsi or English. Return ONLY the transcription."},
-            "refine": {"model": "gemini-2.5-flash", "prompt": "Convert this casual command into a structured Claude Code prompt:\n\"{text}\"\n\nReturn ONLY the prompt."},
+            "transcribe": {"model": "gemini-3.7-flash", "prompt": "Transcribe this voice message exactly. Farsi or English. Return ONLY the transcription."},
+            "refine": {"model": "gemini-3.1-pro-preview", "prompt": "Convert this casual command into a structured Claude Code prompt:\n\"{text}\"\n\nReturn ONLY the prompt."},
             "voice_commands": {}
         }
 
@@ -492,7 +492,7 @@ async def gemini_fallback(prompt: str, project: str) -> str:
     try:
         # Use refine model from gemini-prompts.json (most capable)
         cfg = load_prompts().get("refine", {})
-        model = cfg.get("model", "gemini-2.5-flash")
+        model = cfg.get("model", "gemini-3.7-flash")
         r = gemini_client.models.generate_content(
             model=model,
             contents=[{"role": "user", "parts": [{"text":
@@ -522,7 +522,9 @@ async def openai_fallback(prompt: str, project: str) -> str:
                         {"role": "system", "content": f"You are a DevOps assistant for {project}. Be concise."},
                         {"role": "user", "content": prompt},
                     ],
-                    "max_tokens": 4000,
+                    # GPT-5.x rejects max_tokens (reasoning models want the
+                    # completion-scoped budget); 4o-era ids accept both.
+                    "max_completion_tokens": 4000,
                 })
             resp.raise_for_status()
             data = resp.json()
@@ -537,7 +539,7 @@ async def openrouter_fallback(prompt: str, project: str, model: str = "") -> str
     """Use OpenRouter with any model as fallback."""
     if not OPENROUTER_API_KEY:
         return ""
-    model = model or "google/gemini-2.5-flash"
+    model = model or "google/gemini-3.7-flash"
     try:
         import httpx
         async with httpx.AsyncClient(timeout=120) as client:
@@ -2400,7 +2402,7 @@ async def transcribe(path):
         cfg = load_prompts().get("transcribe", {})
         with open(path, "rb") as f: data = f.read()
         r = gemini_client.models.generate_content(
-            model=cfg.get("model", "gemini-2.5-flash"),
+            model=cfg.get("model", "gemini-3.7-flash"),
             contents=[{"role": "user", "parts": [
                 {"text": cfg.get("prompt", "Transcribe this voice message.")},
                 {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(data).decode()}}
@@ -2416,7 +2418,7 @@ async def refine_prompt(text):
         template = cfg.get("prompt", "Refine: \"{text}\"")
         filled = template.replace("{text}", text)
         r = gemini_client.models.generate_content(
-            model=cfg.get("model", "gemini-2.5-flash"),
+            model=cfg.get("model", "gemini-3.7-flash"),
             contents=[{"role": "user", "parts": [{"text": filled}]}])
         return r.text.strip()
     except Exception as e:
@@ -3173,15 +3175,17 @@ async def cmd_project(u, c):
 # ═══════════════════════════════════════════
 #  /model — Fallback Model Selection
 # ═══════════════════════════════════════════
+# Fallback-chain shortcuts — newest model per family (verified live on
+# OpenRouter). The full catalog stays reachable via "Search OpenRouter…".
 OPENROUTER_POPULAR = [
-    ("google/gemini-2.5-flash", "Gemini 2.5 Flash"),
-    ("google/gemini-2.5-pro", "Gemini 2.5 Pro"),
-    ("openai/gpt-4o", "GPT-4o"),
-    ("openai/gpt-4.1", "GPT-4.1"),
-    ("anthropic/claude-sonnet-4", "Claude Sonnet 4"),
-    ("qwen/qwen3-235b", "Qwen3 235B"),
-    ("deepseek/deepseek-r1", "DeepSeek R1"),
-    ("meta-llama/llama-4-maverick", "Llama 4 Maverick"),
+    ("google/gemini-3.7-flash", "Gemini 3.7 Flash"),
+    ("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro"),
+    ("openai/gpt-5.6-sol", "GPT-5.6 Sol"),
+    ("anthropic/claude-sonnet-5", "Claude Sonnet 5"),
+    ("z-ai/glm-5.3", "GLM 5.3"),
+    ("moonshotai/kimi-k3", "Kimi K3"),
+    ("qwen/qwen3.8-max", "Qwen3.8 Max"),
+    ("deepseek/deepseek-v4-pro-0813", "DeepSeek V4 Pro"),
 ]
 
 @authorized
@@ -3210,8 +3214,8 @@ async def cmd_model(u, c):
     prov = ACTIVE_FALLBACK["provider"]
     model = ACTIVE_FALLBACK.get("model", "")
     prompts_cfg = load_prompts()
-    gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-2.5-flash")
-    gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-2.5-flash")
+    gemini_transcribe = prompts_cfg.get("transcribe", {}).get("model", "gemini-3.7-flash")
+    gemini_refine = prompts_cfg.get("refine", {}).get("model", "gemini-3.1-pro-preview")
     current_fb = f"{prov}" + (f" ({model or gemini_refine})" if prov == "gemini" else f" ({model})" if model else "")
 
     rows = []
@@ -3219,9 +3223,9 @@ async def cmd_model(u, c):
     # ── Primary engine (engine-aware) ──
     # Every engine renders its OWN verified adapter catalog and every choice —
     # button or free-text — goes through that adapter's validation (so a Claude
-    # session rejects Codex/OpenRouter ids, etc.). Claude shows Fable 5 / Opus
-    # 4.8 / Sonnet 5 / Haiku 4.5 / Default; Codex shows its discovered catalog
-    # (Sol/Terra/Luna…); Chat shows favorites + search.
+    # session rejects Codex/OpenRouter ids, etc.). Claude shows Opus 5 (+1M) /
+    # Sonnet 5 (+1M) / Fable 5 / Haiku 4.5 / Opus 4.8 / Default; Codex shows its
+    # discovered catalog (Sol/Terra/Luna…); Chat shows favorites + search.
     if active_session:
         cur = (active_session.claude_model if active_engine == engines.ENGINE_CLAUDE
                else active_session.model) or ""
@@ -3256,8 +3260,8 @@ async def cmd_model(u, c):
         ("FB: ✅ " if prov == "gemini" else "FB: 🔹 ") + f"Gemini — {gemini_refine}",
         callback_data=_cb(f"mdl:gemini:{gemini_refine}"))])
     rows.append([InlineKeyboardButton(
-        ("FB: ✅ " if prov == "openai" else "FB: 🔹 ") + "GPT-4o (OpenAI)",
-        callback_data="mdl:openai:gpt-4o")])
+        ("FB: ✅ " if prov == "openai" else "FB: 🔹 ") + f"{GPT_FALLBACK_MODEL} (OpenAI)",
+        callback_data=f"mdl:openai:{GPT_FALLBACK_MODEL}")])
     for model_id, label in OPENROUTER_POPULAR:
         is_active = prov == "openrouter" and model == model_id
         icon = "✅" if is_active else "🔸"
@@ -3770,7 +3774,7 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
         if target is None:
             return
         adapter = engines.get_adapter(target.engine)
-        example = ("sonnet · opus · claude-sonnet-5" if target.engine == engines.ENGINE_CLAUDE
+        example = ("opus · sonnet · claude-opus-5" if target.engine == engines.ENGINE_CLAUDE
                    else "gpt-5.6-sol · gpt-5.5")
         CONV_STATE[cid] = {"state": "awaiting_engine_model_input",
                            "session_key": target.id, "uuid": target.session_uuid,

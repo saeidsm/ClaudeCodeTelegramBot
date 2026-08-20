@@ -244,11 +244,11 @@ Voice transcription and prompt refinement use Gemini. Customize the prompts in `
 ```json
 {
   "transcribe": {
-    "model": "gemini-2.5-flash",
+    "model": "gemini-3.7-flash",
     "prompt": "Transcribe this voice message exactly..."
   },
   "refine": {
-    "model": "gemini-2.5-flash",
+    "model": "gemini-3.1-pro-preview",
     "prompt": "Convert this casual command into a structured prompt..."
   },
   "voice_commands": {
