@@ -148,6 +148,9 @@ RL_URGENT_SECS = 300  # the "urgent" override: resend in 5 min
 #   strict    → no flag; default Claude Code --print behavior denies non-approved tools
 BOT_TOOL_PERMISSION_MODE = os.environ.get("BOT_TOOL_PERMISSION_MODE", "strict").lower()
 BOT_ALLOWED_TOOLS = os.environ.get("BOT_ALLOWED_TOOLS", "")
+# Second key for `skip` mode. See _assert_permission_mode(): skip disarms the
+# settings.json deny list, so it costs two deliberate acts, not one.
+BOT_ALLOW_SKIP_MODE = os.environ.get("BOT_ALLOW_SKIP_MODE", "").strip() == "1"
 
 # Per-session ephemeral worktrees live here. Each spawn gets its own
 # subdir (<session_id>) so concurrent sessions on the same project don't
@@ -5076,22 +5079,36 @@ def _assert_permission_mode():
     rely on protects NOTHING — and it does so invisibly, which is worse than
     having no deny list at all, because we would believe we were covered.
 
-    WARN, not refuse: skip is a supported, deliberately-configurable mode, and
-    refusing to boot converts a config mistake into a total outage for every
-    real user of this bot. A loud, greppable line at every startup gives
-    detection without that cost. Escalate to a hard refusal only if this is ever
-    observed being set unintentionally.
+    REFUSE, not warn. The earlier version of this function warned and started
+    anyway, on the argument that a config mistake should not become an outage.
+    That trade is wrong here: a warning in a log nobody tails is exactly how
+    this hook's predecessor (block-env-edits.sh) failed open for months without
+    anyone noticing. An outage is loud and gets fixed in minutes; a silently
+    disarmed deny list is not, and lasts until someone audits.
+
+    So disarming costs two deliberate acts, not one: the mode itself, plus
+    BOT_ALLOW_SKIP_MODE=1. Neither env var set by accident is enough alone.
     """
-    if BOT_TOOL_PERMISSION_MODE == "skip":
-        log.warning("=" * 72)
-        log.warning("perm_mode.INSECURE BOT_TOOL_PERMISSION_MODE=skip - spawns use "
-                    "--dangerously-skip-permissions")
-        log.warning("perm_mode.INSECURE settings.json permissions.deny DOES NOT APPLY "
-                    "to these sessions")
-        log.warning("=" * 72)
-    else:
+    if BOT_TOOL_PERMISSION_MODE != "skip":
         log.info(f"perm_mode.ok mode={BOT_TOOL_PERMISSION_MODE} "
                  f"(settings.json deny list applies)")
+        return
+
+    if not BOT_ALLOW_SKIP_MODE:
+        log.critical("=" * 72)
+        log.critical("perm_mode.REFUSED BOT_TOOL_PERMISSION_MODE=skip disables the "
+                     "settings.json deny list for every spawn")
+        log.critical("perm_mode.REFUSED refusing to start - set BOT_ALLOW_SKIP_MODE=1 "
+                     "to confirm this is deliberate, or use allowlist/strict")
+        log.critical("=" * 72)
+        raise SystemExit(1)
+
+    log.warning("=" * 72)
+    log.warning("perm_mode.INSECURE BOT_TOOL_PERMISSION_MODE=skip with "
+                "BOT_ALLOW_SKIP_MODE=1 - spawns use --dangerously-skip-permissions")
+    log.warning("perm_mode.INSECURE settings.json permissions.deny DOES NOT APPLY "
+                "to these sessions")
+    log.warning("=" * 72)
 
 
 async def post_init(app):
