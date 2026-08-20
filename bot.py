@@ -4,7 +4,7 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -14,13 +14,27 @@ from collections import OrderedDict, defaultdict
 import aiohttp
 from aiohttp import web as _aw
 
+# ── Phase 2: engine adapters, coordination, resource footer ──
+import engines.base as engines
+from engines.claude_adapter import ClaudeAdapter
+from engines.codex_adapter import (
+    CodexAdapter, build_codex_cmd, parse_codex_output, classify_codex_failure,
+    parse_codex_models,
+)
+from engines.openrouter_chat import (
+    OpenRouterClient, ChatCatalog, ChatHistory, ChatAdapter, ChatError,
+    derive_chat_dir, validate_chat_dir, resolve_chat_dir,
+)
+import coordination as coord
+import resource_footer
+
 from telegram import (
     Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, Message
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes
+    TypeHandler, ApplicationHandlerStop, filters, ContextTypes, ExtBot
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import BadRequest
@@ -81,10 +95,31 @@ PERMANENT_PROJECTS = {"ZigguratKids4"}  # never auto-close these
 BOT_DEPLOY_ENABLED         = os.environ.get("BOT_DEPLOY_ENABLED",          "true").lower() == "true"
 BOT_NIGHTWATCH_IPC_ENABLED = os.environ.get("BOT_NIGHTWATCH_IPC_ENABLED",  "true").lower() == "true"
 BOT_GIT_REMOTE_TOKEN       = os.environ.get("BOT_GIT_REMOTE_TOKEN", "")
-MAX_SESSIONS               = int(os.environ.get("BOT_MAX_SESSIONS", "4"))
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Parse a strictly-positive int from env, falling back safely on any
+    invalid/non-positive value. (Logging happens at startup once `log` exists —
+    see post_init, which prints the effective values.)"""
+    raw = os.environ.get(name, "")
+    try:
+        val = int(raw)
+        if val > 0:
+            return val
+    except (ValueError, TypeError):
+        pass
+    return default
+
+
+# Two DISTINCT limits (do not conflate):
+#   MAX_SESSIONS       = logical/restorable sessions per chat (cheap: dict entries)
+#   MAX_RUNNING_AGENTS = simultaneous heavy Claude executions across the whole bot
+#                        process (expensive: RAM/CPU). Bounded by RUN_SEMAPHORE.
+MAX_SESSIONS               = _positive_int_env("BOT_MAX_SESSIONS", 4)
+MAX_RUNNING_AGENTS         = _positive_int_env("BOT_MAX_RUNNING_AGENTS", 2)
 
 # Default Claude Code model for new sessions — empty = CLI default,
-# "sonnet"/"opus" aliases, or full model name like "claude-sonnet-4-6".
+# "sonnet"/"opus" aliases, or full model name like "claude-sonnet-5".
 # Per-session overrides via /model (Session.claude_model).
 BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
@@ -133,6 +168,40 @@ ACTIVE_FALLBACK = {"provider": "gemini", "model": ""}
 # (e.g. branch-reset failure notice from run_claude) can send Telegram messages.
 BOT = None
 APPLICATION = None  # telegram Application; set in main() so non-handler paths can schedule work
+
+# ── Phase 2: engine layer config + singletons ──
+CHAT_SESSIONS_DIR = os.environ.get("BOT_CHAT_SESSIONS_DIR", f"{BOT_DATA_ROOT}/chat-sessions")
+COORDINATION_FILE = os.environ.get("BOT_COORDINATION_FILE", f"{BOT_CONFIGS_DIR}/coordination.json")
+# The coordination publish helper ships next to the bot modules. Agents run in
+# worktrees of ARBITRARY projects that do NOT contain scripts/coord_publish.py,
+# so a relative path is useless there — we inject the validated ABSOLUTE path
+# (AGENT_COORD_PUBLISHER) into the child env. BOT_COORD_PUBLISHER overrides the
+# default for non-standard deploy layouts; it is preflighted before injection.
+_COORD_PUBLISHER_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "scripts", "coord_publish.py")
+BOT_COORD_PUBLISHER = os.environ.get("BOT_COORD_PUBLISHER", "").strip() or _COORD_PUBLISHER_SRC
+CHAT_CATALOG_TTL = _positive_int_env("BOT_CHAT_CATALOG_TTL", 3600)
+CHAT_CONCURRENCY = _positive_int_env("BOT_CHAT_CONCURRENCY", 4)  # independent of heavy cap
+APP_REFERER_URL = os.environ.get("APP_REFERER_URL", "")
+APP_TITLE = os.environ.get("APP_TITLE", "Claude Code Telegram Bot")
+
+# Adapter singletons + shared stores. Populated by init_engines() at startup;
+# built here too so import-time/test code has real objects.
+COORD = coord.CoordinationStore(COORDINATION_FILE)
+_or_client = OpenRouterClient(OPENROUTER_API_KEY or None, APP_REFERER_URL, APP_TITLE)
+CHAT_CATALOG = ChatCatalog(_or_client, ttl=float(CHAT_CATALOG_TTL))
+CHAT_SEM = None  # asyncio.Semaphore(CHAT_CONCURRENCY); created in init (needs a loop)
+
+
+def init_engines():
+    """Register the three adapters. Idempotent; safe to call from tests."""
+    engines.reset_registry()
+    engines.register(ClaudeAdapter())
+    engines.register(CodexAdapter())
+    engines.register(ChatAdapter(CHAT_CATALOG))
+
+
+init_engines()
 
 # ── Logging ──
 for d in [LOGS, UPLOADS, os.path.dirname(PROMPTS_FILE)]:
@@ -368,6 +437,51 @@ def _cb_resolve(data: str) -> str:
     return data
 
 
+# ── Phase 2: opaque STRUCTURED callback codec ──────────────────────────────
+# Every Phase-2 button stores a structured payload (dict) server-side and emits
+# an opaque, UNGUESSABLE token `p2:<random>` (always << 64 bytes). This removes
+# ALL delimiter parsing of user data (labels/project names/model ids may contain
+# ':', '|', '/', Unicode or arbitrary length) AND binds each payload to its
+# originating chat id so a second authorized chat cannot guess/replay a token to
+# act in the wrong chat. on_callback validates `cid` ownership in ONE central
+# gate before any action code. Fails closed on unknown/expired/wrong-chat/evicted
+# tokens (restart clears the registry -> expired-button UX).
+_P2_REGISTRY: "OrderedDict[str, dict]" = OrderedDict()
+_P2_MAX = 4000
+
+
+def cb2(kind: str, chat_id: int, **fields) -> str:
+    """Register a chat-bound structured Phase-2 payload; return its opaque token.
+
+    ``chat_id`` is the chat the button is being sent to; it is stored as the
+    reserved ``cid`` key and enforced by on_callback. The token is 128 bits of
+    randomness (unguessable), not a sequential counter."""
+    for _ in range(8):
+        token = "p2:" + secrets.token_urlsafe(16)
+        if token not in _P2_REGISTRY:
+            break
+    # Reserved keys are set LAST so a caller field named "k"/"cid" can never
+    # override the kind or the chat binding (ownership must be un-spoofable).
+    payload = dict(fields)
+    payload["k"] = kind
+    payload["cid"] = chat_id
+    _P2_REGISTRY[token] = payload
+    while len(_P2_REGISTRY) > _P2_MAX:
+        _P2_REGISTRY.popitem(last=False)  # evict oldest
+    return token
+
+
+def cb2_resolve(token: str) -> "dict | None":
+    """Return the structured payload for a token, or None if expired/unknown."""
+    return _P2_REGISTRY.get(token)
+
+
+def cb2_consume(token: str) -> None:
+    """One-shot: drop a token so a double-tap/replay of a create action fails
+    closed (expired-button UX) instead of creating/replacing a second session."""
+    _P2_REGISTRY.pop(token, None)
+
+
 # ═══════════════════════════════════════════
 #  Fallback Chain: Gemini → GPT → OpenRouter
 # ═══════════════════════════════════════════
@@ -507,6 +621,11 @@ class Session:
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
     claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
+    # ── Phase 2: multi-engine ──
+    engine: str = "claude"           # claude | codex | chat  (old sessions => claude)
+    model: str = ""                  # generic per-engine model id (codex/chat); Claude keeps claude_model
+    provider_session_id: str = ""    # Codex thread id (Claude uses session_uuid; chat unused)
+    chat_history_ref: str = ""       # chat-session dir for the bounded Chat history
 
 
 class SessionManager:
@@ -569,6 +688,13 @@ class SessionManager:
         key = self._key(chat_id, label)
         session = self.sessions.pop(key, None)
         if session:
+            # Cancel any queued/in-flight execution tasks for this session so a
+            # queued turn belonging to a killed session can never begin later,
+            # and a running one is interrupted (the slot releases its permit +
+            # lock in finally). Never cancels the caller's own task.
+            cancelled = CONC.cancel_session_tasks(key)
+            if cancelled:
+                log.info(f"kill.session sid={key} cancelled {cancelled} run task(s)")
             # Terminate the live claude subprocess if any. Without this the
             # python process was leaked and stayed alive (and kept MCP children
             # + worktree FDs) until the bot itself restarted.
@@ -585,6 +711,9 @@ class SessionManager:
             to_remove = [mid for mid, sk in self.msg_to_session.items() if sk == key]
             for mid in to_remove:
                 del self.msg_to_session[mid]
+            # Phase 2: remove a Chat session's bounded history + empty dir
+            # (also covers duplicate-label replacement, which routes through kill).
+            _purge_chat_session(session)
             return True
         return False
 
@@ -605,7 +734,7 @@ class SessionManager:
             # Never auto-close sessions on permanent projects
             if session.project in PERMANENT_PROJECTS:
                 continue
-            if session.status != "running" and session.last_active < cutoff:
+            if session.status not in ("running", "queued") and session.last_active < cutoff:
                 timed_out.append(session)
                 keys_to_remove.append(key)
         for key in keys_to_remove:
@@ -614,6 +743,9 @@ class SessionManager:
             to_remove = [mid for mid, sk in self.msg_to_session.items() if sk == key]
             for mid in to_remove:
                 del self.msg_to_session[mid]
+            # Phase 2: purge Chat history for auto-timed-out sessions too.
+            if session is not None:
+                _purge_chat_session(session)
         return timed_out
 
     def can_create(self, chat_id: int) -> bool:
@@ -637,6 +769,199 @@ PENDING_MESSAGES: dict[int, dict] = {}
 ACTIVE_SESSION: dict[int, str] = {}  # chat_id -> session_key
 # Buffer for multi-message concatenation (Telegram splits long text)
 MESSAGE_BUFFER: dict[int, dict] = {}  # chat_id -> {"texts": [], "timer": task, "update": update, "time": float}
+
+
+# ═══════════════════════════════════════════
+#  Execution concurrency
+#  ──────────────────────────────────────────
+#  Two independent controls:
+#    • RUN_SEMAPHORE — process-wide cap on simultaneous heavy Claude runs
+#      (MAX_RUNNING_AGENTS). 9 logical sessions can exist, but only N execute.
+#    • per-session asyncio.Lock — turns in ONE session run FIFO; two turns for
+#      the same session never overlap (protects the worktree + resume state).
+#  A run task is registered per session so /kill (SM.kill) and graceful
+#  shutdown can cancel queued or in-flight executions.
+# ═══════════════════════════════════════════
+class _Concurrency:
+    """Holds the async primitives. They are (re)created inside the running loop
+    via init() — asyncio.Semaphore/Lock bind to a loop, so init() is called from
+    post_init in prod and from each concurrency test in its own loop."""
+
+    def __init__(self):
+        self.semaphore: "asyncio.Semaphore | None" = None
+        self.max_running: int = MAX_RUNNING_AGENTS
+        self.running: int = 0                                   # cosmetic: admitted heavy runs
+        self.chat_semaphore: "asyncio.Semaphore | None" = None  # Phase 2: independent chat cap
+        self.max_chat: int = CHAT_CONCURRENCY
+        self.chat_running: int = 0
+        self.session_locks: dict[str, asyncio.Lock] = {}
+        self.session_lock_refs: dict[str, int] = defaultdict(int)
+        self.session_tasks: dict[str, set] = defaultdict(set)   # session_id -> {asyncio.Task}
+
+    def init(self, max_running: "int | None" = None, max_chat: "int | None" = None):
+        if max_running is not None and max_running > 0:
+            self.max_running = max_running
+        self.semaphore = asyncio.Semaphore(self.max_running)
+        self.running = 0
+        # Phase 2: Chat runs on an INDEPENDENT semaphore (default 4), so
+        # conversational turns never consume a heavy Claude/Codex permit.
+        self.max_chat = max_chat if (max_chat and max_chat > 0) else CHAT_CONCURRENCY
+        self.chat_semaphore = asyncio.Semaphore(self.max_chat)
+        self.chat_running = 0
+        self.session_locks.clear()
+        self.session_lock_refs.clear()
+        # session_tasks intentionally not cleared: live registrations survive re-init.
+
+    def _ensure(self):
+        if self.semaphore is None:
+            self.init()
+
+    def _get_lock(self, session_id: str) -> asyncio.Lock:
+        lock = self.session_locks.get(session_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.session_locks[session_id] = lock
+        self.session_lock_refs[session_id] += 1
+        return lock
+
+    def _put_lock(self, session_id: str):
+        self.session_lock_refs[session_id] -= 1
+        if self.session_lock_refs[session_id] <= 0:
+            self.session_lock_refs.pop(session_id, None)
+            lock = self.session_locks.get(session_id)
+            # Only drop the lock object when nobody holds or awaits it — never
+            # remove a lock while waiters still reference it.
+            if lock is not None and not lock.locked():
+                self.session_locks.pop(session_id, None)
+
+    def register_task(self, session_id: str, task):
+        if task is not None:
+            self.session_tasks[session_id].add(task)
+
+    def discard_task(self, session_id: str, task):
+        s = self.session_tasks.get(session_id)
+        if s is not None:
+            s.discard(task)
+            if not s:
+                self.session_tasks.pop(session_id, None)
+
+    def cancel_session_tasks(self, session_id: str) -> int:
+        """Cancel every run task tracked for a session (queued or running),
+        except the caller's own task (so a /kill callback never cancels itself).
+        Returns the number cancelled."""
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        n = 0
+        for task in list(self.session_tasks.get(session_id, ())):
+            if task is current or task.done():
+                continue
+            task.cancel()
+            n += 1
+        return n
+
+
+CONC = _Concurrency()
+
+# Process-local deploy lock: prevents two Telegram callbacks/users from starting
+# overlapping deploy handlers on THIS bot. The prod-side deploy.sh flock remains
+# the authoritative cross-process guard (exit 2 = concurrent) — this is only a
+# fast local guard so we don't even launch a second overlapping handler.
+_DEPLOY_LOCK = asyncio.Lock()
+
+
+class execution_slot:
+    """Async context manager guarding one heavy Claude execution.
+
+    Acquires (in order) the per-session lock then a global permit, so a run
+    waiting for a permit never holds a permit while blocked on its own lock.
+    While waiting, the session shows status 'queued'; once admitted, 'running'.
+
+    Cancellation-safe: Python does NOT call ``__aexit__`` when ``__aenter__``
+    is cancelled or raises, so ``__aenter__`` rolls back its own partial
+    acquisition on any BaseException. All release bookkeeping goes through a
+    single synchronous, idempotent ``_cleanup`` used by both the rollback and
+    ``__aexit__`` — so they can never double-release.
+    """
+
+    def __init__(self, session_id: str, session=None, *, heavy: bool = True):
+        self.session_id = session_id
+        self.session = session
+        # heavy=True (default, unchanged): global MAX_RUNNING_AGENTS permit.
+        # heavy=False (Chat): independent chat_semaphore, does not touch
+        # CONC.running / the heavy cap.
+        self.heavy = heavy
+        self._lock = None
+        self._task = None
+        # each of these is released/undone exactly once by _cleanup
+        self._have_lock = False
+        self._have_permit = False
+        self._lockref_taken = False
+        self._lockref_released = False
+        self._task_registered = False
+        self._task_discarded = False
+
+    def _cleanup(self, restore_status: bool):
+        """Synchronous, idempotent teardown. No awaits → cannot be interrupted
+        by cancellation partway through."""
+        if self._have_permit:
+            self._have_permit = False
+            if self.heavy:
+                CONC.running -= 1
+                CONC.semaphore.release()
+            else:
+                CONC.chat_running -= 1
+                CONC.chat_semaphore.release()
+        if self._have_lock:
+            self._have_lock = False
+            self._lock.release()
+        if self._lockref_taken and not self._lockref_released:
+            self._lockref_released = True
+            CONC._put_lock(self.session_id)          # decrement/remove exactly once
+        if self._task_registered and not self._task_discarded:
+            self._task_discarded = True
+            CONC.discard_task(self.session_id, self._task)
+        if restore_status and self.session is not None:
+            # Only touch status if the session still exists AND we left it
+            # 'queued' (never clobber a status another turn already advanced).
+            if self.session.id in SM.sessions and getattr(self.session, "status", None) == "queued":
+                self.session.status = "idle"
+
+    async def __aenter__(self):
+        CONC._ensure()
+        self._task = asyncio.current_task()
+        try:
+            CONC.register_task(self.session_id, self._task)
+            self._task_registered = True
+            if self.session is not None and getattr(self.session, "status", None) != "completed":
+                self.session.status = "queued"
+            # 1) per-session FIFO lock (ref taken now; released once in _cleanup)
+            self._lock = CONC._get_lock(self.session_id)
+            self._lockref_taken = True
+            await self._lock.acquire()
+            self._have_lock = True
+            # 2) global concurrency permit (heavy) or independent chat permit
+            if self.heavy:
+                await CONC.semaphore.acquire()
+                self._have_permit = True
+                CONC.running += 1
+            else:
+                await CONC.chat_semaphore.acquire()
+                self._have_permit = True
+                CONC.chat_running += 1
+            if self.session is not None:
+                self.session.status = "running"
+            return self
+        except BaseException:
+            # Cancelled/failed mid-acquisition — roll back whatever we took and
+            # re-raise (including CancelledError). __aexit__ will NOT run.
+            self._cleanup(restore_status=True)
+            raise
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._cleanup(restore_status=False)
+        return False  # never suppress exceptions (incl. CancelledError)
 
 # ═══════════════════════════════════════════
 #  Delayed Prompts
@@ -733,14 +1058,74 @@ def project_kb(session_key: str = ""):
     ps = get_project_names()
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"📦 {p}", callback_data=_cb(f"proj:{session_key}:{p}"))] for p in ps])
 
-def new_session_project_kb(label: str, has_name: bool = True):
-    """Project picker for /new flow — callback stores the session label.
-    has_name=False uses 'newneed:' prefix so we know to ask for name after project pick."""
-    ps = get_project_names()
-    prefix = "newproj" if has_name else "newneed"
-    rows = [[InlineKeyboardButton(f"📁 {p}", callback_data=_cb(f"{prefix}:{label}:{p}"))] for p in ps]
-    rows.append([InlineKeyboardButton("➕ New project...", callback_data=_cb(f"addproj:{label}:{'1' if has_name else '0'}"))])
+_ENGINE_ICONS = {"claude": "🤖", "codex": "🧠", "chat": "💬"}
+
+
+def new_session_engine_kb(chat_id: int, label: str, has_name: bool):
+    """Engine picker — first step of /new. Uses opaque structured tokens, so the
+    label may contain any character without delimiter ambiguity."""
+    rows = []
+    for a in engines.all_engines():
+        icon = _ENGINE_ICONS.get(a.caps.engine, "•")
+        rows.append([InlineKeyboardButton(
+            f"{icon} {a.caps.label}",
+            callback_data=cb2("neng", chat_id, engine=a.caps.engine, label=label, has_name=has_name))])
     return InlineKeyboardMarkup(rows)
+
+
+def new_session_project_kb(chat_id: int, engine: str, label: str, has_name: bool = True):
+    """Project picker for the Claude/Codex /new flow."""
+    ps = get_project_names()
+    kind = "newproj" if has_name else "newneed"
+    rows = [[InlineKeyboardButton(
+        f"📁 {p}",
+        callback_data=cb2(kind, chat_id, engine=engine, label=label, project=p))] for p in ps]
+    rows.append([InlineKeyboardButton(
+        "➕ New project...",
+        callback_data=cb2("addproj", chat_id, engine=engine, label=label, has_name=has_name))])
+    return InlineKeyboardMarkup(rows)
+
+
+def chat_model_kb(chat_id: int, label: str, has_name: bool, models):
+    """OpenRouter favorite/search picker for the Chat /new flow."""
+    rows = []
+    for m in models:
+        if not m.available:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"⭐ {m.label}",
+            callback_data=cb2("cmk", chat_id, label=label, has_name=has_name, model=m.id))])
+    rows.append([InlineKeyboardButton(
+        "🔎 Search models", callback_data=cb2("cmsearch", chat_id, label=label, has_name=has_name))])
+    return InlineKeyboardMarkup(rows)
+
+
+def _apply_engine(session, engine: str, model: str = ""):
+    """Set the engine/model on a freshly created session. For chat, provisions
+    the isolated bounded-history directory. Unknown engine falls back to claude."""
+    session.engine = engine if engines.known_engine(engine) else "claude"
+    session.model = model or ""
+    if session.engine == engines.ENGINE_CHAT:
+        session.project = "chat"
+        # Opaque, filesystem-safe derived dir (never from raw label/path text).
+        session.chat_history_ref = derive_chat_dir(CHAT_SESSIONS_DIR, session.id)
+        try:
+            os.makedirs(session.chat_history_ref, exist_ok=True)
+        except Exception as e:
+            log.warning(f"chat dir create failed: {e}")
+    return session
+
+
+def _purge_chat_session(session) -> None:
+    """Remove a Chat session's bounded history + its empty dir, symlink-safely.
+    No-op for non-chat sessions. Never touches anything outside the chat root."""
+    if getattr(session, "engine", "") != engines.ENGINE_CHAT:
+        return
+    try:
+        safe_dir = resolve_chat_dir(CHAT_SESSIONS_DIR, session.id, session.chat_history_ref)
+        ChatHistory(safe_dir).purge()
+    except Exception as e:
+        log.warning(f"chat purge failed sid={session.id}: {e}")
 
 def sessions_kill_kb(sessions: list):
     """Inline kill buttons for /sessions display."""
@@ -802,8 +1187,31 @@ def fmt_out(text, mx=3800):
     if t: r += "\n\n✂️ <i>Truncated. Tap 📦 Save Report for full.</i>"
     return r
 
-def fmt_links(links):
-    return "\n\n".join(f"🔗 <b>{k}:</b>\n<code>{v}</code>" for k, v in links.items())
+def fmt_links(result):
+    """Render a report's links as deliberate, clickable Telegram HTML anchors.
+
+    Accepts a ReportResult (preferred) or a plain {label: url} mapping
+    (backward-compatible). URLs and labels are HTML-escaped. The raw URL is kept
+    visible under the anchor as a copy/paste fallback — but never wrapped only in
+    <code> (the old behavior, which rendered nothing clickable). On a partial or
+    failed report we say so plainly and never emit a phantom ZIP link.
+    """
+    if isinstance(result, ReportResult):
+        links = result.links
+        note = ""
+        if result.status == "error":
+            return ("⚠️ <b>Report generation failed.</b>\n"
+                    f"<i>{esc(result.error or 'unknown error')}</i>")
+        if result.status == "partial":
+            note = "\n\n⚠️ <i>ZIP unavailable (archive step failed) — Summary/Browse still work.</i>"
+    else:
+        links = result or {}
+        note = ""
+    parts = []
+    for label, url in links.items():
+        u = html.escape(url, quote=True)
+        parts.append(f"🔗 <b>{esc(label)}:</b> <a href=\"{u}\">open</a>\n<code>{esc(url)}</code>")
+    return "\n\n".join(parts) + note
 
 def session_prefix(session: Session) -> str:
     return f"{session.color_emoji} <b>{esc(session.label)}</b>"
@@ -838,6 +1246,66 @@ def authorized(fn):
 # ═══════════════════════════════════════════
 #  Claude Code
 # ═══════════════════════════════════════════
+# ── Post-merge safety: per-worktree-path lifecycle coordinator ─────────────
+# asyncio.to_thread cannot stop the underlying thread, so a cancelled
+# __aenter__ (enter still running) or a cancelled __aexit__ (a SECOND
+# cancellation delivered while awaiting exit — exit still running) can each
+# leave real filesystem work (git worktree add/remove, rm -rf) in flight after
+# the coroutine that started it has already unwound and released its
+# per-session lock. Without coordination, a same-path turn B could then start
+# while turn A's enter/exit is still mutating that exact path on disk.
+#
+# We serialise per CANONICAL path with ONE lifecycle barrier that spans the
+# ENTIRE span from claiming ownership (start of __aenter__) through the
+# genuine completion of __aexit__'s _exit_sync — not just the enter phase:
+#   * __aenter__ claims a fresh owner token and publishes a lifecycle-barrier
+#     future for the path BEFORE starting any work;
+#   * a later __aenter__ on that exact path awaits the CURRENT owner's barrier
+#     (bounded by WORKTREE_BARRIER_TIMEOUT) before doing anything;
+#   * the barrier is resolved via an unconditional, idempotent done-callback —
+#     on the enter thread finishing after a cancelled enter, or on the exit
+#     thread finishing after a normal OR cancelled exit — so resolution is
+#     always tied to the REAL background work actually finishing, never to
+#     the coroutine merely unwinding;
+#   * a late cleanup (enter-orphan or exit) only touches the path while its
+#     token still owns it — a newer owner's tree is never touched;
+#   * once a lifecycle fully resolves AND no newer owner has since claimed the
+#     path, its registry entries are popped — long-lived paths do not
+#     accumulate unbounded owner/barrier state over the process's uptime.
+# Different paths are fully independent. All asyncio state below is touched
+# only from the event-loop thread (single-threaded), so no extra lock is
+# needed for the check-then-set claim (no `await` occurs between them).
+_WORKTREE_PATH_BARRIERS: dict[str, "asyncio.Future"] = {}   # canonical path -> current lifecycle-done future
+_WORKTREE_PATH_OWNER: dict[str, object] = {}                # canonical path -> current owner token (identity only)
+# Bounded, configurable: a later same-path enter fails safely rather than
+# waiting forever if a prior lifecycle never settles.
+WORKTREE_BARRIER_TIMEOUT = float(os.environ.get("BOT_WORKTREE_BARRIER_TIMEOUT", "30"))
+
+
+def _canonical_worktree_path(path: str) -> str:
+    """Canonical key for a worktree path (realpath of the parent + basename, so
+    a not-yet-created leaf still keys consistently with its eventual tree)."""
+    p = os.path.abspath(path)
+    parent = os.path.realpath(os.path.dirname(p))
+    return os.path.join(parent, os.path.basename(p))
+
+
+def _claim_worktree_owner(canonical: str) -> object:
+    """Claim a fresh, opaque owner token for this path. Object identity (`is`)
+    is all that's needed — no monotonic counter, no permanent per-path entry."""
+    token = object()
+    _WORKTREE_PATH_OWNER[canonical] = token
+    return token
+
+
+def _release_worktree_owner_if_current(canonical: str, token: object) -> None:
+    """Drop the owner entry once a lifecycle fully completes — but ONLY if no
+    newer owner has since claimed the path. Bounds registry growth: a path
+    that is not currently in-flight leaves no trace behind."""
+    if _WORKTREE_PATH_OWNER.get(canonical) is token:
+        _WORKTREE_PATH_OWNER.pop(canonical, None)
+
+
 class WorktreeSession:
     """Per-session ephemeral git worktree.
 
@@ -863,8 +1331,13 @@ class WorktreeSession:
         self.session_id = session_id
         self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
         self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
+        self._enter_task = None
+        self._orphan_cleanup_scheduled = False
+        self._canonical = None
+        self._owner_token = None
+        self._lifecycle_barrier = None  # spans claim -> real completion of enter-cleanup or exit
 
-    def __enter__(self):
+    def _enter_sync(self):
         if not self.is_git:
             os.makedirs(self.worktree_path, exist_ok=True)
             subprocess.run(
@@ -919,7 +1392,7 @@ class WorktreeSession:
                  f"sid={self.session_id} branch={self.branch} path={self.worktree_path}")
         return self.worktree_path
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def _exit_sync(self, exc_type, exc_val, exc_tb):
         if not os.path.exists(self.worktree_path):
             return False
 
@@ -935,53 +1408,354 @@ class WorktreeSession:
         log.info(f"worktree.removed sid={self.session_id}")
         return False
 
+    # Async wrappers: the git/rsync/rm work is blocking, so offload it to a
+    # thread — otherwise every worktree create/remove froze the whole Telegram
+    # event loop (and thus every other session) for the duration.
+    #
+    # Cancellation caveat: asyncio.to_thread CANNOT stop the underlying thread.
+    # If the awaiter is cancelled while _enter_sync (or later _exit_sync) runs,
+    # the thread may still finish AFTER the coroutine has unwound. We bound
+    # this with the lifecycle barrier above: a cancelled enter's thread, and a
+    # cancelled exit's thread, both run to completion under a done-callback
+    # that resolves the barrier exactly once whatever finishes — never an
+    # unbounded wait, and a same-path re-entry cannot start until then.
+    async def __aenter__(self):
+        self._canonical = _canonical_worktree_path(self.worktree_path)
+        await self._claim_lifecycle(self._canonical)
+        self._enter_task = asyncio.ensure_future(asyncio.to_thread(self._enter_sync))
+        try:
+            result = await asyncio.shield(self._enter_task)
+        except asyncio.CancelledError:
+            self._schedule_orphan_cleanup()
+            raise
+        except Exception:
+            # Enter failed for a NORMAL (non-cancellation) reason, e.g. `git
+            # worktree add` failed. By the time this exception reaches us the
+            # shielded task is already done — no background work is left
+            # running, so it's safe to resolve/release the lifecycle barrier
+            # immediately (Python will NOT call __aexit__ since __aenter__
+            # raised, so nothing else will ever resolve it).
+            self._resolve_lifecycle_barrier()
+            raise
+        return result
+
+    async def _claim_lifecycle(self, canonical: str):
+        """Atomically (with respect to this event loop) wait for the current
+        owner, then publish this lifecycle's owner/barrier before another
+        same-path waiter can slip through.
+
+        It is important to loop after waiting: several waiters may all awake
+        when one old barrier resolves.  Only the first may claim; every later
+        waiter must observe and await that new owner's barrier instead of
+        overwriting its token while its enter/exit is in flight.
+        """
+        while True:
+            barrier = _WORKTREE_PATH_BARRIERS.get(canonical)
+            if barrier is None or barrier.done():
+                # No await between observation and publication: this claim is
+                # atomic on asyncio's single event-loop thread.
+                self._owner_token = _claim_worktree_owner(canonical)
+                self._lifecycle_barrier = asyncio.get_event_loop().create_future()
+                _WORKTREE_PATH_BARRIERS[canonical] = self._lifecycle_barrier
+                return
+            await self._await_prior_barrier(canonical, barrier)
+
+    async def _await_prior_barrier(self, canonical: str, barrier=None):
+        """Block until any in-flight lifecycle (enter-orphan cleanup OR exit) of
+        a PRIOR owner on this path is done. Bounded by WORKTREE_BARRIER_TIMEOUT
+        — on timeout we fail this run safely instead of waiting forever or
+        racing the prior lifecycle."""
+        barrier = barrier or _WORKTREE_PATH_BARRIERS.get(canonical)
+        if barrier is None or barrier.done():
+            return
+        try:
+            # shield so a timeout here never cancels the prior lifecycle itself.
+            await asyncio.wait_for(asyncio.shield(barrier), timeout=WORKTREE_BARRIER_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"worktree.barrier_timeout path={canonical} "
+                f"prior lifecycle did not settle within {WORKTREE_BARRIER_TIMEOUT}s")
+
+    def _resolve_lifecycle_barrier(self):
+        """Idempotent: settle OUR lifecycle barrier and release path ownership
+        — but only while we still hold it (a newer owner's claim is never
+        touched). Safe to call more than once / from more than one callback."""
+        barrier = self._lifecycle_barrier
+        if barrier is not None and not barrier.done():
+            barrier.set_result(True)
+        canonical = self._canonical
+        if canonical is None:
+            return
+        if _WORKTREE_PATH_BARRIERS.get(canonical) is barrier:
+            _WORKTREE_PATH_BARRIERS.pop(canonical, None)
+        _release_worktree_owner_if_current(canonical, self._owner_token)
+
+    def _schedule_orphan_cleanup(self):
+        """Called when __aenter__ is cancelled. Once the (uninterruptible) enter
+        thread finishes, removes whatever it created EXACTLY ONCE — but only
+        while this owner token still owns the path — then resolves the
+        already-published lifecycle barrier so a later same-path enter can
+        proceed."""
+        if self._orphan_cleanup_scheduled or self._enter_task is None:
+            return
+        self._orphan_cleanup_scheduled = True
+        canonical = self._canonical
+        my_token = self._owner_token
+
+        def _on_done(task):
+            if task.cancelled():
+                self._resolve_lifecycle_barrier()
+                return
+            # Retrieve any enter exception so it isn't logged as "never retrieved"
+            # (the awaiter already received CancelledError). Nothing to clean if
+            # the enter itself failed before creating the tree.
+            exc = task.exception()
+            if exc is not None:
+                log.info(f"worktree.enter_after_cancel_failed sid={self.session_id} "
+                         f"err={type(exc).__name__} (no tree to clean)")
+                self._resolve_lifecycle_barrier()
+                return
+            try:
+                loop2 = asyncio.get_event_loop()
+            except RuntimeError:
+                loop2 = None
+
+            if loop2 is None or not loop2.is_running():
+                # Loop gone (shutdown) — mark the on-disk tree quarantined for
+                # the GC timer; never reuse it in-process. Settle the barrier so
+                # nothing waits forever on a dead loop.
+                log.info(f"worktree.orphan_left_for_gc sid={self.session_id} "
+                         f"path={canonical} quarantined=1")
+                self._resolve_lifecycle_barrier()
+                return
+
+            async def _cleanup():
+                try:
+                    # Ownership guard: if a newer enter (turn B) has claimed this
+                    # path, its tree is NOT ours to remove — skip.
+                    if _WORKTREE_PATH_OWNER.get(canonical) is not my_token:
+                        log.info(f"worktree.orphan_cleanup_skipped_newer_owner "
+                                 f"sid={self.session_id} path={canonical}")
+                        return
+                    await asyncio.to_thread(self._exit_sync, None, None, None)
+                    log.info(f"worktree.orphan_cleaned sid={self.session_id}")
+                except Exception as ex:
+                    log.warning(f"worktree.orphan_cleanup_failed sid={self.session_id}: "
+                                f"{ex} (claude-worktree-gc will sweep)")
+                finally:
+                    self._resolve_lifecycle_barrier()
+
+            loop2.create_task(_cleanup())
+
+        self._enter_task.add_done_callback(_on_done)
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # The lifecycle barrier is ALREADY published (from __aenter__) and
+        # spans through this exit. The done-callback below resolves it
+        # exactly once, tied to _exit_sync's REAL completion — cancellation-
+        # blind — so even if awaiting the shield is cancelled AGAIN here (a
+        # second cancellation delivered mid-exit), __aexit__ can unwind
+        # immediately without abandoning coordination: a same-path re-entry
+        # still cannot start until the real removal work genuinely finishes.
+        exit_task = asyncio.ensure_future(
+            asyncio.to_thread(self._exit_sync, exc_type, exc_val, exc_tb))
+        exit_task.add_done_callback(lambda _t: self._resolve_lifecycle_barrier())
+        try:
+            return await asyncio.shield(exit_task)
+        except asyncio.CancelledError:
+            log.info(f"worktree.exit_cancelled_deferred sid={self.session_id} "
+                     f"path={self._canonical} (exit continues under shield; "
+                     f"barrier resolves when it finishes)")
+            raise
+
+
+def _proc_ppid(pid: int) -> int | None:
+    """Parent pid — /proc/<pid>/stat field 4. comm (field 2) may contain spaces
+    /parens, so parse after the last ')'."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+        return int(data[data.rindex(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
 
 def _collect_tree(pid: int) -> list[int]:
-    """Return pid + all /proc descendants (depth-first), even ones that
-    called setsid() — claude's Bash tool calls are their own session leaders,
-    so pgroup/session-based kills miss them (2026-06-05 regression)."""
-    pids = [pid]
+    """Return `pid` followed by all of its /proc descendants (root first).
+
+    Descendants are found by an independent parent-pointer (PPID) walk over all
+    of /proc, reading each process's own /proc/<pid>/stat. A setsid() descendant
+    (claude's Bash tool calls run as their own session leaders) keeps its real
+    PPID — only its session/pgroup change — so a PPID walk still reaches it. This
+    replaces the earlier per-task `children` file, which is only reliable once the
+    parent is stopped and can silently under-report while the parent is running —
+    a descendant it misses would then escape _kill_tree (2026-06-05 regression)."""
     try:
-        for tid in os.listdir(f"/proc/{pid}/task"):
-            try:
-                children = Path(f"/proc/{pid}/task/{tid}/children").read_text().split()
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
-                continue
-            for child in children:
-                pids.extend(_collect_tree(int(child)))
-    except (FileNotFoundError, ProcessLookupError, PermissionError):
-        pass
-    return pids
+        entries = os.listdir("/proc")
+    except OSError:
+        return [pid]
+    children: dict[int, list[int]] = {}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        cpid = int(entry)
+        ppid = _proc_ppid(cpid)
+        if ppid is not None:
+            children.setdefault(ppid, []).append(cpid)
+    out = [pid]
+    seen = {pid}
+    stack = [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                out.append(child)
+                stack.append(child)
+    return out
+
+
+def _proc_starttime(pid: int) -> str | None:
+    """Process start time — /proc/<pid>/stat field 22 (jiffies since boot).
+    Together with the pid it identifies one process incarnation, so a pid reused
+    by an unrelated process after we recorded it is detectable (start time
+    differs). comm (field 2) may contain spaces/parens, so split after the last
+    ')'."""
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+        return data[data.rindex(")") + 2:].split()[19]
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+# Bounded number of freeze+rescan rounds in _kill_tree. Converges in 1–2 rounds
+# even for an aggressively forking child (once SIGSTOPped it cannot spawn more);
+# the cap only guarantees we never loop forever on a pathological tree.
+_KILL_TREE_MAX_ROUNDS = 16
 
 
 def _kill_tree(pid: int) -> None:
-    """SIGKILL `pid` and every descendant. Collect first, then kill — a child
-    spawned in the race window dies with its parent (orphaned sleep ≤20s).
-    Without this, `until pgrep ...` wait-loops survived the claude kill,
-    reparented to PID 1, and poisoned future pgrep-based loops forever."""
-    victims = _collect_tree(pid)
-    for p in victims:
-        try:
-            os.kill(p, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except Exception as ex:
-            log.warning(f"kill_tree pid={p} failed: {ex}")
-    if len(victims) > 1:
-        log.info(f"kill_tree root={pid} killed {len(victims)} processes: {victims}")
+    """SIGKILL `pid` and every /proc descendant, including setsid() session
+    leaders that pgroup/session kills miss (2026-06-05 regression: claude Bash
+    tool calls run as their own session leaders and survived as immortal orphans
+    that poisoned every future `pgrep`-based wait loop).
+
+    Freeze-then-kill closes the collect-versus-spawn/reparent race that a plain
+    snapshot+kill leaves open, and is identity-safe against PID reuse:
+
+    * A process is recorded as "frozen" ONLY after its SIGSTOP succeeds AND its
+      /proc start time is readable, so the scan cannot go falsely stable while a
+      process we could not stop keeps spawning descendants. A SIGSTOP that fails
+      with ProcessLookupError means the process is already gone; any other failure
+      (e.g. EPERM — a process we do not own) is a PERMANENT freeze failure: it is
+      recorded as unmanaged and never claimed as killed (fail-safe). Only an
+      unreadable identity *after* a successful stop is retried within the bounded
+      round budget.
+    * A successfully SIGSTOPped process cannot exit or be reaped, so its PID
+      cannot be reused while we hold it stopped; the recorded start time is
+      re-checked immediately before SIGKILL, so a procfs mis-read can only make us
+      skip a kill, never signal a stranger.
+    * SIGKILL is sent descendant-first / root-last. A pid is dropped from the
+      resume set ONLY once its SIGKILL is delivered or ProcessLookupError proves
+      it gone; any other SIGKILL failure keeps it in the set so `finally` still
+      resumes it — no successfully frozen process is ever left stopped.
+    * SIGKILL overrides SIGSTOP so freezing never blocks termination, and the
+      round count is bounded, so graceful-shutdown deadlines are preserved.
+    * The outcome is logged accurately: only processes actually terminated are
+      reported as killed, and anything that could not be frozen or killed (and was
+      therefore left running) is logged as a warning.
+    """
+    frozen: dict[int, str] = {}   # pid -> start time, ONLY successfully SIGSTOPped + readable
+    order: list[int] = []         # freeze order (root discovered first)
+    resolved: set[int] = set()    # gone or permanently unmanageable — not revisited
+    unmanaged: list[int] = []     # discovered but could not be frozen (e.g. EPERM)
+    killed: list[int] = []        # SIGKILL delivered, or proven gone at kill time
+    exhausted = True              # cleared when the frozen set stabilizes within budget
+    try:
+        for _ in range(_KILL_TREE_MAX_ROUNDS):
+            pending = [p for p in _collect_tree(pid) if p not in resolved and p not in frozen]
+            if not pending:
+                exhausted = False
+                break                        # frozen set stable → collection complete
+            for p in pending:
+                try:
+                    os.kill(p, signal.SIGSTOP)   # freeze → pins this incarnation
+                except ProcessLookupError:
+                    resolved.add(p)              # already gone — nothing to kill
+                    continue
+                except OSError:
+                    resolved.add(p)              # cannot freeze (EPERM/other): PERMANENT.
+                    unmanaged.append(p)          # fail-safe — record, never claim we killed it
+                    continue
+                st = _proc_starttime(p)          # identity read AFTER a successful stop
+                if st is None:
+                    # Frozen but identity unreadable (procfs race / just-exited): never
+                    # treat as safely frozen. Resume so it is not left stopped and let a
+                    # later bounded round retry it (not added to resolved).
+                    try:
+                        os.kill(p, signal.SIGCONT)
+                    except OSError:
+                        pass
+                    continue
+                frozen[p] = st
+                order.append(p)
+                resolved.add(p)
+        # SIGKILL descendant-first, root last (root forced to the end regardless of
+        # the order it was frozen in).
+        victims = [p for p in reversed(order) if p != pid]
+        if pid in frozen:
+            victims.append(pid)
+        for p in victims:
+            if _proc_starttime(p) != frozen.get(p):
+                continue                         # identity changed → leave for finally SIGCONT
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                frozen.pop(p, None)              # already gone → nothing to resume
+                killed.append(p)
+            except OSError as ex:
+                # Could not deliver SIGKILL (e.g. EPERM): KEEP it in `frozen` so the
+                # finally clause resumes it — never leave it SIGSTOPped.
+                log.warning(f"kill_tree pid={p} SIGKILL failed: {ex}")
+            else:
+                frozen.pop(p, None)              # delivered
+                killed.append(p)
+    finally:
+        # Resume anything we froze but did not kill — identity-checked so a reused
+        # pid is never signalled — so no successfully frozen process is left stopped.
+        for p in list(frozen):
+            if _proc_starttime(p) == frozen[p]:
+                try:
+                    os.kill(p, signal.SIGCONT)
+                except OSError:
+                    pass
+    if killed:
+        log.info(f"kill_tree root={pid} killed {len(killed)} process(es): {killed}")
+    not_terminated = unmanaged + list(frozen)
+    if not_terminated or exhausted:
+        log.warning(
+            f"kill_tree root={pid} did NOT fully terminate the tree: "
+            f"{len(not_terminated)} process(es) could not be frozen/killed and were left "
+            f"running: {not_terminated}"
+            + (f"; collection did not stabilize within {_KILL_TREE_MAX_ROUNDS} rounds"
+               if exhausted else ""))
 
 
-async def _spawn_claude_in(cmd, cwd, session_key: str | None = None):
+async def _spawn_claude_in(cmd, cwd, session_key: str | None = None, extra_env: dict | None = None):
     """Spawn a `claude` subprocess in `cwd` and return (proc, stdout_str, stderr_str).
 
     When `session_key` is provided, the subprocess is registered in SESSION_PROCS
     so /kill can terminate it. On timeout or cancellation we explicitly kill the
     child — `asyncio.wait_for` only cancels the wait coroutine, not the OS process,
     which previously leaked claude + its MCP children for days.
+
+    ``extra_env`` merges extra environment (e.g. the session-scoped coordination
+    publish credentials) on top of the fixed HOME/PATH.
     """
+    env = {**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"}
+    if extra_env:
+        env.update(extra_env)
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        env={**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"})
+        env=env)
     ACTIVE_PROCS[proc.pid] = proc
     if session_key:
         SESSION_PROCS[session_key] = proc
@@ -1036,96 +1810,117 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
     sid_safe = session.id.replace(':', '_')
 
     proc = None
+    # Shared coordination: register 'queued' before the slot; end status is set
+    # in the finally on EVERY exit path. Best-effort; never blocks the loop.
+    _coord = CoordRun(session, repo, starting_branch, prompt)
+    _coord_status = "failed"
     try:
-        with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
-            # Copy uploaded files INSIDE the worktree (not the shared repo)
-            fnote = ""
-            if files:
-                td = f"{wt_path}/.claude-tasks"
-                os.makedirs(td, exist_ok=True)
-                copied = []
-                for fp in files:
-                    if os.path.isfile(fp):
-                        d = f"{td}/{os.path.basename(fp)}"
-                        subprocess.run(["cp", fp, d])
-                        copied.append(d)
-                if copied:
-                    fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-            full_prompt = prompt + fnote
+        await asyncio.to_thread(COORD.upsert, _coord._entry("queued"))
+    except Exception:
+        pass
+    try:
+        # Bounded concurrency: hold the per-session lock (FIFO within a session)
+        # + one global permit (≤ MAX_RUNNING_AGENTS heavy runs bot-wide) for the
+        # whole worktree+spawn. Releases on success/error/timeout/cancel. All
+        # run_claude callers (normal, delayed, rate-limit retry, voice) inherit
+        # this; the rate-limit retry re-enters run_claude as a fresh, non-nested
+        # acquisition after the first run already released its permit.
+        async with execution_slot(session.id, session):
+            async with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+                await _coord.running(wt_path)   # -> 'running' + safe worktree view
+                # Copy uploaded files INSIDE the worktree (not the shared repo)
+                fnote = ""
+                if files:
+                    td = f"{wt_path}/.claude-tasks"
+                    os.makedirs(td, exist_ok=True)
+                    copied = []
+                    for fp in files:
+                        if os.path.isfile(fp):
+                            d = f"{td}/{os.path.basename(fp)}"
+                            await asyncio.to_thread(shutil.copy2, fp, d)
+                            copied.append(d)
+                    if copied:
+                        fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+                full_prompt = prompt + fnote
 
-            def build_cmd(mode, uuid_str):
-                flag = "--resume" if mode == "resume" else "--session-id"
-                cmd = ["claude", "--print"]
-                chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
-                if chosen_model:
-                    cmd += ["--model", chosen_model]
-                # Permission mode: skip / allowlist / strict
-                if BOT_TOOL_PERMISSION_MODE == "skip":
-                    cmd += ["--dangerously-skip-permissions"]
-                elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
-                    cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
-                # else strict: no flag (default Claude Code behavior in --print)
-                cmd += [flag, uuid_str, full_prompt]
-                return cmd
+                def build_cmd(mode, uuid_str):
+                    flag = "--resume" if mode == "resume" else "--session-id"
+                    cmd = ["claude", "--print"]
+                    chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
+                    if chosen_model:
+                        cmd += ["--model", chosen_model]
+                    # Permission mode: skip / allowlist / strict
+                    if BOT_TOOL_PERMISSION_MODE == "skip":
+                        cmd += ["--dangerously-skip-permissions"]
+                    elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
+                        cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
+                    # else strict: no flag (default Claude Code behavior in --print)
+                    cmd += [flag, uuid_str, full_prompt]
+                    return cmd
 
-            mode = "resume" if session.claude_created else "create"
-            cmd = build_cmd(mode, session.session_uuid)
-            log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
-                     f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
-                     f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
+                mode = "resume" if session.claude_created else "create"
+                cmd = build_cmd(mode, session.session_uuid)
+                log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
+                         f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                         f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
-            proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
+                proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id, extra_env=_coord_env(session))
 
-            # Recovery paths
-            if proc.returncode != 0:
-                err_low = (r + e).lower()
-                session_missing = any(kw in err_low for kw in [
-                    "no such session", "session not found", "session does not exist",
-                    "could not find session", "no session with id"
-                ])
-                uuid_collision = "already in use" in err_low
+                # Recovery paths
+                if proc.returncode != 0:
+                    err_low = (r + e).lower()
+                    session_missing = any(kw in err_low for kw in [
+                        "no such session", "session not found", "session does not exist",
+                        "could not find session", "no session with id"
+                    ])
+                    uuid_collision = "already in use" in err_low
 
-                if mode == "resume" and session_missing:
-                    log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
-                    session.session_uuid = str(uuid.uuid4())
-                    session.claude_created = False
-                    cmd = build_cmd("create", session.session_uuid)
-                    proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
-                    mode = "create"
-                elif mode == "create" and uuid_collision:
-                    log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
-                    session.session_uuid = str(uuid.uuid4())
-                    cmd = build_cmd("create", session.session_uuid)
-                    proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id)
+                    if mode == "resume" and session_missing:
+                        log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
+                        session.session_uuid = str(uuid.uuid4())
+                        session.claude_created = False
+                        cmd = build_cmd("create", session.session_uuid)
+                        proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id, extra_env=_coord_env(session))
+                        mode = "create"
+                    elif mode == "create" and uuid_collision:
+                        log.warning(f"UUID collision on create for {session.session_uuid[:8]}; regenerating")
+                        session.session_uuid = str(uuid.uuid4())
+                        cmd = build_cmd("create", session.session_uuid)
+                        proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id, extra_env=_coord_env(session))
 
-            if proc.returncode == 0 and not session.claude_created:
-                session.claude_created = True
+                if proc.returncode == 0 and not session.claude_created:
+                    session.claude_created = True
 
-            USAGE.record(len(full_prompt), len(r), session.label)
+                USAGE.record(len(full_prompt), len(r), session.label)
 
-            # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
-            # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
-            if proc.returncode != 0:
-                combined = (r + e).lower()
-                if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
-                    raw = (e or r).strip()
-                    # Log the RAW CLI error so overload-vs-usage-cap is diagnosable.
-                    log.warning(
-                        f"Claude rate-limited sid={session.id} "
-                        f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
-                        f"rc={proc.returncode} raw_err={raw[:600]!r}")
-                    if _rl_mode == "raw":
-                        return RL_LIMITED_SENTINEL
-                    # Hand off to the interactive flow (auto-retry once, then ask)
-                    # as a background task so this serial handler stays responsive.
-                    asyncio.create_task(_rate_limit_flow(prompt, project, session, files))
-                    return RL_ASK_SENTINEL
+                # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
+                # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
+                if proc.returncode != 0:
+                    combined = (r + e).lower()
+                    if any(kw in combined for kw in ["rate limit", "quota", "overloaded", "429", "too many requests"]):
+                        raw = (e or r).strip()
+                        # Log the RAW CLI error so overload-vs-usage-cap is diagnosable.
+                        log.warning(
+                            f"Claude rate-limited sid={session.id} "
+                            f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                            f"rc={proc.returncode} raw_err={raw[:600]!r}")
+                        if _rl_mode == "raw":
+                            return RL_LIMITED_SENTINEL
+                        # Hand off to the interactive flow (auto-retry once, then ask)
+                        # as a background task so this serial handler stays responsive.
+                        asyncio.create_task(_rate_limit_flow(prompt, project, session, files))
+                        return RL_ASK_SENTINEL
 
-            if proc.returncode != 0 and e:
-                r += f"\n⚠️ {e[:500]}"
-            return r.strip() or "(no output)"
+                if proc.returncode != 0 and e:
+                    r += f"\n⚠️ {e[:500]}"
+                if proc.returncode == 0:
+                    _coord_status = "completed"
+                return r.strip() or "(no output)"
+    except asyncio.CancelledError:
+        _coord_status = "cancelled"
+        raise
     except RuntimeError as rt_err:
-        # WorktreeSession.__enter__ raised — worktree creation failed.
+        # WorktreeSession._enter_sync raised — worktree creation failed.
         log.error(f"worktree.fatal sid={session.id} err={rt_err}")
         try:
             if BOT is not None:
@@ -1144,6 +1939,312 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
         return f"⏰ Timeout ({SPAWN_TIMEOUT_SECONDS // 60} min)."
     except Exception as e:
         return f"❌ {e}"
+    finally:
+        try:
+            await asyncio.to_thread(COORD.set_status, session.id, _coord_status)
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════
+#  Phase 2: coordination helpers + Codex / Chat run-paths + dispatch
+# ═══════════════════════════════════════════
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+
+
+_COORD_INSTRUCTIONS = (
+    "### How to coordinate\n"
+    "The table above is a **point-in-time snapshot** written when your worktree "
+    "was created — a sibling may have published newer claims since. Before large "
+    "edits, read the LIVE central view:\n"
+    "   `python3 \"$AGENT_COORD_PUBLISHER\" --show`\n"
+    "Then publish your own claim (task summary, expected paths, ETA) so others "
+    "see it:\n"
+    "   `python3 \"$AGENT_COORD_PUBLISHER\" --summary \"<what you are doing>\" "
+    "--paths <comma,separated,paths> --eta <e.g. 10m>`\n"
+    "(`$AGENT_COORD_PUBLISHER` is the absolute path to the helper, injected into "
+    "your environment; a relative `scripts/` path does NOT exist in this project "
+    "worktree.)\n\n"
+    "_Note: this is cooperative session identity, not a security boundary. The "
+    "shared store is advisory — please only update your own entry._\n"
+)
+
+
+def _valid_coord_publisher(path: str) -> "str | None":
+    """Return the absolute publisher path iff it passes preflight, else None.
+
+    Refuses anything that is not a regular, non-symlink file owned by root or the
+    running service user and readable, and whose bytes do not match the immutable
+    repo-shipped source (``_COORD_PUBLISHER_SRC``). Fail-closed: an unverifiable
+    publisher is simply not injected (agents skip publishing) rather than shipping
+    a tampered/unexpected script path into every child engine."""
+    try:
+        if not path:
+            return None
+        ap = os.path.abspath(path)
+        if os.path.islink(ap):
+            return None
+        st = os.stat(ap)  # follows nothing new: islink already ruled out a link
+        if not os.path.isfile(ap):
+            return None
+        try:
+            allowed = {0, os.geteuid()}
+        except AttributeError:  # pragma: no cover (non-POSIX)
+            allowed = {st.st_uid}
+        if st.st_uid not in allowed:
+            return None
+        if not os.access(ap, os.R_OK):
+            return None
+        src = os.path.abspath(_COORD_PUBLISHER_SRC)
+        if ap != src:
+            if _sha256_file(ap) != _sha256_file(src):
+                return None
+        return ap
+    except Exception:
+        return None
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _coord_env(session: "Session") -> dict:
+    """Session-scoped identity for the coordination publish helper.
+
+    NOT a security boundary — this is COOPERATIVE session identity: a shell-capable
+    engine could set its own AGENT_COORD_SESSION and update any entry, and the code
+    engines already run with broad host permissions. The shared store is advisory.
+    We inject the VALIDATED absolute publisher path so the helper is runnable from a
+    foreign project worktree (which has no relative ``scripts/coord_publish.py``)."""
+    env = {
+        "AGENT_COORD_STORE": COORDINATION_FILE,
+        "AGENT_COORD_SESSION": session.id,
+        "AGENT_COORD_REPO": coord.canonical_repo(get_project_path(session.project)),
+    }
+    pub = _valid_coord_publisher(BOT_COORD_PUBLISHER)
+    if pub:
+        env["AGENT_COORD_PUBLISHER"] = pub
+    return env
+
+
+class CoordRun:
+    """Truthful lifecycle for a code-engine run in the shared coordination store:
+    ``queued`` (registered BEFORE the execution slot) -> ``running`` (when a
+    worktree is admitted, with branch/worktree) -> ``completed|failed|cancelled``
+    on EVERY exit path. All store writes are flock-protected and off the loop."""
+
+    def __init__(self, session: "Session", repo: str, branch: str, summary: str):
+        self.session = session
+        self.repo = os.path.realpath(repo) if repo else repo
+        self.branch = branch or "main"
+        self.summary = (summary or "").strip()[:120]
+        self._ok = False
+
+    def _entry(self, status: str, worktree: str = "") -> "coord.CoordEntry":
+        return coord.CoordEntry(
+            session_id=self.session.id, engine=self.session.engine,
+            model=self.session.model or self.session.claude_model or "",
+            repo=self.repo, branch=self.branch, worktree=worktree,
+            summary=self.summary, status=status, eta="unknown")
+
+    async def __aenter__(self):
+        try:
+            await asyncio.to_thread(COORD.upsert, self._entry("queued"))
+        except Exception as ex:
+            log.warning(f"coord queued failed sid={self.session.id}: {ex}")
+        return self
+
+    async def running(self, worktree: str):
+        try:
+            await asyncio.to_thread(COORD.upsert, self._entry("running", worktree))
+            await asyncio.to_thread(
+                COORD.link_into_worktree, worktree, self.repo, _COORD_INSTRUCTIONS)
+        except Exception as ex:
+            log.warning(f"coord running failed sid={self.session.id}: {ex}")
+
+    def mark_ok(self):
+        self._ok = True
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc_type is not None and issubclass(exc_type, asyncio.CancelledError):
+            status = "cancelled"
+        elif self._ok:
+            status = "completed"
+        else:
+            status = "failed"
+        try:
+            await asyncio.to_thread(COORD.set_status, self.session.id, status)
+        except Exception:
+            pass
+        return False  # never suppress
+
+
+async def run_codex(prompt, project, session, files=None):
+    """Invoke the Codex CLI for a session inside a per-session git worktree.
+
+    Mirrors run_claude's isolation model (heavy permit + FIFO lock + worktree +
+    hardened tree-kill). Codex-specific bits — argv construction, thread-id
+    capture/resume, JSONL parsing, error normalization — live in the codex
+    adapter module. First turn captures ``thread.started``; later turns resume it.
+    """
+    repo = get_project_path(project)
+    if not os.path.isdir(repo):
+        repo = f"{REPOS}/{project}"
+    if not os.path.isdir(repo):
+        try:
+            os.makedirs(repo, exist_ok=True)
+        except Exception as e:
+            return f"❌ Not found: {project}\nCould not create: {e}"
+
+    starting_branch = getattr(session, 'starting_branch', 'main')
+    sid_safe = session.id.replace(':', '_')
+    model = session.model or engines.get_adapter("codex").default_model()
+    proc = None
+    try:
+        # Register 'queued' BEFORE the slot so siblings see the pending run.
+        async with CoordRun(session, repo, starting_branch, prompt) as cr:
+            async with execution_slot(session.id, session):
+                async with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+                    await cr.running(wt_path)   # -> 'running' + safe worktree view
+                    fnote = ""; images = []
+                    if files:
+                        td = f"{wt_path}/.claude-tasks"
+                        os.makedirs(td, exist_ok=True)
+                        copied = []
+                        for fp in files:
+                            if os.path.isfile(fp):
+                                d = f"{td}/{os.path.basename(fp)}"
+                                await asyncio.to_thread(shutil.copy2, fp, d)
+                                copied.append(d)
+                                if d.lower().endswith(_IMAGE_EXTS):
+                                    images.append(d)
+                        if copied:
+                            fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
+                    full_prompt = prompt + fnote
+
+                    thread_id = session.provider_session_id or None
+                    cmd = build_codex_cmd(full_prompt, model, thread_id, images)
+                    log.info(f"spawn.codex sid={session.id} project={project} "
+                             f"mode={'resume' if thread_id else 'create'} model={model or 'default'} "
+                             f"worktree={wt_path}")
+                    proc, r, e = await _spawn_claude_in(
+                        cmd, wt_path, session.id, extra_env=_coord_env(session))
+                    result = parse_codex_output(r)
+
+                    if result.thread_id and not session.provider_session_id:
+                        session.provider_session_id = result.thread_id
+                        # Persist the Codex thread id immediately so a restart before
+                        # the 10s autosave can still resume this exact thread.
+                        try:
+                            save_state()
+                        except Exception:
+                            pass
+
+                    USAGE.record(len(full_prompt), len(result.text), session.label)
+
+                    kind = classify_codex_failure(proc.returncode, r, e)
+                    if kind == "auth":
+                        return ("❌ Codex is not logged in on the server. "
+                                "Run <code>codex login</code> as the bot user, then retry.")
+                    if kind == "rate_limit":
+                        log.warning(f"Codex rate-limited sid={session.id} rc={proc.returncode}")
+                        return ("⏳ Codex is rate-limited or over quota right now. "
+                                "Try again shortly, or switch engine/model with /model.")
+
+                    text = result.text
+                    if not text:
+                        if result.diagnostics:
+                            text = "⚠️ " + result.diagnostics[-1][:500]
+                        elif kind == "nonzero":
+                            tail = (e or r).strip()[:500]
+                            text = f"❌ Codex exited {proc.returncode}." + (f"\n⚠️ {tail}" if tail else "")
+                        elif result.malformed:
+                            text = "⚠️ Codex produced no parseable output."
+                        else:
+                            text = "(no output)"
+                    else:
+                        cr.mark_ok()
+                    return text.strip() or "(no output)"
+    except RuntimeError as rt_err:
+        log.error(f"worktree.fatal(codex) sid={session.id} err={rt_err}")
+        return f"❌ Worktree creation failed: {rt_err}"
+    except asyncio.CancelledError:
+        raise
+    except asyncio.TimeoutError:
+        try:
+            if proc: _kill_tree(proc.pid)
+        except Exception: pass
+        return f"⏰ Timeout ({SPAWN_TIMEOUT_SECONDS // 60} min)."
+    except Exception as e:
+        return f"❌ {e}"
+
+
+_CHAT_ERR_MSG = {
+    "auth": "❌ Chat is unavailable: OPENROUTER_API_KEY is not configured.",
+    "rate_limit": "⏳ The model is rate-limited. Try again shortly or pick another model with /model.",
+    "timeout": "⏰ The model took too long to respond. Try again or pick a lighter model.",
+    "http": "❌ The model provider returned an error. Try another model with /model.",
+    "network": "❌ Network error reaching the model provider. Try again shortly.",
+    "empty": "⚠️ The model returned an empty response. Try rephrasing or another model.",
+}
+
+
+async def run_chat(prompt, session, files=None):
+    """OpenRouter conversational turn. No worktree, no tools, no repo/deploy.
+
+    Uses the INDEPENDENT chat concurrency cap (not the heavy permit) plus the
+    per-session FIFO lock, so two turns in one chat session never overlap.
+    History is bounded and stored per session outside bot-state.json.
+    """
+    model = session.model or engines.get_adapter("chat").default_model()
+    # Re-validate the safe dir at runtime (never trust a tampered state ref).
+    chat_dir = resolve_chat_dir(CHAT_SESSIONS_DIR, session.id, session.chat_history_ref)
+    if chat_dir != session.chat_history_ref:
+        session.chat_history_ref = chat_dir
+    history = ChatHistory(chat_dir)
+    prefix = ""
+    if files:
+        prefix = "ℹ️ Chat sessions can't open attachments — answering the text only.\n\n"
+    try:
+        async with execution_slot(session.id, session, heavy=False):
+            # Fail closed: the model must be in the current/last-known-good catalog.
+            if not await CHAT_CATALOG.is_selectable(model):
+                return ("❌ That chat model isn't available in the current OpenRouter "
+                        "catalog. Pick another with /model.")
+            messages = history.build_messages(prompt)
+            try:
+                text = await _or_client.chat(model, messages, timeout=120.0, max_retries=3)
+            except ChatError as ce:
+                log.warning(f"chat error sid={session.id} kind={ce.kind}: {ce.message}")
+                return _CHAT_ERR_MSG.get(ce.kind, f"❌ Chat error: {ce.kind}")
+            # Cancellation/kill guard: if the session was killed while we waited,
+            # do NOT recreate its purged history.
+            if session.id in SM.sessions:
+                history.append(prompt, text)
+            USAGE.record(len(prompt), len(text), session.label)
+            return (prefix + text).strip() or "(no output)"
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        return f"❌ {e}"
+
+
+async def dispatch_turn(prompt, project, session, files=None):
+    """Single engine dispatch point — handlers never branch on engine name.
+    Unknown/removed engine fails safely with a recovery hint."""
+    adapter = engines.get_adapter(session.engine)
+    if adapter is None:
+        return (f"⚠️ This session's engine (<code>{esc(session.engine)}</code>) is not "
+                f"available. Start a fresh session with /new, or change it with /model.")
+    if session.engine == engines.ENGINE_CHAT:
+        return await run_chat(prompt, session, files)
+    if session.engine == engines.ENGINE_CODEX:
+        return await run_codex(prompt, project, session, files)
+    return await run_claude(prompt, project, session, files)
 
 
 # ═══════════════════════════════════════════
@@ -1208,76 +2309,86 @@ async def _rate_limit_flow(prompt, project, session, files=None):
     except (ValueError, AttributeError, IndexError):
         return
 
-    notice = None
+    # Track this task under the session so /kill during the auto-retry wait
+    # cancels the pending resend. try/finally guarantees the registration is
+    # removed on normal completion, error, OR cancellation. The nested
+    # run_claude execution_slot registers/discards the SAME task idempotently,
+    # so a double-discard here is a harmless no-op.
+    task = asyncio.current_task()
+    CONC.register_task(session.id, task)
     try:
-        notice = await BOT.send_message(
-            chat_id,
-            f"⏳ <b>Claude is overloaded right now.</b>\n"
-            f"This is the servers being busy — not your daily/weekly limit.\n"
-            f"Auto-retrying once in {RATE_LIMIT_RETRY_DELAY}s…",
-            parse_mode=ParseMode.HTML)
-    except Exception as ex:
-        log.error(f"rate_limit_flow notice error: {ex}")
-
-    await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
-
-    session.status = "running"
-    output = await run_claude(prompt, project, session, files, _rl_mode="raw")
-    session.status = "idle"
-    session.last_active = time.time()
-
-    if output != RL_LIMITED_SENTINEL:
-        # Retry produced a real result (success or a normal error) — post it.
-        session.out = output
-        session.tasks += 1
+        notice = None
         try:
-            if notice:
-                try: await notice.delete()
-                except Exception: pass
-            sent = await BOT.send_message(
+            notice = await BOT.send_message(
                 chat_id,
-                f"{session_prefix(session)} | 🤖 <code>{project}</code> (auto-retry)\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
-                parse_mode=ParseMode.HTML, reply_markup=after_kb())
-            await track_reply(sent, session)
-            if len(output) > 8000:
-                lnk = await make_report(f"{project}-retry", output)
-                await BOT.send_message(
-                    chat_id, f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
-                    parse_mode=ParseMode.HTML)
+                f"⏳ <b>Claude is overloaded right now.</b>\n"
+                f"This is the servers being busy — not your daily/weekly limit.\n"
+                f"Auto-retrying once in {RATE_LIMIT_RETRY_DELAY}s…",
+                parse_mode=ParseMode.HTML)
         except Exception as ex:
-            log.error(f"rate_limit_flow post error: {ex}")
-        return
+            log.error(f"rate_limit_flow notice error: {ex}")
 
-    # Still overloaded → AUTO-schedule a resend at a random 10–35 min delay so
-    # requests naturally spread off the busy pool instead of all retrying at the
-    # same minute. The user doesn't have to do anything; buttons only let them
-    # bring it forward (urgent 5 min), switch to Sonnet 1M now, or cancel.
-    rl_id = uuid.uuid4().hex[:8]
-    secs = random.randint(RL_DEFER_MIN_SECS, RL_DEFER_MAX_SECS)
-    PENDING_RATELIMITS[rl_id] = {
-        "prompt": prompt, "project": project, "session_key": session.id,
-        "files": files or [], "chat_id": chat_id,
-    }
-    dp = _queue_resend(PENDING_RATELIMITS[rl_id], secs, session.label)
-    PENDING_RATELIMITS[rl_id]["dp_id"] = dp.id
-    fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M")
-    log.info(f"Rate-limit auto-defer {rl_id}: {dp.delay_str} for {session.label}")
-    text = (
-        f"🚦 <b>Claude هنوز شلوغه</b> — سرورها شلوغن، نه سقف روزانه/هفتگی تو.\n"
-        f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
-        f"<pre>{esc(prompt[:300])}</pre>\n\n"
-        f"⏰ خودکار <b>{dp.delay_str}</b> دیگه (حدود ساعت {fire_time}) دوباره می‌فرستم — "
-        f"کاری لازم نیست بکنی.\n"
-        f"اگه عجله داری یا می‌خوای همین الان ادامه بدی، یکی از دکمه‌ها رو بزن:")
-    try:
-        kb = _rl_keyboard(rl_id, session)
-        if notice:
-            await notice.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
-        else:
-            await BOT.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
-    except Exception as ex:
-        log.error(f"rate_limit_flow ask error: {ex}")
+        await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
+
+        session.status = "running"
+        output = await run_claude(prompt, project, session, files, _rl_mode="raw")
+        session.status = "idle"
+        session.last_active = time.time()
+
+        if output != RL_LIMITED_SENTINEL:
+            # Retry produced a real result (success or a normal error) — post it.
+            session.out = output
+            session.tasks += 1
+            try:
+                if notice:
+                    try: await notice.delete()
+                    except Exception: pass
+                sent = await BOT.send_message(
+                    chat_id,
+                    f"{session_prefix(session)} | 🤖 <code>{project}</code> (auto-retry)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_out(output)}",
+                    parse_mode=ParseMode.HTML, reply_markup=after_kb())
+                await track_reply(sent, session)
+                if len(output) > 8000:
+                    lnk = await make_report(f"{project}-retry", output)
+                    await BOT.send_message(
+                        chat_id, f"📎 <b>Full output:</b>\n\n{fmt_links(lnk)}",
+                        parse_mode=ParseMode.HTML)
+            except Exception as ex:
+                log.error(f"rate_limit_flow post error: {ex}")
+            return
+
+        # Still overloaded → AUTO-schedule a resend at a random 10–35 min delay so
+        # requests naturally spread off the busy pool instead of all retrying at the
+        # same minute. The user doesn't have to do anything; buttons only let them
+        # bring it forward (urgent 5 min), switch to Sonnet 1M now, or cancel.
+        rl_id = uuid.uuid4().hex[:8]
+        secs = random.randint(RL_DEFER_MIN_SECS, RL_DEFER_MAX_SECS)
+        PENDING_RATELIMITS[rl_id] = {
+            "prompt": prompt, "project": project, "session_key": session.id,
+            "files": files or [], "chat_id": chat_id,
+        }
+        dp = _queue_resend(PENDING_RATELIMITS[rl_id], secs, session.label)
+        PENDING_RATELIMITS[rl_id]["dp_id"] = dp.id
+        fire_time = datetime.fromtimestamp(dp.fire_at).strftime("%H:%M")
+        log.info(f"Rate-limit auto-defer {rl_id}: {dp.delay_str} for {session.label}")
+        text = (
+            f"🚦 <b>Claude هنوز شلوغه</b> — سرورها شلوغن، نه سقف روزانه/هفتگی تو.\n"
+            f"{session_prefix(session)} | 📂 <code>{project}</code>\n\n"
+            f"<pre>{esc(prompt[:300])}</pre>\n\n"
+            f"⏰ خودکار <b>{dp.delay_str}</b> دیگه (حدود ساعت {fire_time}) دوباره می‌فرستم — "
+            f"کاری لازم نیست بکنی.\n"
+            f"اگه عجله داری یا می‌خوای همین الان ادامه بدی، یکی از دکمه‌ها رو بزن:")
+        try:
+            kb = _rl_keyboard(rl_id, session)
+            if notice:
+                await notice.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+            else:
+                await BOT.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as ex:
+            log.error(f"rate_limit_flow ask error: {ex}")
+    finally:
+        CONC.discard_task(session.id, task)
 
 
 # ═══════════════════════════════════════════
@@ -1327,17 +2438,156 @@ def match_cmd(text):
 # ═══════════════════════════════════════════
 #  Reports
 # ═══════════════════════════════════════════
-async def make_report(name, content):
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S"); slug = f"{name}-{ts}"
-    rd = f"{REPORTS}/{slug}"; os.makedirs(rd, exist_ok=True)
-    with open(f"{rd}/summary.txt", "w") as f: f.write(content)
-    subprocess.run(["zip", "-r", f"{REPORTS}/{slug}.zip", slug], cwd=REPORTS, capture_output=True)
-    return {"Summary": f"{REPORT_URL}/{slug}/summary.txt",
-            "Browse": f"{REPORT_URL}/{slug}/", "ZIP": f"{REPORT_URL}/{slug}.zip"}
+@dataclass
+class ReportResult:
+    """Outcome of make_report. `links` is an ordered {label: url} mapping the
+    UI renders. On success it has Summary/Browse/ZIP; on partial failure the ZIP
+    is omitted (never a phantom link); on error it is empty and `error` is set."""
+    status: str                    # "ok" | "partial" | "error"
+    links: dict                    # {label: url}
+    slug: str = ""
+    error: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "ok"
+
+
+_SLUG_MAX_NAME = 60
+
+
+def _sanitize_slug_name(name: str) -> str:
+    """Make a caller-supplied report name safe as a SINGLE path segment.
+
+    Strips path separators and any path components (so `../../x` → `x`,
+    `/abs/path` → `path`, `a\\b` → `b`), removes traversal, leading dots,
+    control chars, newlines/tabs, and length-bounds the result. Never returns
+    empty. Preserves readable Unicode (e.g. Persian project names)."""
+    if not name:
+        return "report"
+    name = str(name).replace("\\", "/")
+    name = name.split("/")[-1]                       # drop path components (incl. absolute)
+    name = "".join(ch for ch in name if ch >= " " and ch != "\x7f")  # strip control chars
+    name = re.sub(r"\s+", "-", name).strip()          # collapse whitespace → hyphen
+    name = name.replace("..", "")                      # kill traversal remnants
+    name = re.sub(r'[<>:"|?*]', "", name)              # FS-hostile chars
+    name = name.strip("-. ")                           # no leading/trailing dots/hyphens/space
+    if len(name) > _SLUG_MAX_NAME:
+        name = name[:_SLUG_MAX_NAME].strip("-. ")
+    return name or "report"
+
+
+def _report_slug(name: str) -> str:
+    """Readable, collision-safe, path-safe slug: sanitized name + timestamp +
+    short random suffix. The random suffix guarantees uniqueness even for calls
+    within the same second; the sanitizer + always-appended suffix guarantee the
+    slug is a single, non-empty path segment (no traversal)."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{_sanitize_slug_name(name)}-{ts}-{uuid.uuid4().hex[:6]}"
+
+
+def _build_report(reports_dir: str, report_url: str, name: str, content: str,
+                  slug: "str | None" = None) -> ReportResult:
+    """Pure, synchronous report builder (no event loop, no external `zip`).
+
+    Writes summary.txt (UTF-8), builds the ZIP to a temp path via zipfile and
+    atomically renames it only after it verifies non-empty and openable with the
+    expected entries. Any failure downgrades to 'partial' (Summary/Browse only)
+    or 'error' — it never raises and never returns a ZIP link for a ZIP that
+    isn't there. Runs off-thread from make_report."""
+    slug = slug or _report_slug(name)
+    # Defense in depth: if a slug is passed directly, guarantee it stays a single
+    # child segment of reports_dir (never `.`/`..`/a separator that could escape).
+    if slug in (".", "..") or "/" in slug or "\\" in slug or os.sep in slug:
+        slug = _report_slug(name)
+    rd = os.path.join(reports_dir, slug)
+    links = OrderedDict()
+    links["Summary"] = f"{report_url}/{slug}/summary.txt"
+    links["Browse"] = f"{report_url}/{slug}/"
+    try:
+        os.makedirs(rd, exist_ok=True)
+        summary_path = os.path.join(rd, "summary.txt")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            f.write(content if content is not None else "")
+        if not os.path.isfile(summary_path):
+            return ReportResult("error", OrderedDict(), slug, "summary write failed")
+    except Exception as ex:
+        log.error(f"make_report.summary_failed slug={slug}: {ex}")
+        return ReportResult("error", OrderedDict(), slug, f"summary error: {ex}")
+
+    # Build ZIP to a temp path, verify, then atomically move into place.
+    final_zip = os.path.join(reports_dir, f"{slug}.zip")
+    tmp_zip = os.path.join(reports_dir, f".{slug}.{uuid.uuid4().hex[:8]}.zip.tmp")
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _dirs, fnames in os.walk(rd):
+                for fn in fnames:
+                    fp = os.path.join(root, fn)
+                    arcname = os.path.relpath(fp, reports_dir)  # -> "<slug>/summary.txt"
+                    zf.write(fp, arcname)
+        # Verify: non-empty and contains the expected summary entry.
+        if os.path.getsize(tmp_zip) <= 0:
+            raise RuntimeError("empty archive")
+        with zipfile.ZipFile(tmp_zip) as zf:
+            if zf.testzip() is not None:
+                raise RuntimeError("archive CRC check failed")
+            names = zf.namelist()
+            if f"{slug}/summary.txt" not in names:
+                raise RuntimeError(f"summary missing from archive ({names[:3]})")
+        os.replace(tmp_zip, final_zip)
+    except Exception as ex:
+        log.error(f"make_report.zip_failed slug={slug}: {ex}")
+        try:
+            if os.path.exists(tmp_zip):
+                os.remove(tmp_zip)
+        except OSError:
+            pass
+        return ReportResult("partial", links, slug, f"zip error: {ex}")
+
+    links["ZIP"] = f"{report_url}/{slug}.zip"
+    return ReportResult("ok", links, slug)
+
+
+async def make_report(name, content) -> ReportResult:
+    """Create a report (summary + verified ZIP) and return a ReportResult.
+
+    Never raises: on failure the caller still sends a message (via fmt_links),
+    just without a ZIP link. The filesystem/zip work runs in a worker thread so
+    the Telegram event loop is never blocked."""
+    try:
+        return await asyncio.to_thread(_build_report, REPORTS, REPORT_URL, name, content)
+    except Exception as ex:
+        log.error(f"make_report.error name={name}: {ex}")
+        return ReportResult("error", OrderedDict(), "", str(ex))
 
 # ═══════════════════════════════════════════
 #  Send
 # ═══════════════════════════════════════════
+def _utf16_prefix_len(s: str, mx: int) -> int:
+    """Largest code-point index ``i`` such that the UTF-16 length of ``s[:i]``
+    is ≤ ``mx`` (so a chunk never exceeds Telegram's UTF-16 limit)."""
+    total = 0
+    for i, ch in enumerate(s):
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if total + w > mx:
+            return i
+        total += w
+    return len(s)
+
+
+def _split_plain_utf16(text: str, mx: int = 4000) -> list:
+    """Split plain text on UTF-16 code-unit boundaries (emoji-safe)."""
+    if resource_footer.tg_len(text) <= mx:
+        return [text]
+    out = []
+    rem = text
+    while rem:
+        i = _utf16_prefix_len(rem, mx) or 1
+        out.append(rem[:i])
+        rem = rem[i:]
+    return out
+
+
 def _split_html_chunks(text: str, mx: int = 4000) -> list:
     """Split text into Telegram-safe chunks preserving HTML tag balance.
 
@@ -1345,23 +2595,24 @@ def _split_html_chunks(text: str, mx: int = 4000) -> list:
     current chunk and reopen it at the start of the next. Prevents
     telegram.error.BadRequest: "Can't parse entities: can't find end tag
     corresponding to start tag 'pre'" — the dominant cause of silent
-    dropped reports in the bot's history.
+    dropped reports in the bot's history. ``mx`` is a UTF-16 code-unit budget.
     """
-    if len(text) <= mx:
+    if resource_footer.tg_len(text) <= mx:
         return [text]
     chunks = []
     remaining = text
     carry_open = []  # tags carried from previous chunk's unclosed state
     while remaining:
-        if len(remaining) <= mx:
+        if resource_footer.tg_len(remaining) <= mx:
             chunk = remaining
             for tag in carry_open:
                 chunk = f"<{tag}>" + chunk
             chunks.append(chunk)
             break
-        cut = remaining.rfind("\n", 0, mx)
-        if cut == -1 or cut < mx // 4:
-            cut = mx
+        mx_idx = _utf16_prefix_len(remaining, mx)
+        cut = remaining.rfind("\n", 0, mx_idx)
+        if cut == -1 or cut < mx_idx // 4:
+            cut = mx_idx
         chunk = remaining[:cut]
         rest = remaining[cut:].lstrip("\n")
         for tag in carry_open:
@@ -1377,42 +2628,134 @@ def _split_html_chunks(text: str, mx: int = 4000) -> list:
     return chunks
 
 
-async def send_long(msg, text, pm=ParseMode.HTML, rm=None):
+# ── Phase 2: CENTRAL user-visible footer ───────────────────────────────────
+# Every user-visible text goes through bot.send_message / bot.edit_message_text
+# (Message.reply_text, Message.edit_text and CallbackQuery.edit_message_text all
+# funnel into them). Wrapping those two on the Bot instance appends exactly one
+# cached RAM/Swap/Disk footer to every text message — commands, menus, errors,
+# delayed results, report links, health/log replies, model confirmations,
+# shutdown notices and engine outputs alike. Binary uploads (send_document/
+# send_photo), chat actions and callback acks use OTHER methods and are excluded
+# automatically. Long agent replies suppress the wrapper and footer their final
+# chunk exactly once (see send_long).
+_FOOTER_SUPPRESS = contextvars.ContextVar("footer_suppress", default=False)
+
+
+def _footerize(text, parse_mode):
+    if not text or _FOOTER_SUPPRESS.get():
+        return text
+    # HTML and plain messages get a matching footer; Markdown is left alone
+    # (the <code> footer would break Markdown parsing).
+    if parse_mode not in (None, ParseMode.HTML):
+        return text
+    try:
+        return resource_footer.with_footer(text, html=(parse_mode == ParseMode.HTML))
+    except Exception:
+        return text
+
+
+class FooterBot(ExtBot):
+    """ExtBot subclass that appends the cached RAM/Swap/Disk footer to every
+    user-visible text send/edit.
+
+    Production uses this (supplied via ``ApplicationBuilder.bot(...)``) instead of
+    replacing instance attributes: ``ExtBot`` inherits frozen, slot-based
+    ``TelegramObject``, which rejects public attribute assignment
+    (``bot.send_message = ...`` raises ``AttributeError`` and aborts startup).
+    Overriding the methods on a subclass is the supported interception point —
+    ``Message.reply_text`` / ``Message.edit_text`` /
+    ``CallbackQuery.edit_message_text`` all funnel through the bot's
+    ``send_message`` / ``edit_message_text``. Footering is idempotent by
+    construction (``_footerize`` -> ``with_footer`` skips an already-present
+    footer) and honours the ``_FOOTER_SUPPRESS`` contextvar used by send_long.
+    """
+
+    async def send_message(self, chat_id=None, text=None, *args, **kwargs):
+        return await super().send_message(
+            chat_id, _footerize(text, kwargs.get("parse_mode")), *args, **kwargs)
+
+    async def edit_message_text(self, text=None, *args, **kwargs):
+        return await super().edit_message_text(
+            _footerize(text, kwargs.get("parse_mode")), *args, **kwargs)
+
+
+def install_send_footer(bot):
+    """Wrap send_message / edit_message_text on a MUTABLE Bot-like object.
+
+    Only for test doubles / non-frozen bots. Production must use ``FooterBot``
+    (see above) because the real ``ExtBot`` is frozen and would raise here.
+    Idempotent via the ``_footer_wrapped`` marker.
+    """
+    if getattr(bot, "_footer_wrapped", False):
+        return
+    orig_send = bot.send_message
+    orig_edit = bot.edit_message_text
+
+    async def send_message(chat_id=None, text=None, *args, **kwargs):
+        return await orig_send(chat_id, _footerize(text, kwargs.get("parse_mode")),
+                               *args, **kwargs)
+
+    async def edit_message_text(text=None, *args, **kwargs):
+        return await orig_edit(_footerize(text, kwargs.get("parse_mode")),
+                               *args, **kwargs)
+
+    bot.send_message = send_message
+    bot.edit_message_text = edit_message_text
+    bot._footer_wrapped = True
+
+
+async def send_long(msg, text, pm=ParseMode.HTML, rm=None, footer=True):
     """Send a long message, splitting safely on HTML tag boundaries.
 
     On BadRequest (HTML parse error) retries the same chunk as plain text
     so the user always sees *something* — silent drops were the #1 reason
     reports appeared lost across sessions.
+
+    The footer goes on the FINAL chunk exactly once; the per-send wrapper is
+    suppressed for the individual chunks so earlier chunks never get one.
+    Chunking uses Telegram's UTF-16 code-unit limit, not code points.
     """
     mx = 4000
-    chunks = _split_html_chunks(text, mx) if pm == ParseMode.HTML else (
-        [text] if len(text) <= mx else [text[i:i+mx] for i in range(0, len(text), mx)]
-    )
+    chunks = _split_html_chunks(text, mx) if pm == ParseMode.HTML else _split_plain_utf16(text, mx)
+    # Footer the FINAL chunk AFTER splitting. Appending to the whole message
+    # first drops the footer on exactly the long (>4096) replies that get split,
+    # because with_footer() refuses to exceed Telegram's limit. Each chunk is
+    # <=mx (4000) UTF-16 units, leaving ample room for the ~80-unit footer under
+    # the 4096 limit. Mirror the central policy: HTML + plain get a footer,
+    # Markdown is left alone.
+    if footer and pm in (None, ParseMode.HTML) and chunks:
+        chunks[-1] = resource_footer.with_footer(chunks[-1], html=(pm == ParseMode.HTML))
     last = None
-    for i, ch in enumerate(chunks):
-        is_last = (i == len(chunks) - 1)
-        mk = rm if is_last else None
-        try:
-            last = await msg.reply_text(
-                ch, parse_mode=pm, reply_markup=mk, disable_web_page_preview=True)
-        except BadRequest as e:
-            err = str(e).lower()
-            if "parse entities" in err or "end tag" in err or "can't parse" in err:
-                log.warning(
-                    f"HTML parse failed on chunk {i+1}/{len(chunks)}, "
-                    f"retrying as plain text: {e}")
-                plain = re.sub(r"<[^>]+>", "", ch)
-                try:
-                    last = await msg.reply_text(
-                        plain, parse_mode=None, reply_markup=mk,
-                        disable_web_page_preview=True)
-                except Exception as ee:
-                    log.error(f"Plain-text fallback also failed: {ee}")
-            else:
-                log.error(f"send_long BadRequest (non-parse): {e}")
-        except Exception as e:
-            log.error(f"send_long unexpected error on chunk {i+1}/{len(chunks)}: {e}")
-        await asyncio.sleep(0.3)
+    # Suppress the per-send footer wrapper: the footer is already on the final
+    # chunk (added above), so individual chunks must NOT each get one.
+    _tok = _FOOTER_SUPPRESS.set(True)
+    try:
+        for i, ch in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            mk = rm if is_last else None
+            try:
+                last = await msg.reply_text(
+                    ch, parse_mode=pm, reply_markup=mk, disable_web_page_preview=True)
+            except BadRequest as e:
+                err = str(e).lower()
+                if "parse entities" in err or "end tag" in err or "can't parse" in err:
+                    log.warning(
+                        f"HTML parse failed on chunk {i+1}/{len(chunks)}, "
+                        f"retrying as plain text: {e}")
+                    plain = re.sub(r"<[^>]+>", "", ch)
+                    try:
+                        last = await msg.reply_text(
+                            plain, parse_mode=None, reply_markup=mk,
+                            disable_web_page_preview=True)
+                    except Exception as ee:
+                        log.error(f"Plain-text fallback also failed: {ee}")
+                else:
+                    log.error(f"send_long BadRequest (non-parse): {e}")
+            except Exception as e:
+                log.error(f"send_long unexpected error on chunk {i+1}/{len(chunks)}: {e}")
+            await asyncio.sleep(0.3)
+    finally:
+        _FOOTER_SUPPRESS.reset(_tok)
     return last
 
 async def download_doc(doc, ctx):
@@ -1510,29 +2853,34 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
             await track_reply(r, session)
 
     # ── Run Claude with progress indicator ──
-    session.status = "running"
-    await cm.edit_text(f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n⏳ Working...", parse_mode=ParseMode.HTML)
+    # run_claude (via execution_slot) sets session.status to "queued" while it
+    # waits for a free global slot, then "running" once admitted — surface both.
+    await cm.edit_text(f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n⏳ Starting…", parse_mode=ParseMode.HTML)
 
     start_time = datetime.now()
 
+    def _progress_text():
+        elapsed = (datetime.now() - start_time).seconds
+        mins, secs = elapsed // 60, elapsed % 60
+        if session.status == "queued":
+            return (f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n"
+                    f"⏳ Queued — waiting for a free slot "
+                    f"({CONC.running}/{CONC.max_running} running) · {mins}m {secs}s")
+        return (f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n"
+                f"⏳ Working ({mins}m {secs}s)")
+
     async def progress_updater():
-        dots = 0
+        # Render immediately (queued shows without a 30s wait), then poll faster
+        # while queued (responsive) and slower while running (low edit spam).
         while True:
-            await asyncio.sleep(30)
-            dots = (dots + 1) % 4
-            elapsed = (datetime.now() - start_time).seconds
-            mins = elapsed // 60
-            secs = elapsed % 60
             try:
-                await cm.edit_text(
-                    f"{pfx} | 🤖 → <code>{proj}</code>{fi}\n"
-                    f"⏳ Working{'.' * (dots + 1)} ({mins}m {secs}s)",
-                    parse_mode=ParseMode.HTML)
+                await cm.edit_text(_progress_text(), parse_mode=ParseMode.HTML)
             except: pass
+            await asyncio.sleep(6 if session.status == "queued" else 30)
 
     progress_task = asyncio.create_task(progress_updater())
     try:
-        output = await run_claude(prompt, proj, session, files)
+        output = await dispatch_turn(prompt, proj, session, files)
     finally:
         progress_task.cancel()
 
@@ -1570,7 +2918,7 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 
     sent = await send_long(update.message,
         f"{pfx} | \U0001f916 <code>{proj}</code>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n{fmt_out(output)}",
-        rm=kb)
+        rm=kb, footer=True)
     await track_reply(sent, session)
 
     if len(output) > 8000:
@@ -1591,13 +2939,13 @@ async def execute(update, context, prompt, session: Session, files=None, is_voic
 # ═══════════════════════════════════════════
 async def do_health(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
-    r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+    r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_logs(u, c):
     await c.bot.send_chat_action(u.effective_chat.id, ChatAction.TYPING)
     prod_host = os.environ.get("PROD_HOST", "127.0.0.1")
-    r = subprocess.run([f"{SCRIPTS}/collect-logs.sh", prod_host, "30"], capture_output=True, text=True, timeout=30)
+    r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/collect-logs.sh", prod_host, "30"], capture_output=True, text=True, timeout=30)
     await u.message.reply_text(f"📋 <b>Logs</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
 async def do_projects(u, c):
@@ -1662,7 +3010,7 @@ async def cmd_help(u, c):
     await u.message.reply_text(
         "\U0001f4d6 <b>How to use \u2014 v4 Multi-Session</b>\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n\n"
         "<b>Sessions:</b>\n"
-        "/new &lt;name&gt; \u2014 start a new session (max 3)\n"
+        f"/new &lt;name&gt; \u2014 start a new session (max {MAX_SESSIONS})\n"
         "/sessions \u2014 list all active sessions\n"
         "/cont \u2014 pick an active session and continue it (no scrolling)\n"
         "/kill &lt;name&gt; \u2014 end a session\n"
@@ -1716,11 +3064,11 @@ async def cmd_new(u, c):
             parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
         return
 
-    # Show project picker — session created on project selection
-    # If no name given, we'll ask for name after project selection
+    # Phase 2: pick the engine first (Claude Code | Codex | Chat), then the
+    # Claude/Codex flow continues to project selection; Chat picks a model.
     await u.message.reply_text(
-        f"🆕 New session{f' <b>{esc(label)}</b>' if has_name else ''} — which project?",
-        parse_mode=ParseMode.HTML, reply_markup=new_session_project_kb(label, has_name=has_name))
+        f"🆕 New session{f' <b>{esc(label)}</b>' if has_name else ''} — pick an engine:",
+        parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(cid, label, has_name=has_name))
 
 @authorized
 async def cmd_sessions(u, c):
@@ -1846,11 +3194,17 @@ async def cmd_model(u, c):
     """
     cid = u.effective_chat.id
 
-    # Active session (for per-session Claude Code model)
+    # Active session (for per-session primary-engine model)
     active_key = ACTIVE_SESSION.get(cid)
     active_session = SM.sessions.get(active_key) if active_key else None
-    current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
+    active_engine = (active_session.engine if active_session else engines.ENGINE_CLAUDE) or engines.ENGINE_CLAUDE
+    active_adapter = engines.get_adapter(active_engine) or engines.get_adapter(engines.ENGINE_CLAUDE)
+    if active_session and active_engine != engines.ENGINE_CLAUDE:
+        current_cc = active_session.model or active_adapter.default_model()
+    else:
+        current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
     cc_label = current_cc if current_cc else "default (CLI default — latest Sonnet/Opus)"
+    engine_label = active_adapter.caps.label if active_adapter else "Claude Code"
 
     # Fallback chain
     prov = ACTIVE_FALLBACK["provider"]
@@ -1862,17 +3216,40 @@ async def cmd_model(u, c):
 
     rows = []
 
-    # ── Claude Code (primary) ──
-    cc_match = (active_session.claude_model if active_session else "") if active_session else None
-    cc_options = [("",       "Default (CLI default)"),
-                  ("sonnet", "Sonnet"),
-                  ("opus",   "Opus")]
-    for val, lbl in cc_options:
-        is_active = (cc_match == val) if active_session else False
-        icon = "✅" if is_active else ("🔹" if active_session else "🔸")
-        cb_token = val if val else "default"
-        rows.append([InlineKeyboardButton(f"CC: {icon} {lbl}", callback_data=_cb(f"ccmod:{cb_token}"))])
-    rows.append([InlineKeyboardButton("CC: ✏️ Custom model name…", callback_data="ccmod:custom")])
+    # ── Primary engine (engine-aware) ──
+    # Every engine renders its OWN verified adapter catalog and every choice —
+    # button or free-text — goes through that adapter's validation (so a Claude
+    # session rejects Codex/OpenRouter ids, etc.). Claude shows Fable 5 / Opus
+    # 4.8 / Sonnet 5 / Haiku 4.5 / Default; Codex shows its discovered catalog
+    # (Sol/Terra/Luna…); Chat shows favorites + search.
+    if active_session:
+        cur = (active_session.claude_model if active_engine == engines.ENGINE_CLAUDE
+               else active_session.model) or ""
+        elabel = active_adapter.caps.label
+        stale = active_adapter.caps.is_chat and CHAT_CATALOG.stale
+        for m in active_adapter.list_models()[:12]:
+            if not m.available:
+                continue
+            icon = "✅" if cur == m.id else "🔹"
+            # Bind the button to the session the menu is rendered FOR: id + engine
+            # + the immutable per-instance nonce (session_uuid). Switching the
+            # active session — or killing+recreating this same label — before a
+            # click can then never retarget the wrong instance.
+            rows.append([InlineKeyboardButton(
+                f"{elabel}: {icon} {m.display()}",
+                callback_data=cb2("emod", cid, session_key=active_session.id,
+                                  engine=active_engine, uuid=active_session.session_uuid,
+                                  model=m.id))])
+        if active_adapter.caps.is_chat:
+            rows.append([InlineKeyboardButton(
+                f"{elabel}: 🔎 Search…" + (" (cached)" if stale else ""),
+                callback_data=cb2("emsearch", cid, session_key=active_session.id,
+                                  engine=active_engine, uuid=active_session.session_uuid))])
+        else:
+            rows.append([InlineKeyboardButton(
+                f"{elabel}: ✏️ Custom model…",
+                callback_data=cb2("emcustom", cid, session_key=active_session.id,
+                                  engine=active_engine, uuid=active_session.session_uuid))])
 
     # ── Fallback chain ──
     rows.append([InlineKeyboardButton(
@@ -1888,15 +3265,16 @@ async def cmd_model(u, c):
     rows.append([InlineKeyboardButton("FB: 🔍 Search OpenRouter…", callback_data="mdl:search")])
 
     sess_note = (
-        f"Active session: {active_session.color_emoji} <b>{esc(active_session.label)}</b>\n"
+        f"Active session: {active_session.color_emoji} <b>{esc(active_session.label)}</b> "
+        f"· engine <b>{esc(engine_label)}</b>\n"
         if active_session else
-        "<i>No active session — start one with /new before changing the Claude Code model.</i>\n"
+        "<i>No active session — start one with /new before changing the primary model.</i>\n"
     )
 
     await u.message.reply_text(
         f"🤖 <b>Model Settings</b>\n"
         f"{sess_note}"
-        f"\n<b>Claude Code (primary)</b>: <code>{esc(cc_label)}</code>\n"
+        f"\n<b>{esc(engine_label)} (primary)</b>: <code>{esc(cc_label)}</code>\n"
         f"<b>Fallback chain</b>: <code>{esc(current_fb)}</code>\n\n"
         f"🎤 STT: <code>{gemini_transcribe}</code>\n"
         f"🧠 Refine: <code>{gemini_refine}</code>\n"
@@ -1956,7 +3334,7 @@ async def schedule_delayed_prompt(dp: DelayedPrompt, app):
     session.status = "running"
     session.last_active = time.time()
     try:
-        output = await run_claude(dp.prompt, project, session, dp.files or None)
+        output = await dispatch_turn(dp.prompt, project, session, dp.files or None)
     except Exception as e:
         output = f"❌ Delayed execution error: {e}"
 
@@ -2055,7 +3433,7 @@ async def schedule_next_delayed_prompt(dp: DelayedPrompt, app):
         session.status = "running"
         session.last_active = time.time()
         try:
-            output = await run_claude(dp.prompt, project, session, dp.files or None)
+            output = await dispatch_turn(dp.prompt, project, session, dp.files or None)
         except Exception as e:
             output = f"❌ Delayed execution error: {e}"
 
@@ -2149,10 +3527,309 @@ async def error_handler(update, context):
 # ═══════════════════════════════════════════
 #  Handler: Inline Buttons
 # ═══════════════════════════════════════════
+def _resolve_rendered_session(cid, p):
+    """Non-async core: resolve the session a /model menu was rendered FOR from the
+    token/conv-state fields (``session_key`` + immutable ``uuid`` nonce + expected
+    ``engine``), NOT the current ACTIVE_SESSION. Returns (session, None) on success
+    or (None, reason) where reason is a short refresh message.
+
+    The ``uuid`` (``Session.session_uuid``, freshly minted per instance by
+    SessionManager.create) is what defeats a same-label/same-engine REPLACEMENT: a
+    killed-and-recreated session has a different nonce, so an old button/state is
+    rejected instead of silently retargeting the new session."""
+    skey = p.get("session_key", "")
+    exp_engine = p.get("engine", "")
+    exp_uuid = p.get("uuid", "")
+    if not skey or not skey.startswith(f"{cid}:"):
+        return None, ("⚠️ This model menu is out of date (the session changed). "
+                      "Open /model again for the current session.")
+    target = SM.sessions.get(skey)
+    if target is None:
+        return None, "⚠️ That session no longer exists. Open /model again."
+    if exp_uuid and target.session_uuid != exp_uuid:
+        # same key can be a different instance (killed + recreated same label)
+        return None, ("⚠️ That session was replaced by a newer one. "
+                      "Open /model again.")
+    if exp_engine and target.engine != exp_engine:
+        return None, "⚠️ That session's engine changed. Open /model again."
+    return target, None
+
+
+async def _p2_rendered_session(q, cid, p):
+    """Async wrapper: resolve the rendered session or send the refresh hint and
+    return None (fail closed)."""
+    target, reason = _resolve_rendered_session(cid, p)
+    if target is None:
+        await q.edit_message_text(reason, parse_mode=ParseMode.HTML)
+        return None
+    return target
+
+
+async def _handle_p2(q, c, cid, p: dict, token: str = ""):
+    """Dispatch a Phase-2 structured callback payload. Fields come straight from
+    the token registry — never parsed from the callback string — so arbitrary
+    labels/project names/model ids (Unicode, ':' , '|', '/', long) are exact.
+    Engine/session/model are re-validated here at execution time. Chat ownership
+    is already enforced by on_callback's central gate. Create actions consume the
+    token (one-shot) so a double-tap/replay cannot spawn/replace a second
+    same-label session."""
+    kind = p.get("k")
+
+    async def _cap_guard() -> bool:
+        if not SM.can_create(cid):
+            await q.edit_message_text(
+                f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
+                parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(SM.active_for_chat(cid)))
+            return False
+        return True
+
+    def _anchor(session):
+        session.anchor_message_id = q.message.message_id
+        SM.register_message(q.message.message_id, session.id)
+        session.message_ids.append(q.message.message_id)
+
+    if kind == "neng":
+        engine = p.get("engine", engines.ENGINE_CLAUDE)
+        label = p.get("label") or f"session-{int(time.time()) % 10000}"
+        has_name = bool(p.get("has_name", True))
+        adapter = engines.get_adapter(engine)
+        if adapter is None:
+            await q.edit_message_text("⚠️ Unknown engine.", parse_mode=ParseMode.HTML)
+            return
+        if adapter.caps.is_chat:
+            try:
+                favs = await CHAT_CATALOG.favorites()
+            except Exception:
+                favs = []
+            note = " <i>(cached)</i>" if CHAT_CATALOG.stale else ""
+            if not any(m.available for m in favs):
+                await q.edit_message_text(
+                    "💬 Chat catalog is unavailable right now (no OpenRouter access). "
+                    "Try again shortly.", parse_mode=ParseMode.HTML)
+                return
+            await q.edit_message_text(
+                f"💬 <b>Chat</b> — pick a model{note}:",
+                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(cid, label, has_name, favs))
+        else:
+            await q.edit_message_text(
+                f"{_ENGINE_ICONS.get(engine, '•')} <b>{esc(adapter.caps.label)}</b> — which project?",
+                parse_mode=ParseMode.HTML,
+                reply_markup=new_session_project_kb(cid, engine, label, has_name=has_name))
+
+    elif kind == "newproj":
+        engine = p.get("engine", engines.ENGINE_CLAUDE)
+        label = p.get("label") or f"session-{int(time.time()) % 10000}"
+        proj_name = p.get("project", "")
+        if not engines.known_engine(engine):
+            engine = engines.ENGINE_CLAUDE
+        if not await _cap_guard():
+            return
+        cb2_consume(token)          # one-shot: block a double-tap second create
+        session = SM.create(cid, label)
+        _apply_engine(session, engine)
+        session.project = proj_name
+        await q.edit_message_text(
+            f"{session.color_emoji} {_ENGINE_ICONS.get(engine,'•')} <b>{esc(session.label)}</b> "
+            f"({esc(engines.get_adapter(engine).caps.label)}) created.\n"
+            f"📁 Project: <b>{esc(proj_name)}</b>\n\n"
+            f"Reply to this message to interact with this session.",
+            parse_mode=ParseMode.HTML)
+        _anchor(session)
+        save_state()
+        log.info(f"Session created (picker): {session.label} engine={engine} for chat {cid}")
+
+    elif kind == "newneed":
+        engine = p.get("engine", engines.ENGINE_CLAUDE)
+        auto_label = p.get("label") or f"session-{int(time.time()) % 10000}"
+        proj_name = p.get("project", "")
+        if not await _cap_guard():
+            return
+        CONV_STATE[cid] = {"state": "awaiting_session_name", "engine": engine,
+                           "project": proj_name, "auto_label": auto_label}
+        await q.edit_message_text(
+            f"📁 Project: <b>{esc(proj_name)}</b>\n\nEnter a name for this session (or tap Skip):",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "⏭ Skip", callback_data=cb2("skipname", cid, engine=engine,
+                                            label=auto_label, project=proj_name))]]))
+
+    elif kind == "skipname":
+        engine = p.get("engine", engines.ENGINE_CLAUDE)
+        auto_label = p.get("label") or f"session-{int(time.time()) % 10000}"
+        proj_name = p.get("project", "")
+        CONV_STATE.pop(cid, None)
+        if not await _cap_guard():
+            return
+        cb2_consume(token)          # one-shot: block a double-tap second create
+        session = SM.create(cid, auto_label)
+        _apply_engine(session, engine)
+        session.project = proj_name
+        await q.edit_message_text(
+            f"{session.color_emoji} {_ENGINE_ICONS.get(engine,'•')} <b>{esc(session.label)}</b> created.\n"
+            f"📁 Project: <b>{esc(proj_name)}</b>\n\n"
+            f"Reply to this message to interact with this session.",
+            parse_mode=ParseMode.HTML)
+        _anchor(session)
+        save_state()
+
+    elif kind == "addproj":
+        engine = p.get("engine", engines.ENGINE_CLAUDE)
+        label = p.get("label") or f"session-{int(time.time()) % 10000}"
+        has_name = bool(p.get("has_name", True))
+        CONV_STATE[cid] = {"state": "awaiting_project_path", "engine": engine,
+                           "label": label, "has_name": has_name}
+        await q.edit_message_text(
+            "📂 Enter the full path on this server:\n"
+            "Example: <code>/opt/shahrzad-devops/repos/MyProject</code>\n"
+            "Or on production: <code>~/MyNewProject</code>",
+            parse_mode=ParseMode.HTML)
+
+    elif kind == "cmk":
+        label = p.get("label") or f"chat-{int(time.time()) % 10000}"
+        model = p.get("model", "")
+        CONV_STATE.pop(cid, None)
+        # Re-validate the model against the Chat adapter before committing.
+        if not engines.get_adapter(engines.ENGINE_CHAT).validate_model(model):
+            await q.edit_message_text(
+                f"⚠️ <code>{esc(model)}</code> isn't a valid chat model.",
+                parse_mode=ParseMode.HTML)
+            return
+        if not await _cap_guard():
+            return
+        cb2_consume(token)          # one-shot: block a double-tap second create
+        session = SM.create(cid, label)
+        _apply_engine(session, engines.ENGINE_CHAT, model)
+        await q.edit_message_text(
+            f"{session.color_emoji} 💬 Chat session <b>{esc(session.label)}</b> created.\n"
+            f"🧠 Model: <code>{esc(model)}</code>\n\n"
+            f"Reply to this message to chat. No tools, repos or deploy — just conversation.",
+            parse_mode=ParseMode.HTML)
+        _anchor(session)
+        save_state()
+        log.info(f"Chat session created: {session.label} chat {cid}")
+
+    elif kind == "cmsearch":
+        label = p.get("label") or f"chat-{int(time.time()) % 10000}"
+        has_name = bool(p.get("has_name", True))
+        CONV_STATE[cid] = {"state": "awaiting_chat_model_search", "label": label, "has_name": has_name}
+        await q.edit_message_text(
+            "🔎 Type part of a model id or name to search OpenRouter "
+            "(e.g. <code>qwen</code>, <code>glm</code>, <code>opus</code>):",
+            parse_mode=ParseMode.HTML)
+
+    elif kind == "emod":
+        # Set the model on the session THIS menu was rendered for (bound in the
+        # token), NOT whatever is active now (re-validated).
+        model_id = p.get("model", "")
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
+            return
+        adapter = engines.get_adapter(target.engine)
+        if adapter is None:
+            await q.edit_message_text("⚠️ This session's engine is unavailable.",
+                                      parse_mode=ParseMode.HTML)
+            return
+        if not adapter.validate_model(model_id):
+            await q.edit_message_text(
+                f"⚠️ <code>{esc(model_id)}</code> isn't valid for this "
+                f"{esc(adapter.caps.label)} session.", parse_mode=ParseMode.HTML)
+            return
+        # Model change affects ONLY this session's future turns; provider resume
+        # identity (session_uuid / provider_session_id) is preserved.
+        if target.engine == engines.ENGINE_CLAUDE:
+            target.claude_model = model_id
+        else:
+            target.model = model_id
+        save_state()
+        await q.edit_message_text(
+            f"✅ {adapter.caps.label} model for {target.color_emoji} "
+            f"<b>{esc(target.label)}</b> set to: <code>{esc(model_id or 'default')}</code>",
+            parse_mode=ParseMode.HTML)
+
+    elif kind == "emsearch":
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
+            return
+        if target.engine != engines.ENGINE_CHAT:
+            await q.edit_message_text("ℹ️ Model search is for Chat sessions.",
+                                      parse_mode=ParseMode.HTML)
+            return
+        # Conv-state stays bound to THIS rendered session id + instance nonce; a
+        # later active-session switch OR same-label replacement cannot retarget it.
+        CONV_STATE[cid] = {"state": "awaiting_chat_model_change",
+                           "session_key": target.id, "uuid": target.session_uuid,
+                           "engine": target.engine}
+        await q.edit_message_text(
+            "🔎 Type part of a model id/name to search OpenRouter "
+            "(<code>cancel</code> to abort):", parse_mode=ParseMode.HTML)
+
+    elif kind == "emcustom":
+        # Free-text custom model for the RENDERED Claude/Codex session — still
+        # validated by that engine's adapter (rejects cross-engine ids).
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
+            return
+        adapter = engines.get_adapter(target.engine)
+        example = ("sonnet · opus · claude-sonnet-5" if target.engine == engines.ENGINE_CLAUDE
+                   else "gpt-5.6-sol · gpt-5.5")
+        CONV_STATE[cid] = {"state": "awaiting_engine_model_input",
+                           "session_key": target.id, "uuid": target.session_uuid,
+                           "engine": target.engine}
+        await q.edit_message_text(
+            f"✏️ Type the {esc(adapter.caps.label)} model for "
+            f"<b>{esc(target.label)}</b>.\nExamples: <code>{example}</code>. "
+            f"Send <code>cancel</code> to abort.", parse_mode=ParseMode.HTML)
+
+    elif kind == "emodset":
+        model_id = p.get("model", "")
+        # Same binding as the other /model actions: key + instance nonce + engine
+        # + chat, so a same-label replacement cannot be retargeted by an old pick.
+        target = await _p2_rendered_session(q, cid, p)
+        if target is None:
+            return
+        adapter = engines.get_adapter(target.engine)
+        if adapter is None or not adapter.validate_model(model_id):
+            await q.edit_message_text(f"⚠️ Invalid model <code>{esc(model_id)}</code>.",
+                                      parse_mode=ParseMode.HTML)
+            return
+        target.model = model_id
+        save_state()
+        await q.edit_message_text(
+            f"✅ Chat model for {target.color_emoji} <b>{esc(target.label)}</b> "
+            f"set to: <code>{esc(model_id)}</code>", parse_mode=ParseMode.HTML)
+
+    else:
+        await q.edit_message_text("⚠️ Unknown action.", parse_mode=ParseMode.HTML)
+
+
 @authorized
 async def on_callback(u, c):
     q = u.callback_query; await q.answer()
-    d = _cb_resolve(q.data); cid = q.message.chat.id
+    cid = q.message.chat.id
+
+    # Phase 2: opaque structured tokens are dispatched separately — no string
+    # splitting of user data, and fail-closed on expiry.
+    if q.data.startswith("p2:"):
+        payload = cb2_resolve(q.data)
+        if payload is None:
+            await q.edit_message_text(
+                "⚠️ This button has expired (bot was restarted).\n"
+                "Please use the command again: /new or /model",
+                parse_mode=ParseMode.HTML)
+            return
+        # Central ownership gate: the token is bound to the chat it was issued in.
+        # A different (even authorized) chat that guesses/replays it is refused
+        # BEFORE any action-specific code runs. Fail closed on a missing/mismatched
+        # cid (malformed or pre-binding token).
+        if payload.get("cid") != cid:
+            log.warning(f"p2 cross-chat token rejected chat={cid} owner={payload.get('cid')}")
+            await q.edit_message_text(
+                "⚠️ This button isn't for this chat.", parse_mode=ParseMode.HTML)
+            return
+        await _handle_p2(q, c, cid, payload, token=q.data)
+        return
+
+    d = _cb_resolve(q.data)
 
     # Handle expired registry keys (after bot restart or eviction)
     if not d:
@@ -2228,7 +3905,7 @@ async def on_callback(u, c):
             return
         _, proj, br = d.split(":")
         if br == "claude_latest":
-            r = subprocess.run(["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
+            r = await asyncio.to_thread(subprocess.run, ["git","branch","-r","--sort=-committerdate"], cwd=f"{REPOS}/{proj}", capture_output=True, text=True)
             cbs = [b.strip().replace("origin/","") for b in r.stdout.splitlines() if "claude/" in b]
             br = cbs[0] if cbs else "main"
         await q.edit_message_text(f"⚠️ <b>Deploy {proj}@{br}</b> → production?\n\nSure?", parse_mode=ParseMode.HTML, reply_markup=deploy_confirm_kb(proj, br))
@@ -2238,54 +3915,67 @@ async def on_callback(u, c):
             await c.bot.send_message(cid, "🔒 Deploy is disabled for this bot instance.")
             return
         _, proj, br = d.split(":")
-        if proj == "ZigguratKids4":
-            # Route ZK4 through the prod-side guardrailed deploy.sh (main-only,
-            # flock, GIT_COMMIT stamp, incremental no-downtime rebuild, healthcheck).
-            if br != "main":
-                await c.bot.send_message(cid,
-                    "🔒 ZK4 deploys are main-only (guardrailed deploy.sh). Pick 🌿 main.")
+        # Local guard: don't even launch a second overlapping deploy handler.
+        # (Auth + the ⚠️ confirmation step above are unchanged; prod deploy.sh
+        # flock stays authoritative across processes.)
+        if _DEPLOY_LOCK.locked():
+            await c.bot.send_message(cid,
+                "⏳ A deploy is already running on this bot — wait for it to finish "
+                "before starting another.")
+            return
+        async with _DEPLOY_LOCK:
+            if proj == "ZigguratKids4":
+                # Route ZK4 through the prod-side guardrailed deploy.sh (main-only,
+                # flock, GIT_COMMIT stamp, incremental no-downtime rebuild, healthcheck).
+                if br != "main":
+                    await c.bot.send_message(cid,
+                        "🔒 ZK4 deploys are main-only (guardrailed deploy.sh). Pick 🌿 main.")
+                    return
+                await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
+                try:
+                    # Long timeout: a real build is 6-8 min (vs the old 120s that
+                    # SIGKILLed mid-build → outage). Wrapper merges remote stderr.
+                    # to_thread: don't freeze the event loop for the whole build.
+                    r = await asyncio.to_thread(
+                        subprocess.run, [f"{SCRIPTS}/deploy-zk4-prod.sh"],
+                        capture_output=True, text=True, timeout=900)
+                except subprocess.TimeoutExpired:
+                    await c.bot.send_message(cid,
+                        "⏱ <b>Deploy exceeded 15 min.</b>\n\nThe build may still be "
+                        "running on prod — do NOT re-trigger. Check <code>docker compose "
+                        "ps</code> / /api/health before retrying.",
+                        parse_mode=ParseMode.HTML)
+                    return
+                ok = r.returncode == 0
+                if ok:
+                    head = "✅ <b>Done</b>"
+                else:
+                    reason = {
+                        1: "wrong branch / bad arg",
+                        2: "⏳ another deploy holds the lock (concurrent deploy)",
+                        3: "git pull failed",
+                        4: "docker build/up failed",
+                        5: "healthcheck failed",
+                        6: "post-deploy checkout failed",
+                    }.get(r.returncode, f"exit {r.returncode}")
+                    head = f"❌ <b>Failed</b> — {esc(reason)}"
+                # Result lines (GIT_COMMIT=, health 200 OK, deploy complete, abort
+                # reasons) are at the END of the output → show the tail, not the head.
+                msg = head + f"\n\n<pre>{esc((r.stdout or '')[-3000:])}</pre>"
+                if r.stderr and r.stderr.strip():
+                    msg += f"\n<pre>{esc(r.stderr[-800:])}</pre>"
+                await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
                 return
             await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
-            try:
-                # Long timeout: a real build is 6-8 min (vs the old 120s that
-                # SIGKILLed mid-build → outage). Wrapper merges remote stderr.
-                r = subprocess.run([f"{SCRIPTS}/deploy-zk4-prod.sh"],
-                                   capture_output=True, text=True, timeout=900)
-            except subprocess.TimeoutExpired:
-                await c.bot.send_message(cid,
-                    "⏱ <b>Deploy exceeded 15 min.</b>\n\nThe build may still be "
-                    "running on prod — do NOT re-trigger. Check <code>docker compose "
-                    "ps</code> / /api/health before retrying.",
-                    parse_mode=ParseMode.HTML)
-                return
+            r = await asyncio.to_thread(
+                subprocess.run, [f"{SCRIPTS}/deploy-to-prod.sh", proj, br],
+                capture_output=True, text=True, timeout=120)
             ok = r.returncode == 0
-            if ok:
-                head = "✅ <b>Done</b>"
-            else:
-                reason = {
-                    1: "wrong branch / bad arg",
-                    2: "⏳ another deploy holds the lock (concurrent deploy)",
-                    3: "git pull failed",
-                    4: "docker build/up failed",
-                    5: "healthcheck failed",
-                    6: "post-deploy checkout failed",
-                }.get(r.returncode, f"exit {r.returncode}")
-                head = f"❌ <b>Failed</b> — {esc(reason)}"
-            # Result lines (GIT_COMMIT=, health 200 OK, deploy complete, abort
-            # reasons) are at the END of the output → show the tail, not the head.
-            msg = head + f"\n\n<pre>{esc((r.stdout or '')[-3000:])}</pre>"
-            if r.stderr and r.stderr.strip():
-                msg += f"\n<pre>{esc(r.stderr[-800:])}</pre>"
-            await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
-            return
-        await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
-        r = subprocess.run([f"{SCRIPTS}/deploy-to-prod.sh", proj, br], capture_output=True, text=True, timeout=120)
-        ok = r.returncode == 0
-        await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
+            await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
 
     elif d == "do:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
-        r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+        r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
         await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     elif d == "do:pause":
@@ -2306,7 +3996,7 @@ async def on_callback(u, c):
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
         files = session.files; session.files = []
         session.status = "running"
-        output = await run_claude(vt, session.project, session, files or None)
+        output = await dispatch_turn(vt, session.project, session, files or None)
         if output == RL_ASK_SENTINEL:
             session.status = "idle"; session.last_active = time.time()
             return
@@ -2326,85 +4016,8 @@ async def on_callback(u, c):
             session.voice_text = ""
         await q.edit_message_text("✏️ <b>Edit mode.</b> Type corrected message (reply to session):", parse_mode=ParseMode.HTML)
 
-    elif d.startswith("newproj:"):
-        # newproj:<label>:<project> — create session with chosen project
-        parts = d.split(":", 2)
-        label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        proj_name = parts[2] if len(parts) > 2 else parts[1]
-        if not SM.can_create(cid):
-            active = SM.active_for_chat(cid)
-            await q.edit_message_text(
-                f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
-                parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
-            return
-        session = SM.create(cid, label)
-        session.project = proj_name
-        await q.edit_message_text(
-            f"{session.color_emoji} Session <b>{esc(session.label)}</b> created.\n"
-            f"📁 Project: <b>{proj_name}</b>\n\n"
-            f"Reply to this message to interact with this session.",
-            parse_mode=ParseMode.HTML)
-        # Track the anchor message
-        session.anchor_message_id = q.message.message_id
-        SM.register_message(q.message.message_id, session.id)
-        session.message_ids.append(q.message.message_id)
-        log.info(f"Session created (picker): {session.label} → {proj_name} for chat {cid}")
-
-    elif d.startswith("newneed:"):
-        # newneed:<auto_label>:<project> — project selected but no name given, ask for name
-        parts = d.split(":", 2)
-        auto_label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        proj_name = parts[2] if len(parts) > 2 else parts[1]
-        if not SM.can_create(cid):
-            active = SM.active_for_chat(cid)
-            await q.edit_message_text(
-                f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
-                parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
-            return
-        # Store state: waiting for session name
-        CONV_STATE[cid] = {"state": "awaiting_session_name", "project": proj_name, "auto_label": auto_label}
-        await q.edit_message_text(
-            f"📁 Project: <b>{esc(proj_name)}</b>\n\nEnter a name for this session (or tap Skip):",
-            parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{auto_label}:{proj_name}"))]
-            ]))
-
-    elif d.startswith("skipname:"):
-        # skipname:<auto_label>:<project> — user skipped naming, use auto-generated label
-        parts = d.split(":", 2)
-        auto_label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        proj_name = parts[2] if len(parts) > 2 else parts[1]
-        CONV_STATE.pop(cid, None)
-        if not SM.can_create(cid):
-            active = SM.active_for_chat(cid)
-            await q.edit_message_text(
-                f"⚠️ Max {MAX_SESSIONS} sessions. Kill one first.",
-                parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
-            return
-        session = SM.create(cid, auto_label)
-        session.project = proj_name
-        await q.edit_message_text(
-            f"{session.color_emoji} Session <b>{esc(session.label)}</b> created.\n"
-            f"📁 Project: <b>{proj_name}</b>\n\n"
-            f"Reply to this message to interact with this session.",
-            parse_mode=ParseMode.HTML)
-        session.anchor_message_id = q.message.message_id
-        SM.register_message(q.message.message_id, session.id)
-        session.message_ids.append(q.message.message_id)
-        log.info(f"Session created (skip-name): {session.label} → {proj_name} for chat {cid}")
-
-    elif d.startswith("addproj:"):
-        # addproj:<label>:<has_name> — user wants to add a new project path
-        parts = d.split(":", 2)
-        label = parts[1] if len(parts) > 2 else f"session-{int(time.time()) % 10000}"
-        has_name_flag = parts[2] if len(parts) > 2 else "1"
-        CONV_STATE[cid] = {"state": "awaiting_project_path", "label": label, "has_name": has_name_flag == "1"}
-        await q.edit_message_text(
-            "📂 Enter the full path on this server:\n"
-            "Example: <code>/opt/shahrzad-devops/repos/MyProject</code>\n"
-            "Or on production: <code>~/MyNewProject</code>",
-            parse_mode=ParseMode.HTML)
+    # (Phase-2 engine/model callbacks are opaque `p2:` tokens dispatched by
+    #  _handle_p2 above — never string-split here.)
 
     elif d.startswith("skill:"):
         # skill:<session_key> — kill a session via inline button
@@ -2437,7 +4050,7 @@ async def on_callback(u, c):
             else:
                 # Fallback: run claude directly and send output
                 session.status = "running"
-                output = await run_claude(pending["text"], session.project, session, f or None)
+                output = await dispatch_turn(pending["text"], session.project, session, f or None)
                 if output == RL_ASK_SENTINEL:
                     session.status = "idle"; session.last_active = time.time()
                     return
@@ -2714,42 +4327,17 @@ async def on_callback(u, c):
         else:
             label = f"session-{int(time.time()) % 10000}"
             await c.bot.send_message(cid,
-                f"🆕 New session — which project?",
-                parse_mode=ParseMode.HTML, reply_markup=new_session_project_kb(label, has_name=False))
+                f"🆕 New session — pick an engine:",
+                parse_mode=ParseMode.HTML, reply_markup=new_session_engine_kb(cid, label, has_name=False))
 
     elif d == "menu:health":
         await c.bot.send_chat_action(cid, ChatAction.TYPING)
-        r = subprocess.run([f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
+        r = await asyncio.to_thread(subprocess.run, [f"{SCRIPTS}/health-check.sh"], capture_output=True, text=True, timeout=30)
         await c.bot.send_message(cid, f"📊 <b>Health</b>\n\n<pre>{esc(r.stdout[:3500])}</pre>", parse_mode=ParseMode.HTML)
 
     # ── Model selection ──
-    elif d.startswith("ccmod:"):
-        # Claude Code primary model — per-session.
-        choice = d.split(":", 1)[1]
-        active_key = ACTIVE_SESSION.get(cid)
-        target = SM.sessions.get(active_key) if active_key else None
-        if not target:
-            await q.edit_message_text(
-                "ℹ️ No active session. Start one with /new before changing the Claude Code model.",
-                parse_mode=ParseMode.HTML)
-            return
-        if choice == "custom":
-            CONV_STATE[cid] = {"state": "awaiting_claude_model_input", "session_key": target.id}
-            await q.edit_message_text(
-                f"✏️ Type the Claude model to use for session "
-                f"<b>{esc(target.label)}</b>.\n"
-                f"Examples: <code>sonnet</code>, <code>opus</code>, "
-                f"<code>claude-sonnet-4-6</code>.\n"
-                f"Send <code>cancel</code> to abort.",
-                parse_mode=ParseMode.HTML)
-            return
-        new_model = "" if choice == "default" else choice
-        target.claude_model = new_model
-        shown = new_model or "default (CLI default)"
-        await q.edit_message_text(
-            f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
-            f"set to: <code>{esc(shown)}</code>",
-            parse_mode=ParseMode.HTML)
+    # (Phase-2 primary-engine model selection — including Claude — is done via
+    #  opaque `p2:` emod/emcustom/emsearch/emodset tokens in _handle_p2 above.)
 
     elif d.startswith("mdl:"):
         parts = d.split(":", 2)
@@ -2932,6 +4520,7 @@ async def on_text(u, c):
             # User typed a session name
             CONV_STATE.pop(cid, None)
             proj_name = conv["project"]
+            engine = conv.get("engine", engines.ENGINE_CLAUDE)
             label = t.strip().replace(" ", "-")[:30]
             if not SM.can_create(cid):
                 active = SM.active_for_chat(cid)
@@ -2940,6 +4529,7 @@ async def on_text(u, c):
                     parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
                 return
             session = SM.create(cid, label)
+            _apply_engine(session, engine)
             session.project = proj_name
             sent = await u.message.reply_text(
                 f"{session.color_emoji} Session <b>{esc(session.label)}</b> created.\n"
@@ -2958,6 +4548,7 @@ async def on_text(u, c):
             path = t.strip()
             label = conv["label"]
             has_name = conv["has_name"]
+            engine = conv.get("engine", engines.ENGINE_CLAUDE)
             # Derive project name from path
             proj_name = os.path.basename(path.rstrip("/"))
             if not proj_name:
@@ -2979,6 +4570,7 @@ async def on_text(u, c):
                         parse_mode=ParseMode.HTML, reply_markup=kill_picker_kb(active))
                     return
                 session = SM.create(cid, label)
+                _apply_engine(session, engine)
                 session.project = proj_name
                 sent = await u.message.reply_text(
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n"
@@ -2989,29 +4581,97 @@ async def on_text(u, c):
                 SM.register_message(sent.message_id, session.id)
                 session.message_ids.append(sent.message_id)
             else:
-                # No name given — ask for name
-                CONV_STATE[cid] = {"state": "awaiting_session_name", "project": proj_name, "auto_label": label}
+                # No name given — ask for name (engine threaded through)
+                CONV_STATE[cid] = {"state": "awaiting_session_name", "engine": engine,
+                                   "project": proj_name, "auto_label": label}
                 await u.message.reply_text(
                     f"📁 Project <b>{esc(proj_name)}</b> added.\n\nEnter a name for this session (or tap Skip):",
                     parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("⏭ Skip", callback_data=_cb(f"skipname:{label}:{proj_name}"))]
-                    ]))
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "⏭ Skip", callback_data=cb2("skipname", cid, engine=engine,
+                                                    label=label, project=proj_name))]]))
             return
 
-        if state == "awaiting_claude_model_input":
+        if state == "awaiting_engine_model_input":
+            # Custom free-text model for a Claude/Codex session — VALIDATED by
+            # the active engine's adapter (rejects cross-engine ids).
             CONV_STATE.pop(cid, None)
-            target_key = conv.get("session_key")
-            target = SM.sessions.get(target_key) if target_key else None
             entry = t.strip()
-            if entry.lower() == "cancel" or not target:
+            if entry.lower() == "cancel":
                 await u.message.reply_text("❌ Cancelled.")
                 return
-            target.claude_model = entry
+            # Revalidate the SAME rendered instance (key + nonce + engine): a
+            # same-label replacement between rendering and submit is refused.
+            target, reason = _resolve_rendered_session(cid, conv)
+            if target is None:
+                await u.message.reply_text(reason, parse_mode=ParseMode.HTML)
+                return
+            adapter = engines.get_adapter(target.engine)
+            if adapter is None or not adapter.validate_model(entry):
+                lbl = adapter.caps.label if adapter else target.engine
+                await u.message.reply_text(
+                    f"⚠️ <code>{esc(entry)}</code> isn't a valid {esc(lbl)} model. "
+                    f"No change made.", parse_mode=ParseMode.HTML)
+                return
+            if target.engine == engines.ENGINE_CLAUDE:
+                target.claude_model = entry
+            else:
+                target.model = entry
+            save_state()
             await u.message.reply_text(
-                f"✅ Claude model for {target.color_emoji} <b>{esc(target.label)}</b> "
-                f"set to: <code>{esc(entry)}</code>",
+                f"✅ {adapter.caps.label} model for {target.color_emoji} "
+                f"<b>{esc(target.label)}</b> set to: <code>{esc(entry)}</code>",
                 parse_mode=ParseMode.HTML)
+            return
+
+        if state == "awaiting_chat_model_change":
+            # /model on a Chat session: search → pick to change THIS session's model
+            CONV_STATE.pop(cid, None)
+            entry = t.strip()
+            if entry.lower() == "cancel":
+                await u.message.reply_text("❌ Cancelled.")
+                return
+            # Revalidate the SAME rendered instance (key + nonce + engine).
+            target, reason = _resolve_rendered_session(cid, conv)
+            if target is None:
+                await u.message.reply_text(reason, parse_mode=ParseMode.HTML)
+                return
+            skey = target.id
+            try:
+                results = await CHAT_CATALOG.search(entry, limit=12)
+            except Exception:
+                results = []
+            if not results:
+                await u.message.reply_text(
+                    f"No models matched <code>{esc(entry)}</code>.", parse_mode=ParseMode.HTML)
+                return
+            rows = [[InlineKeyboardButton(f"⭐ {m.display()}",
+                     callback_data=cb2("emodset", cid, session_key=skey,
+                                       uuid=target.session_uuid, engine=target.engine,
+                                       model=m.id))] for m in results]
+            await u.message.reply_text(
+                f"🔎 Results for <code>{esc(entry)}</code> — pick one:",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+            return
+
+        if state == "awaiting_chat_model_search":
+            # Chat /new: free-text OpenRouter model search → pick from results
+            CONV_STATE.pop(cid, None)
+            query = t.strip()
+            label = conv.get("label", f"chat-{int(time.time()) % 10000}")
+            has_name = conv.get("has_name", True)
+            try:
+                results = await CHAT_CATALOG.search(query, limit=12)
+            except Exception:
+                results = []
+            if not results:
+                await u.message.reply_text(
+                    f"No models matched <code>{esc(query)}</code>. Try /new again.",
+                    parse_mode=ParseMode.HTML)
+                return
+            await u.message.reply_text(
+                f"🔎 Results for <code>{esc(query)}</code> — pick one:",
+                parse_mode=ParseMode.HTML, reply_markup=chat_model_kb(cid, label, has_name, results))
             return
 
         if state == "awaiting_model_search":
@@ -3195,7 +4855,43 @@ _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
     "tasks", "claude_created", "claude_model",
+    # Phase 2 multi-engine fields (absent in old state → safe defaults)
+    "engine", "model", "provider_session_id", "chat_history_ref",
 )
+
+# ── Telegram update_id dedup (Phase 0 A3 — risk R3) ──
+# Telegram's update_id increases strictly per bot token; the only way a
+# handler ever sees the same one twice is a transport-level retry (the
+# getUpdates response was lost/timed out client-side, so PTB re-requests the
+# same offset and Telegram resends the same update). This Application never
+# calls .concurrent_updates(...) in main(), so PTB's default
+# max_concurrent_updates=1 applies: process_update() dispatches exactly one
+# update at a time, in delivery order — no other update's dedup check can
+# interleave with this one (single-threaded event loop, no `await` inside
+# _is_duplicate_update). Given those two guarantees, a plain monotonic
+# high-water mark is both correct and O(1):
+#   - it is at least as good as a bounded LRU of seen ids at catching a
+#     retry, since Telegram never reuses or reorders ids for this bot, and
+#   - unlike a bounded LRU, it can NEVER be tricked by a slow retry that
+#     arrives after enough intervening traffic would have evicted the
+#     original id from a capped cache — the ceiling never forgets.
+# A "recent set" alongside the HWM was considered and dropped: it would not
+# add real protection here (any id <= HWM is a genuine duplicate today), and
+# if concurrent_updates is ever turned on later, a small LRU wouldn't fix the
+# resulting race either (a lower id could legitimately arrive after a higher
+# one already advanced the ceiling) — that would need a real windowed/bitmap
+# scheme, not a bigger cache. Flag for revisit if concurrent_updates changes.
+_UPDATE_ID_HWM = 0
+
+
+def _is_duplicate_update(update_id: int) -> bool:
+    """Synchronous check-and-set against the high-water mark. Returns True
+    (and does NOT advance the mark) if `update_id` was already accepted."""
+    global _UPDATE_ID_HWM
+    if update_id <= _UPDATE_ID_HWM:
+        return True
+    _UPDATE_ID_HWM = update_id
+    return False
 
 
 def save_state():
@@ -3214,6 +4910,7 @@ def save_state():
             "msg_to_session": {str(mid): sk for mid, sk in SM.msg_to_session.items()},
             "color_index": {str(cid): idx for cid, idx in SM.color_index.items()},
             "active_session": {str(cid): sk for cid, sk in ACTIVE_SESSION.items()},
+            "update_dedup_hwm": _UPDATE_ID_HWM,
         }
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -3237,10 +4934,10 @@ def load_state():
     try:
         restored = 0
         for k, s in state.get("sessions", {}).items():
-            # Skip sessions left in "running" — their subprocess is dead.
-            # Mark them "error" so users know to re-send.
+            # Sessions left "running" or "queued" have a dead subprocess/slot
+            # after a restart — mark them "error" so users know to re-send.
             status = s.get("status", "idle")
-            if status == "running":
+            if status in ("running", "queued"):
                 status = "error"
             session = Session(
                 id=s["id"],
@@ -3256,7 +4953,25 @@ def load_state():
                 tasks=s.get("tasks", 0),
                 claude_created=s.get("claude_created", False),
                 claude_model=s.get("claude_model", ""),
+                # Phase 2 migration: old sessions lack these → engine=claude,
+                # empty model/thread. Claude UUID/resume + legacy claude_model
+                # are preserved untouched above.
+                engine=s.get("engine", "claude") or "claude",
+                model=s.get("model", ""),
+                provider_session_id=s.get("provider_session_id", ""),
+                chat_history_ref=s.get("chat_history_ref", ""),
             )
+            # Migration safety: a restored Chat history path is trusted only if it
+            # still passes canonical/no-symlink containment; otherwise replace it
+            # with the safe derived path (log a NON-sensitive warning only).
+            if session.engine == engines.ENGINE_CHAT:
+                if not (session.chat_history_ref and
+                        validate_chat_dir(CHAT_SESSIONS_DIR, session.chat_history_ref)):
+                    safe = derive_chat_dir(CHAT_SESSIONS_DIR, session.id)
+                    if session.chat_history_ref != safe:
+                        log.warning(f"chat_history_ref for {k} was unsafe/missing; "
+                                    f"using derived-safe path")
+                    session.chat_history_ref = safe
             SM.sessions[k] = session
             restored += 1
         for mid_str, sk in state.get("msg_to_session", {}).items():
@@ -3274,8 +4989,17 @@ def load_state():
                 ACTIVE_SESSION[int(cid_str)] = sk
             except ValueError:
                 pass
+        # Restore the update_id dedup ceiling. max(...) with the in-memory
+        # value (0 at boot) is defensive only — belt-and-suspenders in case
+        # load_state is ever called more than once in a process lifetime.
+        global _UPDATE_ID_HWM
+        try:
+            _UPDATE_ID_HWM = max(_UPDATE_ID_HWM, int(state.get("update_dedup_hwm", 0) or 0))
+        except (TypeError, ValueError):
+            pass
         saved_ago = int(time.time() - state.get("saved_at", 0))
-        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old)")
+        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old); "
+                 f"update_dedup_hwm={_UPDATE_ID_HWM}")
     except Exception as e:
         log.error(f"load_state restore error: {e}")
 
@@ -3320,6 +5044,30 @@ async def session_cleanup_task(app):
         return
 
 
+async def _discover_engine_catalogs():
+    """Best-effort, non-blocking catalog warm-up. Failures are non-fatal —
+    adapters fall back to their verified static/last-known-good catalogs."""
+    # Codex: discover account-visible models via `codex debug models`.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "codex", "debug", "models",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            env={**os.environ, "HOME": "/root"})
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        models = parse_codex_models(out.decode("utf-8", "replace"))
+        if models:
+            engines.get_adapter("codex").set_discovered(models)
+            log.info(f"codex.catalog discovered={len(models)}")
+    except Exception as e:
+        log.info(f"codex.catalog discovery skipped: {e}")
+    # Chat: warm the OpenRouter catalog cache (TTL/last-known-good handles rest).
+    try:
+        cat = await CHAT_CATALOG.get()
+        log.info(f"chat.catalog models={len(cat)} stale={CHAT_CATALOG.stale}")
+    except Exception as e:
+        log.info(f"chat.catalog warm skipped: {e}")
+
+
 async def post_init(app):
     await app.bot.set_my_commands([
         BotCommand("start", "\U0001f3e0 Home"),
@@ -3340,8 +5088,28 @@ async def post_init(app):
         BotCommand("upload_music", "\U0001f3b5 آپلود موزیک"),
         BotCommand("renders",      "\U0001f4fa آخرین render‌ها"),
     ])
+    # Initialize execution-concurrency primitives inside the running loop and
+    # log the effective (defensively-parsed) limits so misconfiguration is
+    # visible in the journal.
+    CONC.init(MAX_RUNNING_AGENTS)
+    log.info(f"limits.effective max_sessions={MAX_SESSIONS} max_running_agents={MAX_RUNNING_AGENTS}")
+    # Explicit, machine-readable engine-registration line derived from the ACTUAL
+    # registry — the deploy health gate matches this exact line from the new
+    # process's restart window (see scripts/deploy-phase1-phase2.sh health_check).
+    _eng_names = ",".join(sorted(a.caps.engine for a in engines.all_engines()))
+    log.info(f"engines.registered names={_eng_names}")
     # Restore previous session state before starting handlers
     load_state()
+    # Phase 2: reconcile stale coordination entries against restored sessions
+    # (mark orphaned running/queued as 'stale', never delete active work), then
+    # warm engine catalogs in the background (non-fatal).
+    try:
+        n = await asyncio.to_thread(COORD.reconcile, set(SM.sessions.keys()))
+        if n:
+            log.info(f"coordination.reconciled stale={n}")
+    except Exception as e:
+        log.warning(f"coordination.reconcile failed: {e}")
+    asyncio.create_task(_discover_engine_catalogs())
     # Start background cleanup + autosave tasks (handles saved so
     # graceful_shutdown can cancel them — otherwise asyncio prints
     # "Task was destroyed but it is pending!" on every restart).
@@ -3356,7 +5124,153 @@ async def post_init(app):
         await _nw_ipc_start(app)
     else:
         log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
+    # Session query API: same "quiet no-op without a secret" gate as NightWatch
+    # IPC above, so a second bot instance (no BOT_SESSION_API_TOKEN set) never
+    # fights over the port.
+    await _sessapi_start(app)
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | Consult(GPT)={'\u2705' if OPENAI_API_KEY else '\u274c'} | Sonnet1M={SONNET_1M_MODEL}")
+
+# Bounded deadline for awaiting cancelled run tasks during shutdown. Kept well
+# under the systemd TimeoutStopSec so the unit never gets SIGKILLed mid-cleanup.
+SHUTDOWN_TASK_TIMEOUT = float(os.environ.get("BOT_SHUTDOWN_TASK_TIMEOUT", "10"))
+
+
+async def _cancel_and_await_run_tasks(timeout: float = SHUTDOWN_TASK_TIMEOUT) -> dict:
+    """Snapshot all tracked run tasks (excluding the caller), cancel them, and
+    await their completion under a HARD bounded deadline (asyncio.wait, not
+    wait_for(gather(...)) — the latter can block past the deadline awaiting a
+    non-cooperative task's cancellation).
+
+    Each task that finishes WITHIN the deadline (in the returned "awaited"
+    count) has its execution_slot roll back its own lock/permit/registry
+    bookkeeping via that task's own cancellation handler — so for those tasks
+    specifically, no stale slot state remains. Tasks reported under
+    "non_cooperative" did NOT finish within the deadline: this helper makes NO
+    claim their bookkeeping is clean, and shutdown proceeds regardless
+    (best-effort only for those stragglers — see graceful_shutdown).
+
+    Returns a summary dict. Testable in isolation — no app/bot needed.
+    """
+    try:
+        current = asyncio.current_task()
+    except RuntimeError:
+        current = None
+    tasks = []
+    for sid in list(CONC.session_tasks.keys()):
+        for t in list(CONC.session_tasks.get(sid, ())):
+            if t is current or t.done():
+                continue
+            tasks.append(t)
+    for t in tasks:
+        t.cancel()
+    awaited = 0
+    timed_out = False
+    non_cooperative = 0
+    if tasks:
+        # HARD deadline: asyncio.wait returns (done, pending) AT the timeout and
+        # never awaits pending tasks. asyncio.wait_for(gather(...)) could block
+        # past the deadline because it awaits the gather's own cancellation,
+        # which a task suppressing CancelledError never completes.
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        awaited = len(done)
+        non_cooperative = len(pending)
+        # Consume each finished task's result/exception so a task that raised
+        # something OTHER than CancelledError can never produce a "Task
+        # exception was never retrieved" warning at garbage-collection time.
+        # (Task.exception() itself raises CancelledError for a task that WAS
+        # cancelled — that's not an unretrieved exception, so skip those.)
+        for t in done:
+            if t.cancelled():
+                continue
+            exc = t.exception()
+            if exc is not None:
+                log.warning(f"shutdown.run_task_exception err={type(exc).__name__}: {exc}")
+        if pending:
+            timed_out = True
+            # Best-effort only: these tasks are still live, so we do NOT claim
+            # their execution_slot bookkeeping is clean.
+            log.warning(f"shutdown.run_tasks_timeout cancelled={len(tasks)} "
+                        f"finished={awaited} non_cooperative={non_cooperative} "
+                        f"timeout_s={timeout}")
+    summary = {"cancelled": len(tasks), "awaited": awaited,
+               "timed_out": timed_out, "non_cooperative": non_cooperative}
+    if tasks:
+        log.info(f"shutdown.run_tasks {summary}")
+    return summary
+
+
+# Small, FIXED bound for draining cancelled waiter tasks after the main reap
+# deadline — not a fresh per-process timeout, just enough for asyncio to
+# process the cancellation so no pending Task lingers past this function.
+_REAP_WAITER_DRAIN_TIMEOUT = 1.0
+
+
+async def _reap_active_procs(timeout: float = 5.0) -> dict:
+    """Terminate any still-tracked Claude process trees and await their reaping
+    (best-effort, bounded). Most are already gone via each run task's own
+    cancellation handler; this covers stragglers.
+
+    ONE total deadline across ALL processes (they are reaped concurrently) —
+    not a fresh full timeout per process, which could stack to N*timeout and
+    blow past systemd TimeoutStopSec when several trees are non-cooperative.
+
+    Returns {"completed": n, "pending": n}. A process counted under "pending"
+    is NOT claimed as successfully reaped — the OS-level SIGKILL has already
+    been sent (via _kill_tree/terminate above), but this function only
+    observed that its exit wasn't reported within the deadline; ACTIVE_PROCS
+    bookkeeping is still cleared (best-effort — the tracking dict is not
+    itself a resource), with an explicit warning naming any pending handles.
+    """
+    procs = list(ACTIVE_PROCS.items())
+    for pid, proc in procs:
+        try:
+            _kill_tree(pid)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+    completed = 0
+    pending_count = 0
+    if procs:
+        waiters = {asyncio.ensure_future(proc.wait()): pid for pid, proc in procs}
+        done, pending = await asyncio.wait(waiters.keys(), timeout=timeout)
+        completed = len(done)
+        pending_count = len(pending)
+        # Consume results/exceptions of finished waiters so none can produce a
+        # "Task exception was never retrieved" warning.
+        for w in done:
+            if not w.cancelled():
+                w.exception()
+        if pending:
+            pending_pids = [waiters[w] for w in pending]
+            log.warning(f"shutdown.reap_procs_pending count={pending_count} "
+                        f"pids={pending_pids} timeout_s={timeout} "
+                        f"(NOT claimed as reaped)")
+            for w in pending:
+                w.cancel()
+            # Bounded, FIXED, non-blocking-forever drain so the cancelled
+            # waiter tasks actually finish before we return — avoids
+            # "Task was destroyed but it is pending!" at loop/test teardown.
+            # This is one small additional bound, not a fresh per-process
+            # timeout, and never turns into an unbounded await.
+            drained, still_pending = await asyncio.wait(pending, timeout=_REAP_WAITER_DRAIN_TIMEOUT)
+            for w in drained:
+                if not w.cancelled():
+                    w.exception()
+            if still_pending:
+                log.warning(f"shutdown.reap_procs_waiter_drain_incomplete "
+                            f"count={len(still_pending)} (best-effort only)")
+    summary = {"completed": completed, "pending": pending_count}
+    if procs:
+        log.info(f"shutdown.reap_procs {summary}")
+    # Best-effort only: OS-level kill already issued for every tracked pid; a
+    # pending wait handle means our wait() didn't observe the exit within the
+    # deadline(+drain), NOT that the process is confirmed still alive. We do
+    # NOT claim a still-pending process was successfully reaped (see above).
+    ACTIVE_PROCS.clear()
+    return summary
+
 
 async def graceful_shutdown(app):
     """Kill all running Claude processes and notify active chats before exit."""
@@ -3373,19 +5287,20 @@ async def graceful_shutdown(app):
                 log.info(f"bg_task.cancelled name={task_name} err={type(e).__name__}")
     if BOT_NIGHTWATCH_IPC_ENABLED:
         await _nw_ipc_stop()
-    # Collect active sessions info before killing
-    active = [(k, s) for k, s in SM.sessions.items() if s.status == "running"]
-    # Kill all tracked claude subprocesses
-    for pid, proc in list(ACTIVE_PROCS.items()):
-        try:
-            proc.terminate()
-            log.info(f"Terminated claude process PID {pid}")
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-    ACTIVE_PROCS.clear()
+    await _sessapi_stop()
+    # Collect active sessions info before killing (running OR queued/waiting).
+    active = [(k, s) for k, s in SM.sessions.items() if s.status in ("running", "queued")]
+    # Cancel queued/in-flight execution tasks AND await their real cleanup under
+    # a bounded timeout, so no stale lock/permit/registry state survives.
+    await _cancel_and_await_run_tasks()
+    # Terminate any straggler Claude process trees and await reaping (bounded).
+    await _reap_active_procs()
+    # Phase 2: nothing is running post-cancel — mark any lingering running/queued
+    # coordination entries stale (never deletes; startup reconcile mirrors this).
+    try:
+        await asyncio.to_thread(COORD.reconcile, set())
+    except Exception:
+        pass
     # Notify each chat with active sessions
     notified_chats = set()
     for key, session in active:
@@ -3408,7 +5323,8 @@ async def graceful_shutdown(app):
             await app.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
         except Exception as e:
             log.error(f"Failed to notify chat {chat_id}: {e}")
-    # Mark all running sessions as error so they don't block on restart
+    # Mark all interrupted sessions (running + queued) as error so they don't
+    # block on restart.
     for key, session in active:
         session.status = "error"
     # Persist final state so sessions can be restored after restart
@@ -3420,6 +5336,59 @@ async def graceful_shutdown(app):
 NW_HMAC = os.environ.get("BOT_NIGHTWATCH_HMAC_SECRET", "").strip()
 NW_PORT = int(os.environ.get("BOT_NIGHTWATCH_IPC_PORT", "9091"))
 NW_BIND = os.environ.get("BOT_NIGHTWATCH_IPC_BIND", "127.0.0.1")
+# Optional SECOND listener bind. Empty by default in the repo — production sets
+# BOT_NIGHTWATCH_IPC_BIND2 to the DO VPC private IP (e.g. 10.108.0.4) so prod can
+# POST /inject over the VPC while 127.0.0.1 stays bound for local scripts. Only a
+# loopback/private IP that differs from the primary is ever bound (never a
+# wildcard/public/multicast/invalid address) — see _nw_second_bind_ok.
+NW_BIND2 = os.environ.get("BOT_NIGHTWATCH_IPC_BIND2", "").strip()
+
+
+def _nw_second_bind_ok(bind: str, primary: str) -> "tuple[bool, str]":
+    """Validate an optional second NightWatch listener address.
+
+    Returns (ok, reason). Accepts ONLY a parseable loopback or private IP that
+    differs from the primary. Rejects empty, same-as-primary, wildcard
+    (0.0.0.0 / ::), unspecified, multicast, public, and unparseable addresses —
+    binding 9091 on a public/wildcard interface would expose the HMAC-gated
+    inject endpoint to the internet."""
+    b = (bind or "").strip()
+    if not b:
+        return (False, "empty")
+    if b == (primary or "").strip():
+        return (False, "same_as_primary")
+    if b in ("0.0.0.0", "::"):
+        return (False, "wildcard")
+    try:
+        ip = ipaddress.ip_address(b)
+    except ValueError:
+        return (False, "invalid")
+    if ip.is_unspecified:
+        return (False, "unspecified")
+    if ip.is_multicast:
+        return (False, "multicast")
+    if ip.is_loopback or ip.is_private:
+        return (True, "ok")
+    return (False, "public")
+
+
+async def _nw_start_sites(site_starter, binds: list) -> list:
+    """Start one TCPSite per address via `site_starter(bind)` (an awaitable).
+
+    The FIRST (primary) bind is mandatory — its failure re-raises. A secondary
+    bind that fails to start is logged and skipped WITHOUT tearing down the
+    primary. Returns the list of addresses that bound successfully. Extracted so
+    the fan-out is unit-testable without a real aiohttp runner."""
+    ok_binds = []
+    for i, b in enumerate(binds):
+        try:
+            await site_starter(b)
+            ok_binds.append(b)
+        except Exception as ex:
+            if i == 0:
+                raise
+            log.warning(f"nightwatch_ipc.second_bind_failed bind={b}:{NW_PORT}: {ex}")
+    return ok_binds
 NW_PREFIXES = [p.strip() for p in os.environ.get("BOT_NIGHTWATCH_ALLOWED_FILE_PREFIXES", "/opt/sentry-nightwatch/snapshots/").split(",") if p.strip()]
 NW_MAX_BYTES = 25 * 1024 * 1024
 NW_RUN_PYTHON = os.environ.get("NIGHTWATCH_VENV_PYTHON", "/opt/sentry-nightwatch/venv/bin/python")
@@ -3499,9 +5468,21 @@ async def _nw_ipc_start(app):
     a.router.add_get("/healthz", _nw_healthz)
     a.router.add_post("/inject", _nw_inject)
     runner = _aw.AppRunner(a); await runner.setup()
-    await _aw.TCPSite(runner, NW_BIND, NW_PORT).start()
+    # Primary listener (mandatory) + optional validated second listener.
+    binds = [NW_BIND]
+    if NW_BIND2:
+        ok, reason = _nw_second_bind_ok(NW_BIND2, NW_BIND)
+        if ok:
+            binds.append(NW_BIND2)
+        else:
+            log.warning(f"nightwatch_ipc.second_bind_rejected bind={NW_BIND2} reason={reason}")
+
+    async def _start(bind):
+        await _aw.TCPSite(runner, bind, NW_PORT).start()
+
+    bound = await _nw_start_sites(_start, binds)
     _NW_RUNNER = runner
-    log.info(f"nightwatch_ipc.listening bind={NW_BIND}:{NW_PORT}")
+    log.info(f"nightwatch_ipc.listening binds={bound}:{NW_PORT}")
 
 async def _nw_ipc_stop():
     global _NW_DOWN
@@ -3509,6 +5490,108 @@ async def _nw_ipc_stop():
     if _NW_RUNNER is None: return
     try: await asyncio.wait_for(_NW_RUNNER.cleanup(), timeout=5.0)
     except asyncio.TimeoutError: log.warning("nightwatch_ipc.cleanup_timeout")
+
+
+# ── Session query API (Phase 0 A3 Task 2 — read-only console prerequisite) ──
+# A SECOND aiohttp Application/AppRunner in this same process/event loop —
+# same library, same lifecycle wiring (started in post_init, stopped in
+# graceful_shutdown, right alongside the NightWatch IPC listener) — but
+# deliberately its own `web.Application()`, not a new route on `a` above.
+# aiohttp shares one router across every TCPSite bound to an AppRunner: adding
+# a 172.17.0.1 bind to the NightWatch app would also put /inject (a WRITE
+# endpoint, HMAC-gated, VPC+loopback only today) on the docker bridge — an
+# exposure change to an existing endpoint nobody asked for. A separate
+# Application keeps that change scoped to this brand-new, GET-only endpoint,
+# which is the "does not entangle the two auth schemes" judgment call the
+# task asked for. What IS reused from the NightWatch pattern: AppRunner/
+# TCPSite setup, hmac.compare_digest for the auth check, and the post_init/
+# graceful_shutdown lifecycle hooks.
+#
+# Auth: a plain shared-secret bearer token compared with hmac.compare_digest,
+# not an HMAC-over-body signature like _nw_inject's. _nw_inject signs a POST
+# body because it needs to authenticate THAT payload; a GET has no body worth
+# signing, so borrowing hmac.compare_digest for a timing-safe token compare is
+# the correct-sized version of the same pattern, not a shortcut around it.
+BOT_SESSION_API_TOKEN = os.environ.get("BOT_SESSION_API_TOKEN", "").strip()
+BOT_SESSION_API_PORT = _positive_int_env("BOT_SESSION_API_PORT", 9092)
+# 172.17.0.1 = docker0 bridge — reachable from the Caddy container via
+# host.docker.internal, unreachable from the public internet without an
+# explicit ufw allow (see docs/phase0/a3-*.md for the proposed rule). Same
+# posture as gfrc (:8088) and hermes-dashboard (:8642).
+BOT_SESSION_API_BIND = os.environ.get("BOT_SESSION_API_BIND", "172.17.0.1").strip()
+_SESSAPI_RUNNER = None
+
+
+def _sessapi_authorized(req) -> bool:
+    token = req.headers.get("X-Session-API-Token", "")
+    return bool(token) and bool(BOT_SESSION_API_TOKEN) and hmac.compare_digest(
+        token.encode(), BOT_SESSION_API_TOKEN.encode())
+
+
+async def _sessapi_sessions(req):
+    """Read-only snapshot of live SessionManager state.
+
+    Exposes exactly: id/label/engine/model/project, created (started_at) and
+    last-active timestamps, running state (status), active_session per chat,
+    and summary counts. Deliberately excludes session_uuid/provider_session_id
+    (thread ids), message_ids, anchor_message_id, chat_history_ref, and
+    anything from worktree paths, prompts, or transcripts — none of that is
+    on this response.
+    """
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    sessions = [
+        {
+            "id": s.id,
+            "label": s.label,
+            "engine": s.engine,
+            "model": (s.claude_model if s.engine == engines.ENGINE_CLAUDE else s.model) or "",
+            "project": s.project,
+            "status": s.status,
+            "started_at": s.started_at,
+            "last_active": s.last_active,
+        }
+        for s in SM.sessions.values()
+    ]
+    counts: dict = defaultdict(int)
+    counts["total"] = len(sessions)
+    for s in SM.sessions.values():
+        counts[s.status] += 1
+    return _aw.json_response({
+        "ok": True,
+        "sessions": sessions,
+        "active_session": {str(cid): key for cid, key in ACTIVE_SESSION.items()},
+        "counts": dict(counts),
+    })
+
+
+async def _sessapi_start(app):
+    global _SESSAPI_RUNNER
+    if not BOT_SESSION_API_TOKEN:
+        log.warning("session_api.disabled reason=missing_secret")
+        return
+    a = _aw.Application()
+    a.router.add_get("/sessions", _sessapi_sessions)
+    runner = _aw.AppRunner(a)
+    await runner.setup()
+    try:
+        await _aw.TCPSite(runner, BOT_SESSION_API_BIND, BOT_SESSION_API_PORT).start()
+    except Exception as ex:
+        log.error(f"session_api.bind_failed bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}: {ex}")
+        await runner.cleanup()
+        return
+    _SESSAPI_RUNNER = runner
+    log.info(f"session_api.listening bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}")
+
+
+async def _sessapi_stop():
+    if _SESSAPI_RUNNER is None:
+        return
+    try:
+        await asyncio.wait_for(_SESSAPI_RUNNER.cleanup(), timeout=5.0)
+    except asyncio.TimeoutError:
+        log.warning("session_api.cleanup_timeout")
+
 
 @authorized
 async def cmd_nightwatch_ping(update, context):
@@ -3567,10 +5650,30 @@ async def cmd_nightwatch_last(update, context):
         parse_mode=ParseMode.HTML)
 
 
+async def _dedup_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """group=-1 chokepoint — every Update (each CommandHandler, MessageHandler,
+    and the CallbackQueryHandler included) passes through here first, since
+    PTB evaluates handler groups in ascending order and ApplicationHandlerStop
+    halts ALL later groups for this update. This is deliberately the ONE
+    place update_id dedup happens — patching each handler individually would
+    leave any handler someone adds later (or one of the 18 that already exist)
+    unprotected.
+
+    Dedup is on the transport-level `update_id` ONLY. A user double-tapping
+    the same inline button produces two Updates with two DIFFERENT update_ids
+    and both are legitimate, distinct user actions — that is NOT deduped
+    here, same as before this change. Only an exact retry of one already-seen
+    update_id (e.g. Telegram resending because our getUpdates ack was lost)
+    is suppressed.
+    """
+    if _is_duplicate_update(update.update_id):
+        log.warning(f"update_dedup.duplicate update_id={update.update_id}")
+        raise ApplicationHandlerStop
+
+
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
     log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
-    from telegram.ext import Defaults
     from telegram.request import HTTPXRequest
     # Increase timeouts to prevent ReadError during long Claude operations
     request = HTTPXRequest(
@@ -3579,12 +5682,27 @@ def main():
         connect_timeout=30,
         pool_timeout=30,
     )
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).post_shutdown(graceful_shutdown).request(request).build()
+    # Phase 2: FooterBot (an ExtBot subclass) appends the RAM/Swap/Disk footer to
+    # every user-visible text via its send_message / edit_message_text overrides.
+    # ExtBot is frozen/slotted, so we cannot patch the instance after build();
+    # instead build the bot ourselves and hand it to ApplicationBuilder.bot().
+    # get_updates_request mirrors the builder's own default (pool size 1); the
+    # custom `request` carries the long-operation timeouts as before.
+    footer_bot = FooterBot(
+        BOT_TOKEN,
+        request=request,
+        get_updates_request=HTTPXRequest(connection_pool_size=1),
+    )
+    app = Application.builder().bot(footer_bot).post_init(post_init).post_shutdown(graceful_shutdown).build()
     # Expose bot reference module-wide so non-handler code paths (e.g. the
     # worktree-creation failure notice from run_claude) can send Telegram messages.
     global BOT, APPLICATION
     BOT = app.bot
     APPLICATION = app
+    # The footer is applied by FooterBot (built above); no instance patching.
+    # Dedup gate runs in group -1 — before every other handler below, for
+    # every update kind (see _dedup_gate docstring for why one chokepoint).
+    app.add_handler(TypeHandler(Update, _dedup_gate), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))

@@ -1,0 +1,38 @@
+# Canonical report-retention cleanup (repository-owned).
+# Replaces the three conflicting cron jobs — see docs/REPORT_RETENTION_MIGRATION.md.
+#
+# Install: the deploy runbook copies the script to the STABLE live path
+#   /opt/shahrzad-devops/scripts/cleanup-reports.sh
+# (NOT the repo checkout, which may be stale), then:
+#   cp systemd/reports-cleanup.{service,timer} /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now reports-cleanup.timer
+[Unit]
+Description=Shahrzad bot report retention cleanup (canonical, 15-day TTL)
+Documentation=file:///opt/shahrzad-devops/repos/ClaudeCodeTelegramBot/docs/REPORT_RETENTION_MIGRATION.md
+After=network.target
+
+[Service]
+Type=oneshot
+# Dedicated, NON-secret config only (retention days etc.). Never the full bot
+# .env — this job needs no Telegram/GitHub/OpenAI/Anthropic secrets. Optional
+# (leading '-'): absent file is fine. The path token is read by the script from
+# the token file, not from here.
+EnvironmentFile=-/opt/shahrzad-devops/configs/reports-cleanup.env
+# Pin the deletion scope so it can never be redefined by stray configuration.
+Environment=REPORTS_ROOT_GUARD=/opt/shahrzad-devops/reports
+# Run the STABLE live script, not the (possibly stale) repo checkout.
+ExecStart=/opt/shahrzad-devops/scripts/cleanup-reports.sh
+
+# Defensive hardening that still allows writing under the reports tree.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Reports live here — must remain writable for the cleanup to remove expired dirs.
+ReadWritePaths=/opt/shahrzad-devops/reports
+
+[Install]
+WantedBy=multi-user.target

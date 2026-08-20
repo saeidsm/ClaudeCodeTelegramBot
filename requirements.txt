@@ -1,8 +1,13 @@
-python-telegram-bot>=21.0
+# FooterBot subclasses ExtBot and relies on the frozen-slots behaviour validated
+# on the 21.x–22.x line (see tests/test_footer_extbot.py). Bound the upper edge.
+python-telegram-bot>=21,<23
 google-genai>=1.0.0
 openai>=1.0.0
 httpx>=0.27.0
 aiohttp>=3.9.0
+# Non-executing .env parsing for the deploy readiness/edit gates (dotenv_values);
+# pinned here so it is not a host-drift assumption of the deploy tooling.
+python-dotenv>=1.0.0
 
 # dev
 pytest-asyncio>=0.23.0

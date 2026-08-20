@@ -34,12 +34,19 @@ Each session shows a 🗑 button to kill it.
 
 ### `/kill <name>`
 
-End a session by name.
+End a session by name. Also cancels that session's **queued or in-flight**
+execution — a queued turn for a killed session never starts later. Other
+sessions are unaffected.
 
 ```
 /kill my-task         # Kill specific session
 /kill                 # If one session: kills it. If multiple: shows picker.
 ```
+
+> **Logical sessions vs running agents.** You can hold up to `BOT_MAX_SESSIONS`
+> (9) sessions, but only `BOT_MAX_RUNNING_AGENTS` (2) execute at once. Extra turns
+> show **`queued` — waiting for a free slot (N/max)** until a slot frees. Two
+> turns in the *same* session always run one at a time (FIFO).
 
 ### `/project <name>`
 
