@@ -5068,7 +5068,34 @@ async def _discover_engine_catalogs():
         log.info(f"chat.catalog warm skipped: {e}")
 
 
+def _assert_permission_mode():
+    """Phase 0 / D3: refuse to let `skip` mode be silently true.
+
+    `--dangerously-skip-permissions` bypasses the permission engine entirely,
+    settings.json `permissions.deny` included. So in skip mode the deny list we
+    rely on protects NOTHING — and it does so invisibly, which is worse than
+    having no deny list at all, because we would believe we were covered.
+
+    WARN, not refuse: skip is a supported, deliberately-configurable mode, and
+    refusing to boot converts a config mistake into a total outage for every
+    real user of this bot. A loud, greppable line at every startup gives
+    detection without that cost. Escalate to a hard refusal only if this is ever
+    observed being set unintentionally.
+    """
+    if BOT_TOOL_PERMISSION_MODE == "skip":
+        log.warning("=" * 72)
+        log.warning("perm_mode.INSECURE BOT_TOOL_PERMISSION_MODE=skip - spawns use "
+                    "--dangerously-skip-permissions")
+        log.warning("perm_mode.INSECURE settings.json permissions.deny DOES NOT APPLY "
+                    "to these sessions")
+        log.warning("=" * 72)
+    else:
+        log.info(f"perm_mode.ok mode={BOT_TOOL_PERMISSION_MODE} "
+                 f"(settings.json deny list applies)")
+
+
 async def post_init(app):
+    _assert_permission_mode()
     await app.bot.set_my_commands([
         BotCommand("start", "\U0001f3e0 Home"),
         BotCommand("help", "\U0001f4d6 Help"),
