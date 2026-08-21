@@ -154,6 +154,12 @@ RL_URGENT_SECS = 300  # the "urgent" override: resend in 5 min
 #   strict    → no flag; default Claude Code --print behavior denies non-approved tools
 BOT_TOOL_PERMISSION_MODE = os.environ.get("BOT_TOOL_PERMISSION_MODE", "strict").lower()
 BOT_ALLOWED_TOOLS = os.environ.get("BOT_ALLOWED_TOOLS", "")
+# Path to a JSON file listing exactly the MCP servers a bot session may start.
+# When set, the spawn adds --mcp-config <path> --strict-mcp-config, which ignores
+# user scope entirely. Empty (the default) leaves behaviour unchanged, so this is
+# opt-in and reverts by clearing one variable. Disabling a server changes the
+# agent's capability surface, which is a founder decision, not a code decision.
+BOT_MCP_CONFIG = os.environ.get("BOT_MCP_CONFIG", "").strip()
 # Second key for `skip` mode. See _assert_permission_mode(): skip disarms the
 # settings.json deny list, so it costs two deliberate acts, not one.
 BOT_ALLOW_SKIP_MODE = os.environ.get("BOT_ALLOW_SKIP_MODE", "").strip() == "1"
@@ -1873,6 +1879,15 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                     elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
                         cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
                     # else strict: no flag (default Claude Code behavior in --print)
+                    # MCP set, scoped to the SPAWN rather than to a directory.
+                    # Per-project config cannot govern a bot session: the cwd is
+                    # /tmp/claude-sessions/<label> and becomes an ephemeral
+                    # worktree during a turn, so there is no stable path to key an
+                    # entry to. --strict-mcp-config ignores every other source, so
+                    # the file below is the whole answer and is reviewable in one
+                    # place. Unset -> unchanged behaviour (user scope, all servers).
+                    if BOT_MCP_CONFIG:
+                        cmd += ["--mcp-config", BOT_MCP_CONFIG, "--strict-mcp-config"]
                     cmd += [flag, uuid_str, full_prompt]
                     return cmd
 
