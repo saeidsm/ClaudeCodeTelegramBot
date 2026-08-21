@@ -85,8 +85,10 @@ async def test_sessions_endpoint_shape_and_no_leakage(monkeypatch):
         #   status_reason - distinguishes a restart marker from a real failure
         #   has_error     - whether error_text is worth fetching
         # Neither carries a path, a uuid, prompt text or a transcript.
+        # 2E adds has_output: a boolean saying a reply is sitting unread, which
+        # is what distinguishes "waiting on you" from "idle". Boolean only.
         assert set(s) == {"id", "label", "engine", "model", "project",
-                           "status", "status_reason", "has_error",
+                           "status", "status_reason", "has_error", "has_output",
                            "started_at", "last_active"}
 
     assert body["active_session"] == {"1": "1:a"}

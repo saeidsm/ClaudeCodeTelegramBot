@@ -5669,6 +5669,21 @@ def _resolved_models() -> dict:
     return _MODEL_CACHE
 
 
+_MODEL_REFRESH_TASK = None
+
+
+def _schedule_model_refresh():
+    """Kick a background refresh at most once at a time. Never awaited by a
+    request - a cold cache returns {} and fills in within a minute or two."""
+    global _MODEL_REFRESH_TASK
+    if _MODEL_REFRESH_TASK is not None and not _MODEL_REFRESH_TASK.done():
+        return
+    try:
+        _MODEL_REFRESH_TASK = asyncio.create_task(asyncio.to_thread(_resolved_models))
+    except RuntimeError:
+        pass          # no running loop (import-time / tests) - nothing to do
+
+
 def _sessapi_authorized(req) -> bool:
     token = req.headers.get("X-Session-API-Token", "")
     return bool(token) and bool(BOT_SESSION_API_TOKEN) and hmac.compare_digest(
@@ -5700,6 +5715,10 @@ async def _sessapi_sessions(req):
             # worth fetching. Neither carries a path, a uuid or a transcript.
             "status_reason": getattr(s, "status_reason", ""),
             "has_error": bool(getattr(s, "error_text", "")),
+            # REVIEWED (2E): a BOOLEAN only - "this session has a reply sitting
+            # unread", which is what makes a card 'waiting on you' rather than
+            # merely idle. Carries no content, no length, no path.
+            "has_output": bool(getattr(s, "out", "")),
             "started_at": s.started_at,
             "last_active": s.last_active,
         }
@@ -5798,6 +5817,13 @@ CONSOLE_MIN_INTERVAL_S = _positive_int_env("CONSOLE_MIN_INTERVAL_S", 3)
 # stays small; `?full=1` bypasses both for an explicit, user-initiated copy.
 OUTPUT_DISPLAY_CAP = _positive_int_env("CONSOLE_OUTPUT_CAP", 20000)
 OUTPUT_ERR_CAP = _positive_int_env("CONSOLE_ERROR_CAP", 4000)
+# Linux caps a SINGLE argv element at 32 pages. The prompt travels as one argv
+# element, so this - not Telegram's 4096 - is what actually bounds a message.
+_MAX_ARG_STRLEN = 32 * os.sysconf("SC_PAGE_SIZE")
+# Headroom for the file note appended to the prompt, the flags, the session uuid
+# and the binary path, all of which share the same exec.
+CONSOLE_MAX_MESSAGE_BYTES = _positive_int_env(
+    "CONSOLE_MAX_MESSAGE_BYTES", _MAX_ARG_STRLEN - 8192)
 _CONSOLE_LAST_SEND = 0.0
 _CONSOLE_NONCE_HWM = 0
 _CONSOLE_NONCES: "deque" = deque(maxlen=512)
@@ -5892,8 +5918,26 @@ async def _sessapi_send(req):
     if not label or not text:
         return _aw.json_response({"ok": False, "error": "label_and_message_required"},
                                  status=400)
-    if len(text) > 8000:
-        return _aw.json_response({"ok": False, "error": "message_too_long"}, status=413)
+    # The real constraint is the KERNEL, not Telegram. run_claude passes the
+    # prompt as a single argv element (`cmd += [flag, uuid_str, full_prompt]`),
+    # and Linux caps one argv string at MAX_ARG_STRLEN = 32 * PAGE_SIZE. Measured
+    # on this box: 131071 bytes execs, 131072 gives E2BIG. Telegram's 4096 limit
+    # applies to the REPLY path only, and that path chunks rather than truncates.
+    # Measure BYTES: len() counts characters, and Farsi is ~2 bytes/char, so a
+    # character cap silently halves the real allowance for the language actually
+    # being typed here.
+    text_bytes = len(text.encode("utf-8"))
+    if text_bytes > CONSOLE_MAX_MESSAGE_BYTES:
+        return _aw.json_response({
+            "ok": False,
+            "error": "message_too_long",
+            "detail": (f"{text_bytes} bytes exceeds the {CONSOLE_MAX_MESSAGE_BYTES}-byte "
+                       f"limit (kernel MAX_ARG_STRLEN {_MAX_ARG_STRLEN} minus headroom "
+                       f"for the file note and command). Split it into two messages."),
+            "length_bytes": text_bytes,
+            "max_bytes": CONSOLE_MAX_MESSAGE_BYTES,
+            "limit_source": "kernel MAX_ARG_STRLEN",
+        }, status=413)
     if nonce <= 0:
         return _aw.json_response({"ok": False, "error": "nonce_required"}, status=400)
     if _console_duplicate(nonce):
@@ -6082,9 +6126,16 @@ async def _sessapi_control(req):
         model = str(body.get("model") or "").strip()
         if not re.fullmatch(r"[A-Za-z0-9._\-]{1,64}", model):
             return _aw.json_response({"ok": False, "error": "bad_model"}, status=400)
-        session.claude_model = model
-        _console_audit("model", label, model)
-        return _aw.json_response({"ok": True, "label": label, "model": model})
+        # Claude reads session.claude_model; every other engine reads
+        # session.model. Setting the wrong one made a Codex model switch report
+        # success and change nothing.
+        if session.engine == engines.ENGINE_CLAUDE:
+            session.claude_model = model
+        else:
+            session.model = model
+        _console_audit("model", label, model, f"engine={session.engine}")
+        return _aw.json_response({"ok": True, "label": label, "model": model,
+                                  "engine": session.engine})
 
     if action == "project":
         project = str(body.get("project") or "").strip()
@@ -6134,7 +6185,12 @@ async def _sessapi_models(req):
     shows a stale label but can never pin a session to an old model."""
     if not _sessapi_authorized(req):
         return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
-    resolved = await asyncio.to_thread(_resolved_models)
+    # NEVER probe inline: each alias costs a real CLI turn, and probing four of
+    # them serially took >2 minutes, which hung the console's startup fetch.
+    # Serve whatever is cached and refresh in the background.
+    resolved = dict(_MODEL_CACHE)
+    if not resolved or (time.time() - _MODEL_CACHE_AT) >= MODEL_CACHE_TTL:
+        _schedule_model_refresh()
     return _aw.json_response({
         "ok": True,
         "families": MODEL_FAMILIES,
@@ -6168,6 +6224,9 @@ async def _sessapi_start(app):
         return
     _SESSAPI_RUNNER = runner
     log.info(f"session_api.listening bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}")
+    # Warm the alias->concrete map in the background so the console's first
+    # /models call is served from cache instead of waiting on four CLI turns.
+    _schedule_model_refresh()
 
 
 async def _sessapi_stop():

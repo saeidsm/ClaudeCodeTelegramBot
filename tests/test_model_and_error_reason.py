@@ -104,3 +104,87 @@ def test_scrub_covers_path_tokens_when_present(var, monkeypatch):
     monkeypatch.setenv(var, "abcdef0123456789abcdef0123456789")
     out = bot._scrub_secrets("url /reports/abcdef0123456789abcdef0123456789/x")
     assert "abcdef0123456789" not in out
+
+
+# ── 2E: length bound reflects the REAL constraint, and says so ──────────────
+
+def test_message_bound_is_derived_from_the_kernel_not_telegram():
+    """4096 is Telegram's REPLY limit; the prompt travels as one argv element."""
+    assert bot._MAX_ARG_STRLEN == 32 * __import__("os").sysconf("SC_PAGE_SIZE")
+    assert bot.CONSOLE_MAX_MESSAGE_BYTES < bot._MAX_ARG_STRLEN, "must leave headroom"
+    assert bot.CONSOLE_MAX_MESSAGE_BYTES > 100000, "must not be a borrowed transport limit"
+    assert bot.CONSOLE_MAX_MESSAGE_BYTES not in (4096, 8000), "that was the borrowed cap"
+
+
+def test_too_long_error_names_the_limit_the_length_and_the_max():
+    import asyncio, json
+
+    class R:
+        def __init__(self, b):
+            self._b = b; self.headers = {"X-Session-API-Token": bot.BOT_SESSION_API_TOKEN}
+            self.query = {}; self.app = {"bot": None}
+        async def json(self): return self._b
+
+    bot._CONSOLE_LAST_SEND = 0.0
+    big = "x" * (bot.CONSOLE_MAX_MESSAGE_BYTES + 10)
+    r = asyncio.run(bot._sessapi_send(R({"label": "n", "message": big,
+                                         "nonce": bot._CONSOLE_NONCE_HWM + 1})))
+    b = json.loads(r.body.decode())
+    assert r.status == 413 and b["error"] == "message_too_long"
+    # An error that names neither the limit nor the value is the same failure
+    # class as an empty log.
+    assert b["length_bytes"] == len(big.encode())
+    assert b["max_bytes"] == bot.CONSOLE_MAX_MESSAGE_BYTES
+    assert "MAX_ARG_STRLEN" in b["limit_source"]
+    assert str(b["max_bytes"]) in b["detail"]
+
+
+def test_length_is_measured_in_bytes_not_characters():
+    """Farsi is ~2 bytes/char; a character cap halves the real allowance."""
+    farsi = "ب" * 100
+    assert len(farsi) == 100
+    assert len(farsi.encode("utf-8")) == 200
+
+
+# ── 2E: the model switch must respect the engine ────────────────────────────
+
+def _switch(label, model):
+    import asyncio, json
+
+    class R:
+        def __init__(self, b):
+            self._b = b; self.headers = {"X-Session-API-Token": bot.BOT_SESSION_API_TOKEN}
+            self.query = {}; self.app = {"bot": None}
+        async def json(self): return self._b
+
+    bot._CONSOLE_LAST_SEND = 0.0
+    r = asyncio.run(bot._sessapi_control(R({"action": "model", "label": label,
+                                            "model": model,
+                                            "nonce": bot._CONSOLE_NONCE_HWM + 1})))
+    return r, json.loads(r.body.decode())
+
+
+def test_model_switch_on_a_codex_session_actually_takes_effect():
+    cid = bot._console_chat_id()
+    s = bot.SM.create(cid, "eng-codex")
+    s.engine = bot.engines.ENGINE_CODEX
+    s.status = "idle"
+    before_claude = s.claude_model
+    r, b = _switch("eng-codex", "gpt-5.6-sol")
+    assert r.status == 200 and b["ok"] is True
+    # the field the CODEX path actually reads
+    assert s.model == "gpt-5.6-sol", "codex session must have session.model set"
+    assert s.claude_model == before_claude, "claude_model must be left alone"
+    bot.SM.kill(cid, "eng-codex")
+
+
+def test_model_switch_on_a_claude_session_still_sets_claude_model():
+    cid = bot._console_chat_id()
+    s = bot.SM.create(cid, "eng-claude")
+    s.engine = bot.engines.ENGINE_CLAUDE
+    s.status = "idle"
+    r, b = _switch("eng-claude", "opus")
+    assert r.status == 200
+    assert s.claude_model == "opus"
+    assert s.model == "", "the generic field must stay empty for claude"
+    bot.SM.kill(cid, "eng-claude")
