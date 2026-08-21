@@ -77,6 +77,12 @@ async def test_sessions_endpoint_shape_and_no_leakage(monkeypatch):
     assert set(by_id) == {"1:a", "1:b"}
     assert by_id["1:a"]["engine"] == "claude" and by_id["1:a"]["model"] == "opus"
     assert by_id["1:b"]["engine"] == "codex" and by_id["1:b"]["model"] == "gpt-5.6-sol"
+    # AP-5: the exact-set assertion below proves has_output is PRESENT, not that
+    # it means anything. Without these two lines a field hardwired to False
+    # would satisfy the contract, and "waiting on you" would simply never appear
+    # with nothing in the suite to explain why. s1 carries out=..., s2 does not.
+    assert by_id["1:a"]["has_output"] is True, "has_output False despite non-empty out"
+    assert by_id["1:b"]["has_output"] is False, "has_output True with no out"
     for s in body["sessions"]:
         # EXACT set, deliberately: the payload is a reviewed contract and a new
         # field is a security decision, not a feature decision. Amend this only

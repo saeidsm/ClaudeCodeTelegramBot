@@ -423,10 +423,14 @@ def test_kill_tree_leaves_no_frozen_process_stopped(tmp_path):
         deadline = time.time() + 5
         while time.time() < deadline and (_alive(parent.pid) or _alive(loop_pid)):
             time.sleep(0.05)
+        # AP-5: order matters here. _proc_state() returns None for a dead pid,
+        # so `!= "T"` cannot fail once the tree is proven dead - this check used
+        # to sit AFTER the line below and was unfailable by construction. Ask it
+        # while a process could still be parked, the way
+        # test_kill_tree_resumes_when_sigkill_fails does.
+        stuck = [p for p in (parent.pid, loop_pid) if _alive(p) and _proc_state(p) == "T"]
+        assert not stuck, f"a frozen process was left STOPPED: {stuck}"
         assert not _alive(parent.pid) and not _alive(loop_pid), "tree survived"
-        # neither is parked in STOPPED state
-        assert _proc_state(parent.pid) != "T" and _proc_state(loop_pid) != "T", \
-            "a frozen process was left STOPPED"
     finally:
         for pid in ([parent.pid, loop_pid] if loop_pid else [parent.pid]):
             try:
