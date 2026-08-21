@@ -5852,6 +5852,158 @@ async def _sessapi_output(req):
     })
 
 
+def _console_guard(req, body, need_nonce=True):
+    """Shared write-path guard (phase 2C). Returns an error response, or None.
+
+    Every console WRITE runs this, so a new control cannot accidentally ship
+    with a weaker shape than /send. Callers must have already authenticated -
+    that stays the literal first statement of each handler (AP-1)."""
+    global _CONSOLE_LAST_SEND
+    if not isinstance(body, dict):
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+    for forbidden in ("chat_id", "chat", "owner", "session_id", "id"):
+        if forbidden in body:
+            return _aw.json_response(
+                {"ok": False, "error": "owner_fields_not_accepted",
+                 "detail": f"'{forbidden}' is server-bound"}, status=400)
+    if need_nonce:
+        try:
+            nonce = int(body.get("nonce") or 0)
+        except (TypeError, ValueError):
+            nonce = 0
+        if nonce <= 0:
+            return _aw.json_response({"ok": False, "error": "nonce_required"}, status=400)
+        if _console_duplicate(nonce):
+            return _aw.json_response({"ok": False, "error": "duplicate"}, status=409)
+    now = time.time()
+    if now - _CONSOLE_LAST_SEND < CONSOLE_MIN_INTERVAL_S:
+        return _aw.json_response({"ok": False, "error": "rate_limited",
+                                  "retry_after": CONSOLE_MIN_INTERVAL_S}, status=429)
+    _CONSOLE_LAST_SEND = now
+    return None
+
+
+def _console_session(label: str):
+    """Resolve a label ONLY inside the server-bound chat. A session belonging to
+    any other chat is simply not in this list, so it cannot be named."""
+    cid = _console_chat_id()
+    if not cid:
+        return None, None
+    return cid, next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+
+
+async def _sessapi_control(req):
+    """POST /control — new | kill | model | project.
+
+    Same shape as /send: authenticate first, refuse owner fields, dedup, rate
+    limit, audit. Each action goes through the SAME SessionManager calls the
+    Telegram command handlers use; nothing here reimplements session lifecycle."""
+    # AP-1: authenticate BEFORE reading the body.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    try:
+        body = await req.json()
+    except Exception:
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+    err = _console_guard(req, body)
+    if err is not None:
+        _console_audit("control_rejected", str(body.get("label") or ""),
+                       str(body.get("action") or ""), "guard")
+        return err
+
+    action = str(body.get("action") or "").strip()
+    label = str(body.get("label") or "").strip()[:40]
+    if not action or not label:
+        return _aw.json_response({"ok": False, "error": "action_and_label_required"},
+                                 status=400)
+    cid = _console_chat_id()
+    if not cid:
+        return _aw.json_response({"ok": False, "error": "no_bound_chat"}, status=503)
+
+    if action == "new":
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,30}", label):
+            return _aw.json_response({"ok": False, "error": "bad_label"}, status=400)
+        project = str(body.get("project") or "").strip()
+        if project not in get_project_names():
+            return _aw.json_response({"ok": False, "error": "unknown_project"}, status=400)
+        if not SM.can_create(cid):
+            return _aw.json_response({"ok": False, "error": "session_limit"}, status=409)
+        _, existing = _console_session(label)
+        if existing is not None:
+            return _aw.json_response({"ok": False, "error": "label_in_use"}, status=409)
+        session = SM.create(cid, label)
+        _apply_engine(session, engines.ENGINE_CLAUDE)
+        session.project = project
+        _console_audit("new", label, project)
+        return _aw.json_response({"ok": True, "label": session.label,
+                                  "project": session.project})
+
+    _, session = _console_session(label)
+    if session is None:
+        _console_audit("no_such_session", label, action)
+        return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+
+    if action == "kill":
+        # A running session is in-flight work. Killing one by accident is the
+        # disruption this endpoint must not enable, so it takes a SECOND,
+        # explicit act - the same two-factors-of-intent rule as AP-3.
+        if session.status == "running" and body.get("force") is not True:
+            return _aw.json_response(
+                {"ok": False, "error": "session_running",
+                 "detail": "resend with force=true to kill a running session"},
+                status=409)
+        ok = SM.kill(cid, label)
+        _console_audit("kill", label, f"force={body.get('force') is True}",
+                       f"was={session.status}")
+        return _aw.json_response({"ok": bool(ok), "label": label})
+
+    if action == "model":
+        model = str(body.get("model") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._\-]{1,64}", model):
+            return _aw.json_response({"ok": False, "error": "bad_model"}, status=400)
+        session.claude_model = model
+        _console_audit("model", label, model)
+        return _aw.json_response({"ok": True, "label": label, "model": model})
+
+    if action == "project":
+        project = str(body.get("project") or "").strip()
+        if project not in get_project_names():
+            return _aw.json_response({"ok": False, "error": "unknown_project"}, status=400)
+        session.project = project
+        _console_audit("project", label, project)
+        return _aw.json_response({"ok": True, "label": label, "project": project})
+
+    return _aw.json_response({"ok": False, "error": "unknown_action"}, status=400)
+
+
+async def _sessapi_mcp(req):
+    """GET /mcp — which MCP servers are configured (read-only, 2C).
+
+    Deliberately exposes NAMES and shape only: no args, no urls, no env values.
+    An MCP arg list routinely carries an API key, and a url can carry a token, so
+    neither is safe to render in a browser. Toggling a server changes the
+    permission surface and stays founder-only."""
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    out = []
+    try:
+        with open("/root/.claude.json") as fh:
+            cfg = json.load(fh).get("mcpServers", {})
+    except Exception as ex:
+        return _aw.json_response({"ok": False, "error": "config_unreadable",
+                                  "detail": type(ex).__name__}, status=503)
+    for name, c in sorted(cfg.items()):
+        cmd = c.get("command") or ""
+        out.append({
+            "name": name,
+            "type": c.get("type") or ("url" if c.get("url") else "stdio"),
+            "command": os.path.basename(cmd) if cmd else "",
+            "arg_count": len(c.get("args") or []),
+            "env_names": sorted((c.get("env") or {}).keys()),
+        })
+    return _aw.json_response({"ok": True, "servers": out, "count": len(out)})
+
+
 async def _sessapi_start(app):
     global _SESSAPI_RUNNER
     if not BOT_SESSION_API_TOKEN:
@@ -5862,7 +6014,9 @@ async def _sessapi_start(app):
     a.router.add_get("/sessions", _sessapi_sessions)
     a.router.add_get("/metrics", _sessapi_metrics)
     a.router.add_get("/output", _sessapi_output)
+    a.router.add_get("/mcp", _sessapi_mcp)
     a.router.add_post("/send", _sessapi_send)
+    a.router.add_post("/control", _sessapi_control)
     runner = _aw.AppRunner(a)
     await runner.setup()
     try:
