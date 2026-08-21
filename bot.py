@@ -5794,6 +5794,10 @@ async def _sessapi_metrics(req):
 CONSOLE_AUDIT_LOG = os.environ.get(
     "CONSOLE_AUDIT_LOG", "/var/log/claude-console-commands.log")
 CONSOLE_MIN_INTERVAL_S = _positive_int_env("CONSOLE_MIN_INTERVAL_S", 3)
+# Display caps for /output. The console polls every 5s, so the default response
+# stays small; `?full=1` bypasses both for an explicit, user-initiated copy.
+OUTPUT_DISPLAY_CAP = _positive_int_env("CONSOLE_OUTPUT_CAP", 20000)
+OUTPUT_ERR_CAP = _positive_int_env("CONSOLE_ERROR_CAP", 4000)
 _CONSOLE_LAST_SEND = 0.0
 _CONSOLE_NONCE_HWM = 0
 _CONSOLE_NONCES: "deque" = deque(maxlen=512)
@@ -5944,6 +5948,13 @@ async def _sessapi_output(req):
     session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
     if session is None:
         return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+    # Display is capped so a poll cannot ship megabytes every 5s. `?full=1`
+    # returns the WHOLE thing for the copy button - a copy that silently gives
+    # you only what was on screen is the same failure class as an audit log that
+    # misses successes: it looks like it worked.
+    full = str(req.query.get("full") or "") in ("1", "true", "yes")
+    raw_out = _scrub_secrets(getattr(session, "out", "") or "")
+    raw_err = _scrub_secrets(getattr(session, "error_text", "") or "")
     return _aw.json_response({
         "ok": True,
         "label": session.label,
@@ -5951,8 +5962,14 @@ async def _sessapi_output(req):
         "last_active": session.last_active,
         "tasks": session.tasks,
         "status_reason": getattr(session, "status_reason", ""),
-        "error_text": _scrub_secrets(getattr(session, "error_text", "") or "")[-4000:],
-        "out": _scrub_secrets((getattr(session, "out", "") or ""))[-20000:],
+        "error_text": raw_err if full else raw_err[-OUTPUT_ERR_CAP:],
+        "out": raw_out if full else raw_out[-OUTPUT_DISPLAY_CAP:],
+        # Lengths are of the SCRUBBED text, i.e. exactly what a client can get.
+        "out_len": len(raw_out),
+        "error_len": len(raw_err),
+        "out_truncated": (not full) and len(raw_out) > OUTPUT_DISPLAY_CAP,
+        "error_truncated": (not full) and len(raw_err) > OUTPUT_ERR_CAP,
+        "full": full,
     })
 
 
