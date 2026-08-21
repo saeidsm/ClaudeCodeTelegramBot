@@ -584,6 +584,11 @@ def test_cli_content_contracts_fail_closed(fs, mode_env, expect):
     assert not (fs["live"] / "scripts" / "claude-telegram-bot.py").exists()
 
 
+@pytest.mark.slow   # ~26s on an idle box: runs the deploy script all the way
+# to DEPLOYED. It was on the carry-forward list as "hanging"; it is not. It
+# crossed a 45s sweep bound only while three agent sessions were running.
+# The script's waits are already neutralised here (DEPLOY_OBSERVE_SECONDS=0,
+# HEALTH_POLL=1), so the time is real work, not a sleep to tune away.
 def test_separate_cache_dir_and_root_owned_files_chowned(fs):
     # non-default cache dir + pre-existing files: install must chown them and
     # verify service-user replace capability (svcuser via fake sudo)
