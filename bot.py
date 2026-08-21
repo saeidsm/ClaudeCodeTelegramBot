@@ -118,15 +118,21 @@ def _positive_int_env(name: str, default: int) -> int:
 MAX_SESSIONS               = _positive_int_env("BOT_MAX_SESSIONS", 4)
 MAX_RUNNING_AGENTS         = _positive_int_env("BOT_MAX_RUNNING_AGENTS", 2)
 
-# Default Claude Code model for new sessions — empty = CLI default,
-# "sonnet"/"opus" aliases, or full model name like "claude-sonnet-5".
+# Default Claude Code model for new sessions — empty = CLI default. Prefer a
+# FAMILY ALIAS ("sonnet", "opus", "haiku", "fable"): the CLI resolves an alias to
+# the newest model in that family, so an alias never goes stale. A full version
+# id can be set here, but then someone has to remember to bump it.
 # Per-session overrides via /model (Session.claude_model).
 BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
-# Sonnet-1M model offered as an immediate switch when Claude (Opus) is
-# overloaded. The "[1m]" suffix selects the 1M-context variant (same syntax the
-# CLI uses for claude-opus-4-8[1m]). Override via env if the id ever changes.
-SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "claude-sonnet-4-6[1m]")
+# Sonnet-1M model offered as an immediate switch when Claude is overloaded.
+# The "[1m]" suffix selects the 1M-context variant. Use the FAMILY ALIAS, not a
+# pinned version: `sonnet[1m]` resolves to the newest sonnet's 1M variant, so
+# this follows releases with no code change. The old default was pinned to
+# claude-sonnet-4-6[1m] and had silently kept the overload fallback on Sonnet
+# 4.6 after Sonnet 5 shipped. [verified 2026-08-21: `--model sonnet[1m]` ->
+# modelUsage claude-sonnet-5[1m] on CLI 2.1.237]
+SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "sonnet[1m]")
 # Seconds to wait before the single automatic retry on a Claude rate-limit.
 try:
     RATE_LIMIT_RETRY_DELAY = int(os.environ.get("BOT_RATE_LIMIT_RETRY_DELAY", "60"))
@@ -624,6 +630,13 @@ class Session:
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
     claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
+    # Why this session is in its current status. "error" alone is ambiguous:
+    # until phase 2D it was set ONLY by a restart, never by a real failure, so a
+    # console "show me the error" button would have had nothing to show.
+    #   interrupted_by_restart -> the process died under it; resend resumes it
+    #   execution_failed       -> the engine exited non-zero; error_text has why
+    status_reason: str = ""
+    error_text: str = ""             # scrubbed engine stderr, only for execution_failed
     # ── Phase 2: multi-engine ──
     engine: str = "claude"           # claude | codex | chat  (old sessions => claude)
     model: str = ""                  # generic per-engine model id (codex/chat); Claude keeps claude_model
@@ -1916,6 +1929,16 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
                 if proc.returncode != 0 and e:
                     r += f"\n⚠️ {e[:500]}"
+                if proc.returncode != 0:
+                    # A REAL failure, as opposed to the restart marker. Record why,
+                    # so the console can show something truthful instead of a
+                    # bare "error" that used to mean only "the bot restarted".
+                    session.status_reason = "execution_failed"
+                    session.error_text = _scrub_secrets(
+                        f"exit {proc.returncode}\n{(e or r)[:3000]}")
+                else:
+                    session.status_reason = ""
+                    session.error_text = ""
                 if proc.returncode == 0:
                     _coord_status = "completed"
                 return r.strip() or "(no output)"
@@ -3773,7 +3796,7 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
         if target is None:
             return
         adapter = engines.get_adapter(target.engine)
-        example = ("sonnet · opus · claude-sonnet-5" if target.engine == engines.ENGINE_CLAUDE
+        example = ("sonnet · opus · haiku · fable  (aliases track the newest)" if target.engine == engines.ENGINE_CLAUDE
                    else "gpt-5.6-sol · gpt-5.5")
         CONV_STATE[cid] = {"state": "awaiting_engine_model_input",
                            "session_key": target.id, "uuid": target.session_uuid,
@@ -4866,6 +4889,10 @@ _PERSISTED_SESSION_FIELDS = (
     "tasks", "claude_created", "claude_model",
     # Phase 2 multi-engine fields (absent in old state → safe defaults)
     "engine", "model", "provider_session_id", "chat_history_ref",
+    # Phase 2D: why a session is in its status. Persisting the reason is the
+    # whole point - RAgg lost its reason to a restart precisely because nothing
+    # recorded one, and it cannot be backfilled.
+    "status_reason", "error_text",
 )
 
 # ── Telegram update_id dedup (Phase 0 A3 — risk R3) ──
@@ -4946,8 +4973,10 @@ def load_state():
             # Sessions left "running" or "queued" have a dead subprocess/slot
             # after a restart — mark them "error" so users know to re-send.
             status = s.get("status", "idle")
+            reason = s.get("status_reason", "")
             if status in ("running", "queued"):
                 status = "error"
+                reason = reason or "interrupted_by_restart"
             session = Session(
                 id=s["id"],
                 label=s["label"],
@@ -4955,6 +4984,8 @@ def load_state():
                 session_uuid=s["session_uuid"],
                 project=s.get("project", DEFAULT_PROJECT),
                 status=status,
+                status_reason=reason,
+                error_text=s.get("error_text", ""),
                 started_at=s.get("started_at", time.time()),
                 last_active=s.get("last_active", time.time()),
                 message_ids=s.get("message_ids", []),
@@ -5377,6 +5408,7 @@ async def graceful_shutdown(app):
     # block on restart.
     for key, session in active:
         session.status = "error"
+        session.status_reason = "interrupted_by_restart"
     # Persist final state so sessions can be restored after restart
     save_state()
     log.info(f"Graceful shutdown complete. Killed {len(active)} active sessions.")
@@ -5572,6 +5604,71 @@ BOT_SESSION_API_BIND = os.environ.get("BOT_SESSION_API_BIND", "172.17.0.1").stri
 _SESSAPI_RUNNER = None
 
 
+# ── secret scrubbing for anything we surface to a browser ────────────────────
+# Engine stderr can quote a command line, and a command line on this box has
+# historically carried tokens. The console must never render one, so every live
+# secret-shaped value from the environment is replaced before display. This is a
+# safety net, NOT a licence to put secrets on command lines - see 0.5-B.
+_SCRUB_MIN_LEN = 12
+
+
+def _scrub_secrets(text: str) -> str:
+    if not text:
+        return text
+    for k, v in os.environ.items():
+        if len(v or "") < _SCRUB_MIN_LEN:
+            continue
+        if not re.search(r"(TOKEN|KEY|SECRET|PASS|PWD|HMAC)", k, re.I):
+            continue
+        if v in text:
+            text = text.replace(v, f"<{k}:redacted>")
+    return text
+
+
+# ── model alias resolution ──────────────────────────────────────────────────
+# A family alias ("opus") ALWAYS means the newest model in that family - the
+# CLI resolves it, and `claude --model --help` says so explicitly. So the bot
+# passes the alias straight through and pins nothing. This cache exists only to
+# SHOW which concrete model an alias currently resolves to; it is never used to
+# choose a model, so a stale cache cannot pin anything.
+_MODEL_CACHE: dict = {}
+_MODEL_CACHE_AT = 0.0
+MODEL_CACHE_TTL = _positive_int_env("BOT_MODEL_CACHE_TTL", 3600)
+MODEL_FAMILIES = [f.strip() for f in os.environ.get(
+    "BOT_MODEL_FAMILIES", "haiku,sonnet,opus,fable").split(",") if f.strip()]
+
+
+def _probe_model(alias: str) -> str:
+    """Ask the CLI what an alias resolves to. Returns '' if it cannot."""
+    try:
+        pr = subprocess.run(
+            ["claude", "--print", "--model", alias, "--output-format", "json",
+             "--max-turns", "1", "hi"],
+            capture_output=True, text=True, timeout=120)
+        if pr.returncode != 0:
+            return ""
+        used = (json.loads(pr.stdout or "{}").get("modelUsage") or {})
+        return next(iter(used), "")
+    except Exception as ex:
+        log.info(f"model_probe.failed alias={alias} {type(ex).__name__}")
+        return ""
+
+
+def _resolved_models() -> dict:
+    """alias -> concrete id, cached. Probing costs one tiny turn per alias."""
+    global _MODEL_CACHE, _MODEL_CACHE_AT
+    if _MODEL_CACHE and (time.time() - _MODEL_CACHE_AT) < MODEL_CACHE_TTL:
+        return _MODEL_CACHE
+    out = {}
+    for fam in MODEL_FAMILIES:
+        got = _probe_model(fam)
+        if got:
+            out[fam] = got
+    if out:                      # keep the previous map if every probe failed
+        _MODEL_CACHE, _MODEL_CACHE_AT = out, time.time()
+    return _MODEL_CACHE
+
+
 def _sessapi_authorized(req) -> bool:
     token = req.headers.get("X-Session-API-Token", "")
     return bool(token) and bool(BOT_SESSION_API_TOKEN) and hmac.compare_digest(
@@ -5598,6 +5695,11 @@ async def _sessapi_sessions(req):
             "model": (s.claude_model if s.engine == engines.ENGINE_CLAUDE else s.model) or "",
             "project": s.project,
             "status": s.status,
+            # REVIEWED ADDITION (2D): status_reason distinguishes a restart
+            # marker from a real failure; has_error says whether error_text is
+            # worth fetching. Neither carries a path, a uuid or a transcript.
+            "status_reason": getattr(s, "status_reason", ""),
+            "has_error": bool(getattr(s, "error_text", "")),
             "started_at": s.started_at,
             "last_active": s.last_active,
         }
@@ -5848,7 +5950,9 @@ async def _sessapi_output(req):
         "status": session.status,
         "last_active": session.last_active,
         "tasks": session.tasks,
-        "out": (getattr(session, "out", "") or "")[-20000:],
+        "status_reason": getattr(session, "status_reason", ""),
+        "error_text": _scrub_secrets(getattr(session, "error_text", "") or "")[-4000:],
+        "out": _scrub_secrets((getattr(session, "out", "") or ""))[-20000:],
     })
 
 
@@ -6004,6 +6108,25 @@ async def _sessapi_mcp(req):
     return _aw.json_response({"ok": True, "servers": out, "count": len(out)})
 
 
+async def _sessapi_models(req):
+    """GET /models — family aliases and what each currently resolves to.
+
+    The console renders FAMILIES. It never sends a version string, and nothing
+    here maps one: the alias goes to the CLI untouched and the CLI picks the
+    newest model in that family. This endpoint is display-only, so a stale cache
+    shows a stale label but can never pin a session to an old model."""
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    resolved = await asyncio.to_thread(_resolved_models)
+    return _aw.json_response({
+        "ok": True,
+        "families": MODEL_FAMILIES,
+        "resolved": resolved,
+        "default": BOT_DEFAULT_CLAUDE_MODEL or "",
+        "cached_at": _MODEL_CACHE_AT,
+    })
+
+
 async def _sessapi_start(app):
     global _SESSAPI_RUNNER
     if not BOT_SESSION_API_TOKEN:
@@ -6015,6 +6138,7 @@ async def _sessapi_start(app):
     a.router.add_get("/metrics", _sessapi_metrics)
     a.router.add_get("/output", _sessapi_output)
     a.router.add_get("/mcp", _sessapi_mcp)
+    a.router.add_get("/models", _sessapi_models)
     a.router.add_post("/send", _sessapi_send)
     a.router.add_post("/control", _sessapi_control)
     runner = _aw.AppRunner(a)

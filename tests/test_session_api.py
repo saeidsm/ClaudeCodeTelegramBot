@@ -78,8 +78,16 @@ async def test_sessions_endpoint_shape_and_no_leakage(monkeypatch):
     assert by_id["1:a"]["engine"] == "claude" and by_id["1:a"]["model"] == "opus"
     assert by_id["1:b"]["engine"] == "codex" and by_id["1:b"]["model"] == "gpt-5.6-sol"
     for s in body["sessions"]:
+        # EXACT set, deliberately: the payload is a reviewed contract and a new
+        # field is a security decision, not a feature decision. Amend this only
+        # together with the review note in _sessapi_sessions.
+        # Phase 2D added two, both reviewed there:
+        #   status_reason - distinguishes a restart marker from a real failure
+        #   has_error     - whether error_text is worth fetching
+        # Neither carries a path, a uuid, prompt text or a transcript.
         assert set(s) == {"id", "label", "engine", "model", "project",
-                           "status", "started_at", "last_active"}
+                           "status", "status_reason", "has_error",
+                           "started_at", "last_active"}
 
     assert body["active_session"] == {"1": "1:a"}
     assert body["counts"] == {"total": 2, "running": 1, "idle": 1}
