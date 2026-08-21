@@ -3970,9 +3970,15 @@ async def on_callback(u, c):
                 await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
                 return
             await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
+            # AP-3: deploy-to-prod.sh refuses unless DEPLOY_CONFIRM equals the
+            # project. This handler is a deliberate, user-initiated deploy, so it
+            # is the one place entitled to set it. Passing the project (not a
+            # constant like "yes") is the point: a value left in the environment
+            # cannot authorise a different project.
             r = await asyncio.to_thread(
                 subprocess.run, [f"{SCRIPTS}/deploy-to-prod.sh", proj, br],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "DEPLOY_CONFIRM": proj})
             ok = r.returncode == 0
             await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
 
