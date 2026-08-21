@@ -26,6 +26,9 @@ Only boolean presence and verifiable public capability data.
 
 ### Claude model catalog (account-visible, `claude models`)
 
+> Snapshot as of Phase A. Current catalogs live in code (`engines/*.py`) and were
+> refreshed 2026-08-19 to Opus 5 / Sonnet 5 (+1M), GLM 5.3, Qwen3.8 Max, Kimi K3.
+
 | Label | ID |
 |-------|-----|
 | Fable 5 | `claude-fable-5` |

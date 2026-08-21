@@ -16,12 +16,16 @@ from .base import Capabilities, EngineAdapter, ModelInfo, ENGINE_CLAUDE
 # the account catalog changes. There is no `claude models` subcommand and
 # readiness never issues a Claude prompt/model call to verify this list — it
 # is validated purely from this source plus the env override.
+# Verified against claude-code 2.1.222 (its own supported-model table).
 _DEFAULT_CATALOG = [
     ModelInfo("", "Default (CLI default)"),
-    ModelInfo("claude-fable-5", "Fable 5"),
-    ModelInfo("claude-opus-4-8", "Opus 4.8"),
+    ModelInfo("claude-opus-5", "Opus 5"),
+    ModelInfo("claude-opus-5[1m]", "Opus 5 (1M)"),
     ModelInfo("claude-sonnet-5", "Sonnet 5"),
-    ModelInfo("claude-haiku-4-5-20251001", "Haiku 4.5"),
+    ModelInfo("claude-sonnet-5[1m]", "Sonnet 5 (1M)"),
+    ModelInfo("claude-fable-5", "Fable 5"),
+    ModelInfo("claude-haiku-4-5", "Haiku 4.5"),
+    ModelInfo("claude-opus-4-8", "Opus 4.8 (previous)"),
 ]
 
 # `--model` also accepts short aliases; keep them selectable/validatable.
