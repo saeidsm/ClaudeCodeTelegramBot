@@ -5615,6 +5615,74 @@ async def _sessapi_sessions(req):
     })
 
 
+def _read_cpu_times():
+    """Aggregate jiffies from /proc/stat: (idle_all, total). Unprivileged."""
+    with open("/proc/stat") as fh:
+        parts = fh.readline().split()
+    vals = [int(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)      # idle + iowait
+    return idle, sum(vals)
+
+
+async def _sessapi_metrics(req):
+    """Host resource snapshot for the console (phase 2A / W2).
+
+    Read-only, unprivileged: /proc/meminfo, /proc/loadavg, /proc/stat and
+    statvfs. Deliberately part of the EXISTING session-API app rather than a new
+    daemon - see docs/phase2/2a-console.md for the trade-off. Exposes no paths,
+    no process names, no session data.
+    """
+    # AP-1: authenticate the caller BEFORE reading or parsing anything. In 2A
+    # every route is GET, but 2B inherits this shape.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+
+    mem = {}
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            k, _, v = line.partition(":")
+            mem[k] = int(v.split()[0]) * 1024          # kB -> bytes
+
+    i0, t0 = _read_cpu_times()
+    await asyncio.sleep(0.12)                          # short delta, not a stall
+    i1, t1 = _read_cpu_times()
+    dt = t1 - t0
+    cpu_pct = round(100.0 * (1.0 - (i1 - i0) / dt), 1) if dt > 0 else 0.0
+
+    st = os.statvfs("/")
+    disk_total = st.f_blocks * st.f_frsize
+    disk_free = st.f_bavail * st.f_frsize
+
+    with open("/proc/loadavg") as fh:
+        la = fh.read().split()[:3]
+    with open("/proc/uptime") as fh:
+        uptime_s = int(float(fh.read().split()[0]))
+
+    mem_total = mem.get("MemTotal", 0)
+    mem_avail = mem.get("MemAvailable", 0)
+    swap_total = mem.get("SwapTotal", 0)
+    swap_free = mem.get("SwapFree", 0)
+    pct = lambda used, total: round(100.0 * used / total, 1) if total else 0.0
+
+    return _aw.json_response({
+        "ok": True,
+        "cpu": {"percent": max(0.0, min(100.0, cpu_pct)),
+                "cores": os.cpu_count() or 1,
+                "load": [float(x) for x in la]},
+        "memory": {"total": mem_total, "available": mem_avail,
+                   "used": mem_total - mem_avail,
+                   "percent": pct(mem_total - mem_avail, mem_total)},
+        "swap": {"total": swap_total, "free": swap_free,
+                 "used": swap_total - swap_free,
+                 "percent": pct(swap_total - swap_free, swap_total)},
+        "disk": {"total": disk_total, "free": disk_free,
+                 "used": disk_total - disk_free,
+                 "percent": pct(disk_total - disk_free, disk_total)},
+        "uptime_s": uptime_s,
+        "ts": time.time(),
+    })
+
+
 async def _sessapi_start(app):
     global _SESSAPI_RUNNER
     if not BOT_SESSION_API_TOKEN:
@@ -5622,6 +5690,7 @@ async def _sessapi_start(app):
         return
     a = _aw.Application()
     a.router.add_get("/sessions", _sessapi_sessions)
+    a.router.add_get("/metrics", _sessapi_metrics)
     runner = _aw.AppRunner(a)
     await runner.setup()
     try:
