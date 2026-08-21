@@ -5,11 +5,11 @@ Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
 import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 
 import aiohttp
 from aiohttp import web as _aw
@@ -5683,14 +5683,186 @@ async def _sessapi_metrics(req):
     })
 
 
+# ── Console write path (phase 2B) ────────────────────────────────────────────
+# The console is SINGLE-USER. The target chat is bound server-side from
+# TELEGRAM_CHAT_ID and is never accepted from the client: a chat id in a request
+# body is a claim, not a credential (AP-1). The client may name a session LABEL;
+# that label is resolved only within the server-bound chat, so naming another
+# chat's session cannot reach it.
+CONSOLE_AUDIT_LOG = os.environ.get(
+    "CONSOLE_AUDIT_LOG", "/var/log/claude-console-commands.log")
+CONSOLE_MIN_INTERVAL_S = _positive_int_env("CONSOLE_MIN_INTERVAL_S", 3)
+_CONSOLE_LAST_SEND = 0.0
+_CONSOLE_NONCE_HWM = 0
+_CONSOLE_NONCES: "deque" = deque(maxlen=512)
+
+
+def _console_chat_id() -> int:
+    """The one chat the console may act on. Server-side, from config only."""
+    return ALLOWED_IDS[0] if ALLOWED_IDS else 0
+
+
+def _console_audit(event: str, label: str, message: str, extra: str = "") -> None:
+    """Append-only record of what the console did. Deliberately a SEPARATE file
+    from the bot log: this is the record consulted when something goes wrong,
+    and it must not be buried in operational noise."""
+    try:
+        line = json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "event": event,
+            "session_label": label,
+            "message": message,
+            "extra": extra,
+        }, ensure_ascii=False)
+        with open(CONSOLE_AUDIT_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as ex:                       # never let auditing break the request
+        log.error(f"console.audit_failed {ex!r}")
+
+
+def _console_duplicate(nonce: int) -> bool:
+    """Same SHAPE as the Telegram update_id dedup (monotonic high-water mark),
+    deliberately in its OWN namespace. Sharing `_UPDATE_ID_HWM` would be actively
+    harmful: a console nonce above the mark would make every real Telegram update
+    below it look like a duplicate and be silently dropped.
+    The bounded deque additionally catches an exact replay of an older nonce."""
+    global _CONSOLE_NONCE_HWM
+    if nonce in _CONSOLE_NONCES:
+        return True
+    if nonce <= _CONSOLE_NONCE_HWM:
+        return True
+    _CONSOLE_NONCE_HWM = nonce
+    _CONSOLE_NONCES.append(nonce)
+    return False
+
+
+class _ConsoleUpdateShim:
+    """`execute()` reads only `update.message`. Giving it a real Telegram
+    Message means the console runs the IDENTICAL execution path as Telegram —
+    execute() → dispatch_turn() → run_claude() — inheriting the pause window,
+    the global concurrency slots, the rate-limit flow and the permission mode.
+    No second execution path exists."""
+    __slots__ = ("message",)
+
+    def __init__(self, message):
+        self.message = message
+
+
+async def _sessapi_send(req):
+    """POST /send — enqueue a message into a session, as if typed in Telegram."""
+    # AP-1: authenticate FIRST, before reading or parsing any body.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+
+    global _CONSOLE_LAST_SEND
+    now = time.time()
+    if now - _CONSOLE_LAST_SEND < CONSOLE_MIN_INTERVAL_S:
+        return _aw.json_response({"ok": False, "error": "rate_limited",
+                                  "retry_after": CONSOLE_MIN_INTERVAL_S}, status=429)
+
+    try:
+        body = await req.json()
+    except Exception:
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+    if not isinstance(body, dict):
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+
+    label = str(body.get("label") or "").strip()
+    text = str(body.get("message") or "").strip()
+    try:
+        nonce = int(body.get("nonce") or 0)
+    except (TypeError, ValueError):
+        nonce = 0
+
+    # Any chat/session-owner field in the body is refused outright rather than
+    # ignored: silently dropping it would let a caller believe it worked.
+    for forbidden in ("chat_id", "chat", "owner", "session_id", "id"):
+        if forbidden in body:
+            _console_audit("rejected_owner_field", label, text, forbidden)
+            return _aw.json_response(
+                {"ok": False, "error": "owner_fields_not_accepted",
+                 "detail": f"'{forbidden}' is server-bound"}, status=400)
+
+    if not label or not text:
+        return _aw.json_response({"ok": False, "error": "label_and_message_required"},
+                                 status=400)
+    if len(text) > 8000:
+        return _aw.json_response({"ok": False, "error": "message_too_long"}, status=413)
+    if nonce <= 0:
+        return _aw.json_response({"ok": False, "error": "nonce_required"}, status=400)
+    if _console_duplicate(nonce):
+        _console_audit("duplicate", label, text, f"nonce={nonce}")
+        return _aw.json_response({"ok": False, "error": "duplicate"}, status=409)
+
+    cid = _console_chat_id()
+    if not cid:
+        return _aw.json_response({"ok": False, "error": "no_bound_chat"}, status=503)
+
+    # Resolve the label ONLY within the server-bound chat.
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        _console_audit("no_such_session", label, text, f"chat_bound={cid}")
+        return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+    if session.status == "running":
+        return _aw.json_response({"ok": False, "error": "session_busy"}, status=409)
+
+    _CONSOLE_LAST_SEND = now
+    _console_audit("send", session.label, text, f"nonce={nonce} project={session.project}")
+
+    bot = req.app["bot"]
+    anchor = await bot.send_message(
+        cid, f"🖥 <b>console</b> → {esc(session.label)}\n<pre>{esc(text[:1500])}</pre>",
+        parse_mode=ParseMode.HTML)
+    SM.register_message(anchor.message_id, session.id)
+
+    async def _run():
+        try:
+            await execute(_ConsoleUpdateShim(anchor), None, text, session)
+            _console_audit("completed", session.label, text[:200], f"nonce={nonce}")
+        except Exception as ex:
+            log.error(f"console.send_failed {ex!r}")
+            _console_audit("failed", session.label, text[:200], repr(ex)[:300])
+
+    asyncio.create_task(_run())
+    return _aw.json_response({"ok": True, "label": session.label, "queued": True})
+
+
+async def _sessapi_output(req):
+    """GET /output?label= — last reply for one session, for the console to poll.
+
+    A NEW surface, reviewed against the same exclusion list as /sessions: no
+    chat_id, no session_uuid, no worktree path, no transcript, no message ids.
+    `out` is the model's reply text, which is the thing being displayed."""
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    label = str(req.query.get("label") or "").strip()
+    if not label:
+        return _aw.json_response({"ok": False, "error": "label_required"}, status=400)
+    cid = _console_chat_id()
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+    return _aw.json_response({
+        "ok": True,
+        "label": session.label,
+        "status": session.status,
+        "last_active": session.last_active,
+        "tasks": session.tasks,
+        "out": (getattr(session, "out", "") or "")[-20000:],
+    })
+
+
 async def _sessapi_start(app):
     global _SESSAPI_RUNNER
     if not BOT_SESSION_API_TOKEN:
         log.warning("session_api.disabled reason=missing_secret")
         return
     a = _aw.Application()
+    a["bot"] = app.bot
     a.router.add_get("/sessions", _sessapi_sessions)
     a.router.add_get("/metrics", _sessapi_metrics)
+    a.router.add_get("/output", _sessapi_output)
+    a.router.add_post("/send", _sessapi_send)
     runner = _aw.AppRunner(a)
     await runner.setup()
     try:
