@@ -1809,6 +1809,92 @@ async def _spawn_claude_in(cmd, cwd, session_key: str | None = None, extra_env: 
     return proc, r, e
 
 
+# ── session context notice (2I) ──────────────────────────────────────────────
+# Two sessions edited bot.py concurrently in 2G and nothing detected it; the
+# collision surfaced only when someone ran merge-tree by hand. Both notices below
+# are ADVISORY. The failure was two agents unaware of each other's INTENT, and
+# information fixes that where a lock does not - a lock on a long-lived agent
+# session blocks work with no clear owner, so its failure mode is worse than the
+# problem. See AP-8 in ADR 0001.
+_FETCH_CACHE: "dict[str, tuple[float, str]]" = {}   # repo -> (checked_at, line)
+FETCH_TTL_S = _positive_int_env("BOT_PREFLIGHT_FETCH_TTL", 900)
+FETCH_TIMEOUT_S = _positive_int_env("BOT_PREFLIGHT_FETCH_TIMEOUT", 15)
+
+
+def _cotenancy_line(session, project) -> str:
+    """Other LIVE sessions working the same project. Pure in-memory read."""
+    try:
+        others = sorted(
+            s.label for s in SM.sessions.values()
+            if s.id != session.id and getattr(s, "project", None) == project
+            and getattr(s, "label", None)
+        )
+    except Exception:
+        return ""
+    if not others:
+        return ""
+    who = ", ".join(f'"{o}"' for o in others)
+    return (f"NOTE: session{'s' if len(others) > 1 else ''} {who} "
+            f"{'are' if len(others) > 1 else 'is'} also working in {project}. "
+            "Coordinate before editing shared files.")
+
+
+def _divergence_line(repo: str) -> str:
+    """`git fetch` then one line if this repo has diverged from its upstream.
+
+    MUST NOT block session start. A network failure, a missing remote or a slow
+    fetch all degrade to SILENCE - the line is emitted only when the fetch
+    actually succeeded, so its absence never reads as "no divergence".
+    """
+    now = time.time()
+    hit = _FETCH_CACHE.get(repo)
+    if hit and (now - hit[0]) < FETCH_TTL_S:
+        return hit[1]
+    line = ""
+    try:
+        rc = subprocess.run(["git", "-C", repo, "remote"], capture_output=True,
+                            text=True, timeout=5)
+        if rc.returncode != 0 or not rc.stdout.strip():
+            _FETCH_CACHE[repo] = (now, "")          # no remote: nothing to say
+            return ""
+        f = subprocess.run(["git", "-C", repo, "fetch", "--quiet"],
+                           capture_output=True, text=True, timeout=FETCH_TIMEOUT_S)
+        if f.returncode != 0:
+            _FETCH_CACHE[repo] = (now, "")          # fetch failed: stay silent
+            return ""
+        cnt = subprocess.run(
+            ["git", "-C", repo, "rev-list", "--left-right", "--count", "@{u}...HEAD"],
+            capture_output=True, text=True, timeout=10)
+        if cnt.returncode == 0 and cnt.stdout.split():
+            behind, ahead = (cnt.stdout.split() + ["0", "0"])[:2]
+            if behind != "0" or ahead != "0":
+                files = subprocess.run(
+                    ["git", "-C", repo, "diff", "--name-only", "HEAD...@{u}"],
+                    capture_output=True, text=True, timeout=10)
+                touched = [x for x in files.stdout.split() if x][:4]
+                extra = f" — upstream touches {', '.join(touched)}" if touched else ""
+                line = (f"NOTE: upstream is {behind} commit(s) ahead and this branch "
+                        f"is {ahead} ahead (fetched just now){extra}.")
+    except Exception:
+        line = ""                                    # never block on this
+    _FETCH_CACHE[repo] = (now, line)
+    return line
+
+
+async def _session_context_note(session, project, repo) -> str:
+    """Advisory preamble. Empty string when there is nothing to say."""
+    parts = [_cotenancy_line(session, project)]
+    try:
+        parts.append(await asyncio.wait_for(
+            asyncio.to_thread(_divergence_line, repo), timeout=FETCH_TIMEOUT_S + 10))
+    except Exception:
+        pass                                         # degrade to silence
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    return "[SESSION CONTEXT]\n" + "\n".join(parts) + "\n\n"
+
+
 async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
     """Invoke Claude Code for a session inside a per-session git worktree.
 
@@ -1865,7 +1951,11 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                             copied.append(d)
                     if copied:
                         fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-                full_prompt = prompt + fnote
+                # Advisory context: co-tenant sessions and upstream divergence.
+                # Empty when there is nothing to say, so a quiet estate sees no
+                # change at all.
+                _ctx = await _session_context_note(session, project, repo)
+                full_prompt = _ctx + prompt + fnote
 
                 def build_cmd(mode, uuid_str):
                     flag = "--resume" if mode == "resume" else "--session-id"
@@ -2167,7 +2257,10 @@ async def run_codex(prompt, project, session, files=None):
                                     images.append(d)
                         if copied:
                             fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-                    full_prompt = prompt + fnote
+                    # Same advisory context as the claude path - a codex session can
+                    # collide with a claude session just as easily.
+                    _ctx = await _session_context_note(session, project, repo)
+                    full_prompt = _ctx + prompt + fnote
 
                     thread_id = session.provider_session_id or None
                     cmd = build_codex_cmd(full_prompt, model, thread_id, images)
