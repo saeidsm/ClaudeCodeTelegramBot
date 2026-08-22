@@ -22,7 +22,11 @@ import glob
 
 WORKTREE_ROOT = os.environ.get("BOT_WORKTREE_ROOT", "/tmp/claude-sessions")
 REPOS = os.environ.get("BOT_REPOS", "/opt/shahrzad-devops/repos")
-AGE_THRESHOLD_SECONDS = 24 * 3600
+# Single source of truth for "old enough to reap". Every age test below derives
+# from this - see is_active_session() check 3, which used to hardcode `-mtime -1`
+# and agreed with the old 24h value only by coincidence.
+AGE_THRESHOLD_DAYS = int(os.environ.get("BOT_WORKTREE_GC_AGE_DAYS", "8"))
+AGE_THRESHOLD_SECONDS = AGE_THRESHOLD_DAYS * 24 * 3600
 
 now = time.time()
 cleaned = 0
@@ -54,11 +58,17 @@ def is_active_session(worktree_path: str) -> bool:
     except Exception:
         pass
 
-    # 3. Check for recent file modifications (anywhere in worktree)
+    # 3. Check for recent file modifications (anywhere in worktree).
+    #    Derived from AGE_THRESHOLD_SECONDS, not hardcoded. This said `-mtime -1`,
+    #    which matched the old 24h threshold BY COINCIDENCE and would have
+    #    silently disagreed the moment the threshold moved - which is exactly
+    #    what raising it to 8 days does. `-newermt @<epoch>` takes an absolute
+    #    cutoff, so it also avoids -mtime's whole-day rounding.
     try:
+        cutoff = f"@{int(now - AGE_THRESHOLD_SECONDS)}"
         result = subprocess.run(
             ["find", worktree_path, "-type", "f", "-not", "-path", "*/.git/*",
-             "-mtime", "-1", "-print", "-quit"],
+             "-newermt", cutoff, "-print", "-quit"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0 and result.stdout.strip():
