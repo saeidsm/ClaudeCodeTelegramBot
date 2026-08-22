@@ -4,7 +4,8 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars, tempfile
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -2530,7 +2531,11 @@ async def _rate_limit_flow(prompt, project, session, files=None):
 # ═══════════════════════════════════════════
 #  Gemini: Transcribe + Refine
 # ═══════════════════════════════════════════
-async def transcribe(path):
+async def transcribe(path, mime="audio/ogg"):
+    """Transcribe a voice file. `mime` is a parameter because the browser's
+    MediaRecorder emits audio/webm;codecs=opus while Telegram sends audio/ogg -
+    the same function serves both ends, so there is one STT path and one prompt
+    file to fix Farsi errors in."""
     if not GEMINI_OK: return None
     try:
         cfg = load_prompts().get("transcribe", {})
@@ -2539,7 +2544,7 @@ async def transcribe(path):
             model=cfg.get("model", "gemini-3.7-flash"),
             contents=[{"role": "user", "parts": [
                 {"text": cfg.get("prompt", "Transcribe this voice message.")},
-                {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(data).decode()}}
+                {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
             ]}])
         return r.text.strip()
     except Exception as e:
@@ -5867,7 +5872,21 @@ def _agent_load():
     same failure class as a log that misses successes. Counts only; no command
     lines, no cwd, no session labels leave this endpoint.
     """
-    bot_n = int_n = 0
+    def _footprint_mb(pid):
+        """Pss + SwapPss. Pss counts RESIDENT pages only, so a Pss-only figure is
+        a floor that silently shrinks as the kernel evicts the very process being
+        measured. A memory figure on a swapping box needs both halves."""
+        kb = 0
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as fh:
+                for line in fh:
+                    if line.startswith("Pss:") or line.startswith("SwapPss:"):
+                        kb += int(line.split()[1])
+        except OSError:
+            pass
+        return kb // 1024
+
+    bot_n = int_n = bot_mb = int_mb = 0
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -5879,12 +5898,15 @@ def _agent_load():
                 in_bot = "claude-telegram-bot" in fh.read()
         except OSError:
             continue
+        mb = _footprint_mb(pid)
         if in_bot:
-            bot_n += 1
+            bot_n += 1; bot_mb += mb
         else:
-            int_n += 1
+            int_n += 1; int_mb += mb
     return {"bot": bot_n, "interactive": int_n, "total": bot_n + int_n,
-            "cap": MAX_RUNNING_AGENTS}
+            "cap": MAX_RUNNING_AGENTS,
+            "bot_mb": bot_mb, "interactive_mb": int_mb,
+            "total_mb": bot_mb + int_mb}
 
 
 async def _sessapi_metrics(req):
@@ -6021,6 +6043,224 @@ class _ConsoleUpdateShim:
 
     def __init__(self, message):
         self.message = message
+
+
+# ── voice turn (2M) ──────────────────────────────────────────────────────────
+# Push-to-talk, not conversation. Saeid holds the button, speaks as long as he
+# needs, releases. The turn runs normally. Afterwards a SECOND, SEPARATE
+# generation produces a short spoken status - never a reading of the answer.
+#
+# AUDIO RETENTION: the uploaded file is deleted immediately after transcription
+# and never enters a transcript, a log, or the audit entry. The audit records
+# that the send was voice and the transcript LENGTH - never the audio, never a
+# path to it. Raw audio of the founder talking is a category this estate has
+# never held and this does not start holding it.
+VOICE_MAX_BYTES = _positive_int_env("CONSOLE_VOICE_MAX_BYTES", 2 * 1024 * 1024)
+# TTS on the SAME key transcribe() already uses. Chosen on evidence, not docs:
+# a Farsi sentence synthesised in 7.3s, 568320 bytes of 24 kHz PCM, 11.8s long,
+# peak 26931 of 32767 - real speech. Zero new credentials, one provider for both
+# ends of the turn. Voice quality is deliberately not a criterion: this is a
+# status summary, not narration.
+VOICE_TTS_MODEL = os.environ.get("BOT_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+VOICE_TTS_VOICE = os.environ.get("BOT_TTS_VOICE", "Kore")
+
+_SPEECH_PROMPT = (
+    "You are summarising a completed agent turn so it can be READ ALOUD to the "
+    "operator in Persian. This is a status report, not the answer.\n\n"
+    "Rules:\n"
+    "- At most 60 spoken seconds (about 120 Persian words).\n"
+    "- Say what happened in one sentence.\n"
+    "- Then any question that needs a decision, asked directly.\n"
+    "- Then anything about to happen that is hard to undo.\n"
+    "- NEVER read code, file contents, paths character by character, logs, or "
+    "diffs. Naming a file is fine; reciting it is not.\n"
+    "- If the turn failed, say the reason in plain language, not the traceback.\n"
+    "- Persian, conversational, no markdown, no bullet characters.\n\n"
+    "The turn's output follows.\n\n"
+)
+
+
+async def _speech_summary(text: str, label: str, failed: bool = False) -> str:
+    """SECOND generation: a summary FOR SPEECH, not the answer itself.
+
+    Deliberately separate from the turn. It summarises; it cannot act - no tools
+    are available to it, and its output is never fed back into the session.
+    """
+    if not GEMINI_OK or not (text or "").strip():
+        return ""
+    body = text.strip()
+    if len(body) > 12000:                       # a summary needs the shape, not all of it
+        body = body[:6000] + "\n…\n" + body[-6000:]
+    prompt = _SPEECH_PROMPT + f"[session: {label}]\n" + ("[the turn FAILED]\n" if failed else "") + body
+    try:
+        # Its OWN model key, not refine's. Inheriting refine's
+        # gemini-3.1-pro-preview cost 12.8s for a 271-character summary; a flash
+        # model does the same job, because this is compression, not reasoning.
+        cfg = load_prompts().get("speech_summary", {})
+        r = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=cfg.get("model", "gemini-3.7-flash"),
+            contents=[{"role": "user", "parts": [{"text": prompt}]}])
+        return (r.text or "").strip()
+    except Exception as e:
+        log.error(f"speech summary failed: {e}")
+        return ""
+
+
+async def _synthesize(text: str):
+    """Persian TTS -> (opus_bytes, mime). Returns (None, None) on any failure:
+    the voice reply is an enhancement, never a reason for a turn to look broken.
+
+    Gemini returns raw 24 kHz mono PCM. ffmpeg transcodes to opus, which is 16x
+    smaller (568320 -> 34596 bytes measured) and directly playable by a browser.
+    """
+    if not text.strip() or not GEMINI_API_KEY:
+        return None, None
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{VOICE_TTS_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    body = {"contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig":
+                                                                 {"voiceName": VOICE_TTS_VOICE}}}}}
+    try:
+        def _call():
+            req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.load(r)
+        d = await asyncio.to_thread(_call)
+        parts = d["candidates"][0]["content"]["parts"]
+        aud = next((p for p in parts if "inlineData" in p), None)
+        if not aud:
+            return None, None
+        pcm = base64.b64decode(aud["inlineData"]["data"])
+    except Exception as e:
+        log.error(f"tts failed: {e}")
+        return None, None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
+            "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(pcm), timeout=60)
+        if out:
+            return out, "audio/ogg"
+    except Exception as e:
+        log.error(f"tts transcode failed: {e}")
+    return None, None
+
+
+async def _sessapi_voice(req):
+    """POST /voice — audio in, transcript out, and the turn enqueued.
+
+    A VOICE SEND IS STILL A SEND: same auth, same CSRF header at the edge, same
+    rate limit, same nonce dedup, same audit log. It does not get a second,
+    weaker door because it arrives as bytes instead of text.
+    """
+    # AP-1: authenticate BEFORE reading or parsing any body.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+
+    global _CONSOLE_LAST_SEND
+    now = time.time()
+    if now - _CONSOLE_LAST_SEND < CONSOLE_MIN_INTERVAL_S:
+        return _aw.json_response({"ok": False, "error": "rate_limited",
+                                  "retry_after": CONSOLE_MIN_INTERVAL_S}, status=429)
+
+    label = (req.query.get("label") or "").strip()
+    if not label:
+        return _aw.json_response({"ok": False, "error": "label_required"}, status=400)
+    mime = (req.query.get("mime") or "audio/webm").strip()[:64]
+
+    body = await req.read()
+    if not body:
+        return _aw.json_response({"ok": False, "error": "empty_audio"}, status=400)
+    if len(body) > VOICE_MAX_BYTES:
+        return _aw.json_response({"ok": False, "error": "audio_too_large",
+                                  "max_bytes": VOICE_MAX_BYTES,
+                                  "length_bytes": len(body)}, status=413)
+
+    # Temp file, then unlinked in `finally` whatever happens. Never under a
+    # transcript root, never named after the session.
+    fd, tmp = tempfile.mkstemp(prefix="voice-", suffix=".bin")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        text = await transcribe(tmp, mime=mime)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    del body
+
+    if not text:
+        return _aw.json_response({"ok": False, "error": "transcription_failed"}, status=502)
+
+    text_bytes = len(text.encode("utf-8"))
+    if text_bytes > CONSOLE_MAX_MESSAGE_BYTES:
+        return _aw.json_response({
+            "ok": False, "error": "message_too_long",
+            "detail": (f"the transcript is {text_bytes} bytes, over the "
+                       f"{CONSOLE_MAX_MESSAGE_BYTES}-byte limit. Say less per turn."),
+            "transcript": text[:400], "length_bytes": text_bytes,
+            "max_bytes": CONSOLE_MAX_MESSAGE_BYTES}, status=413)
+
+    # Chat-bound lookup, identical to /send. The label is a hint; the CHAT is
+    # server-bound. A body- or query-supplied owner is a claim, not a credential.
+    cid = _console_chat_id()
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        _console_audit("no_such_session", label, "<voice>", f"chat_bound={cid}")
+        return _aw.json_response({"ok": False, "error": "unknown_session"}, status=404)
+
+    _CONSOLE_LAST_SEND = now
+    # Audit: the fact it was voice and how long the transcript was. Not the audio.
+    _console_audit("voice_send", label, f"<voice transcript, {text_bytes} bytes>", "voice")
+
+    anchor = await bot.send_message(
+        chat_id=cid, text=f"🎙️ <b>{session.label}</b> — voice", parse_mode=ParseMode.HTML)
+    SM.register_message(anchor.message_id, session.id)
+
+    async def _run():
+        try:
+            await execute(_ConsoleUpdateShim(anchor), None, text, session)
+        except Exception as ex:
+            log.error(f"voice send failed: {ex}")
+    asyncio.create_task(_run())
+    return _aw.json_response({"ok": True, "label": label, "transcript": text,
+                              "length_bytes": text_bytes})
+
+
+async def _sessapi_speak(req):
+    """GET /speak?label= — the spoken status for a session's last turn.
+
+    Generated on demand rather than pushed, because the console already polls
+    and a turn takes minutes. Two calls: summarise, then synthesise.
+    """
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    label = (req.query.get("label") or "").strip()
+    cid = _console_chat_id()
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        return _aw.json_response({"ok": False, "error": "unknown_session"}, status=404)
+    out = _scrub_secrets(getattr(session, "out", "") or "")
+    if not out.strip():
+        return _aw.json_response({"ok": False, "error": "no_output"}, status=404)
+    failed = getattr(session, "status", "") == "error"
+    summary = await _speech_summary(out, label, failed=failed)
+    if not summary:
+        return _aw.json_response({"ok": False, "error": "summary_failed"}, status=502)
+    if req.query.get("text_only") == "1":
+        return _aw.json_response({"ok": True, "summary": summary})
+    audio, mime = await _synthesize(summary)
+    if not audio:
+        # Degrade to text: the operator still gets the summary, just silently.
+        return _aw.json_response({"ok": True, "summary": summary, "audio": False})
+    return _aw.Response(body=audio, content_type=mime,
+                        headers={"X-Voice-Summary-Len": str(len(summary))})
 
 
 async def _sessapi_send(req):
@@ -6356,6 +6596,8 @@ async def _sessapi_start(app):
     a.router.add_get("/mcp", _sessapi_mcp)
     a.router.add_get("/models", _sessapi_models)
     a.router.add_post("/send", _sessapi_send)
+    a.router.add_post("/voice", _sessapi_voice)
+    a.router.add_get("/speak", _sessapi_speak)
     a.router.add_post("/control", _sessapi_control)
     runner = _aw.AppRunner(a)
     await runner.setup()
