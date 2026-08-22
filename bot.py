@@ -5857,6 +5857,36 @@ def _read_cpu_times():
     return idle, sum(vals)
 
 
+def _agent_load():
+    """Claude sessions split by whether the concurrency permit governs them.
+
+    MAX_RUNNING_AGENTS is a BOT cap, not a box cap. A `claude` started from a
+    terminal is a full session that counts against neither the permit nor the
+    unit's MemoryMax, because it runs in user.slice rather than the bot's own
+    cgroup. Reporting only the governed half would understate real load - the
+    same failure class as a log that misses successes. Counts only; no command
+    lines, no cwd, no session labels leave this endpoint.
+    """
+    bot_n = int_n = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                if fh.read().strip() != "claude":
+                    continue
+            with open(f"/proc/{pid}/cgroup") as fh:
+                in_bot = "claude-telegram-bot" in fh.read()
+        except OSError:
+            continue
+        if in_bot:
+            bot_n += 1
+        else:
+            int_n += 1
+    return {"bot": bot_n, "interactive": int_n, "total": bot_n + int_n,
+            "cap": MAX_RUNNING_AGENTS}
+
+
 async def _sessapi_metrics(req):
     """Host resource snapshot for the console (phase 2A / W2).
 
@@ -5912,6 +5942,7 @@ async def _sessapi_metrics(req):
                  "used": disk_total - disk_free,
                  "percent": pct(disk_total - disk_free, disk_total)},
         "uptime_s": uptime_s,
+        "agents": _agent_load(),
         "ts": time.time(),
     })
 
