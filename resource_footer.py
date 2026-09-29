@@ -1,6 +1,6 @@
 """Compact cached resource footer (Phase 2 §J).
 
-Appends ``RAM available/total | Swap free/total | Disk free/total`` to primary
+Appends ``RAM <avail> free/<total> · Swap <free> free/<total> · Disk <free> free/<total>`` to primary
 user-visible responses. Reads ``/proc/meminfo`` + ``os.statvfs`` (no subprocess
 per message), caches 5–10s, is HTML-safe and Telegram-length-aware, and is
 idempotent so edits/reports never get a doubled footer.
@@ -73,9 +73,10 @@ def _compute() -> str:
     swap_total = mem.get("SwapTotal", 0)
     disk_path = os.environ.get("BOT_DATA_ROOT") or "/"
     disk_free, disk_total = _disk(disk_path)
-    return (f"{FOOTER_MARK} RAM {_human(ram_avail)}/{_human(ram_total)} · "
-            f"Swap {_human(swap_free)}/{_human(swap_total)} · "
-            f"Disk {_human(disk_free)}/{_human(disk_total)}")
+    # "free" is spelled out: "Swap 6.5G/8.0G" was read as 6.5 GB USED (2026-09-29) when it meant free.
+    return (f"{FOOTER_MARK} RAM {_human(ram_avail)} free/{_human(ram_total)} · "
+            f"Swap {_human(swap_free)} free/{_human(swap_total)} · "
+            f"Disk {_human(disk_free)} free/{_human(disk_total)}")
 
 
 def footer_text(now: float | None = None) -> str:
