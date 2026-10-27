@@ -30,6 +30,7 @@ import coordination as coord
 import resource_footer
 from engines.project_context import project_context, validate_codex_project
 from engines import claude_gateway
+import mcp_bridge
 
 from telegram import (
     Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -651,6 +652,10 @@ class Session:
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
     claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
+    # Branch the session's worktrees spawn from. Persisted (additive, v1
+    # state schema) so a restart cannot silently re-bind a resumed session
+    # to a different branch; the MCP bridge relies on this binding.
+    starting_branch: str = "main"
     # Why this session is in its current status. "error" alone is ambiguous:
     # until phase 2D it was set ONLY by a restart, never by a real failure, so a
     # console "show me the error" button would have had nothing to show.
@@ -1373,6 +1378,11 @@ class WorktreeSession:
         self._canonical = None
         self._owner_token = None
         self._lifecycle_barrier = None  # spans claim -> real completion of enter-cleanup or exit
+        # Set by mcp_bridge._TurnCapture when the pre-cleanup delta capture
+        # could NOT be proven complete on a dirty tree: the exit then leaves
+        # the worktree on disk (next same-session enter does stale_cleanup)
+        # instead of rm -rf-ing uncommitted work away.
+        self.preserve_on_exit = False
 
     def _enter_sync(self):
         if not self.is_git:
@@ -1385,13 +1395,34 @@ class WorktreeSession:
                      f"sid={self.session_id} type=non-git")
             return self.worktree_path
 
-        # Idempotent enter: clean up any stale dir from a previous crash
+        # Idempotent enter: clean up any stale dir from a previous crash.
+        # C1 (post-review): a stale dir may be a tree preserved by
+        # preserve_on_exit (capture unproven) — it is still uncommitted
+        # work. It is removed ONLY after a proven capture; otherwise it is
+        # quarantined under the session's capture root, never rm -rf'd.
         if os.path.exists(self.worktree_path):
-            log.warning(f"worktree.stale_cleanup path={self.worktree_path}")
+            cap = mcp_bridge.capture_worktree_delta(self.worktree_path, self.session_id)
+            if cap.dirty and not cap.ok:
+                q = mcp_bridge.quarantine_stale_worktree(self.worktree_path, self.session_id)
+                if not q:
+                    # Quarantine failed (disk?): fail LOUD — a visible failed
+                    # turn beats silent data loss. Never the destructive path.
+                    raise RuntimeError(
+                        f"worktree.stale_capture_unproven sid={self.session_id} "
+                        f"path={self.worktree_path} quarantine_failed; refusing to remove")
+                log.warning(f"worktree.stale_dirty_kept sid={self.session_id} "
+                            f"quarantine={q} (capture unproven; tree moved aside)")
+            else:
+                log.warning(f"worktree.stale_cleanup path={self.worktree_path} "
+                            f"capture={'clean' if not cap.dirty else 'ok'}")
             subprocess.run(
-                ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
+                ["git", "-C", self.project_path, "worktree", "prune"],
                 capture_output=True, timeout=30)
-            subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True)
+            if not (cap.dirty and not cap.ok):
+                subprocess.run(
+                    ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
+                    capture_output=True, timeout=30)
+                subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True)
 
         # Fetch latest (best-effort — don't fail spawn on network blip)
         try:
@@ -1430,6 +1461,14 @@ class WorktreeSession:
         return self.worktree_path
 
     def _exit_sync(self, exc_type, exc_val, exc_tb):
+        if self.preserve_on_exit:
+            # The pre-cleanup capture could not prove it saved the dirty
+            # tree. Losing uncommitted work to a failed safety net is the
+            # exact failure this flag exists to prevent — leave the tree
+            # in place (the next same-session enter does stale_cleanup).
+            log.warning(f"worktree.preserved_dirty sid={self.session_id} "
+                        f"path={self.worktree_path} (capture unproven; NOT removed)")
+            return False
         if not os.path.exists(self.worktree_path):
             return False
 
@@ -1956,7 +1995,12 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
         # this; the rate-limit retry re-enters run_claude as a fresh, non-nested
         # acquisition after the first run already released its permit.
         async with execution_slot(session.id, session):
-            async with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+            # _wt captured by name so TurnCapture can mark preserve_on_exit.
+            # TurnCapture is the INNER context: its __aexit__ runs BEFORE
+            # WorktreeSession's, so the uncommitted delta is durably saved
+            # (or the tree explicitly preserved) before any rm -rf.
+            _wt = WorktreeSession(repo, starting_branch, sid_safe)
+            async with _wt as wt_path, mcp_bridge.TurnCapture(_wt, wt_path, session.id):
                 await _coord.running(wt_path)   # -> 'running' + safe worktree view
                 # Copy uploaded files INSIDE the worktree (not the shared repo)
                 fnote = ""
@@ -2687,7 +2731,7 @@ def _report_slug(name: str) -> str:
 
 
 def _build_report(reports_dir: str, report_url: str, name: str, content: str,
-                  slug: "str | None" = None) -> ReportResult:
+                  slug: "str | None" = None, include_dir: "str | None" = None) -> ReportResult:
     """Pure, synchronous report builder (no event loop, no external `zip`).
 
     Writes summary.txt (UTF-8), builds the ZIP to a temp path via zipfile and
@@ -2714,6 +2758,18 @@ def _build_report(reports_dir: str, report_url: str, name: str, content: str,
     except Exception as ex:
         log.error(f"make_report.summary_failed slug={slug}: {ex}")
         return ReportResult("error", OrderedDict(), slug, f"summary error: {ex}")
+
+    # Optional captured worktree delta (MCP bridge / TurnCapture): copied
+    # BEFORE the ZIP is built, so the archive carries reviewable output —
+    # status.porcelain, diff.patch, bounded changed files, sha256 manifest —
+    # not a lone summary.txt. Server-derived path (captures root), never
+    # caller input. A failed copy downgrades the report, it never raises:
+    # the capture dir itself stays on disk as the durable copy.
+    if include_dir and os.path.isdir(include_dir):
+        try:
+            shutil.copytree(include_dir, os.path.join(rd, "capture"), dirs_exist_ok=True)
+        except Exception as ex:
+            log.error(f"make_report.capture_copy_failed slug={slug}: {ex}")
 
     # Build ZIP to a temp path, verify, then atomically move into place.
     final_zip = os.path.join(reports_dir, f"{slug}.zip")
@@ -2748,17 +2804,30 @@ def _build_report(reports_dir: str, report_url: str, name: str, content: str,
     return ReportResult("ok", links, slug)
 
 
-async def make_report(name, content) -> ReportResult:
+async def make_report(name, content, include_dir: "str | None" = None) -> ReportResult:
     """Create a report (summary + verified ZIP) and return a ReportResult.
 
     Never raises: on failure the caller still sends a message (via fmt_links),
     just without a ZIP link. The filesystem/zip work runs in a worker thread so
     the Telegram event loop is never blocked."""
     try:
-        return await asyncio.to_thread(_build_report, REPORTS, REPORT_URL, name, content)
+        return await asyncio.to_thread(_build_report, REPORTS, REPORT_URL, name, content,
+                                       None, include_dir)
     except Exception as ex:
         log.error(f"make_report.error name={name}: {ex}")
         return ReportResult("error", OrderedDict(), "", str(ex))
+
+
+async def _report_for_session(session) -> ReportResult:
+    """ONE report builder for both transports: summary (the session's last
+    output) + the session's latest captured worktree delta, so the ZIP is
+    reviewable (status/diff/changed files/sha256 manifest), never a lone
+    summary.txt. Telegram's do:report and the MCP report tool both route
+    through here. The summary text is scrubbed with the SAME _scrub_secrets
+    the /output and /speak routes use (M3 after review: the report path fed
+    raw session.out into a ZIP served over HTTP)."""
+    return await make_report(f"{session.project}-task", _scrub_secrets(getattr(session, "out", "") or ""),
+                             include_dir=mcp_bridge.latest_capture_dir(session.id))
 
 # ═══════════════════════════════════════════
 #  Send
@@ -4110,7 +4179,7 @@ async def on_callback(u, c):
     elif d == "do:report":
         if not session or not session.out:
             await c.bot.send_message(cid, "📭 No output."); return
-        lnk = await make_report(f"{session.project}-task", session.out)
+        lnk = await _report_for_session(session)
         sent = await c.bot.send_message(cid,
             f"{session_prefix(session)} | 📦 <b>Report</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_links(lnk)}\n\n💡 <i>Copy Summary → paste in Claude Chat</i>",
             parse_mode=ParseMode.HTML)
@@ -5084,7 +5153,7 @@ async def _flush_buffer(cid: int, context):
 _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
-    "tasks", "claude_created", "claude_model",
+    "tasks", "claude_created", "claude_model", "starting_branch",
     # Phase 2 multi-engine fields (absent in old state → safe defaults)
     "engine", "model", "provider_session_id", "chat_history_ref",
     # Phase 2D: why a session is in its status. Persisting the reason is the
@@ -5198,6 +5267,10 @@ def load_state():
                 model=s.get("model", ""),
                 provider_session_id=s.get("provider_session_id", ""),
                 chat_history_ref=s.get("chat_history_ref", ""),
+                # MCP bridge: restart-safe branch binding. Old state lacks
+                # the field → "main", which is what run_claude already
+                # assumed for every pre-bridge session (no behavior change).
+                starting_branch=s.get("starting_branch", "main"),
             )
             # Migration safety: a restored Chat history path is trusted only if it
             # still passes canonical/no-symlink containment; otherwise replace it
@@ -5799,6 +5872,13 @@ BOT_SESSION_API_PORT = _positive_int_env("BOT_SESSION_API_PORT", 9092)
 # explicit ufw allow (see docs/phase0/a3-*.md for the proposed rule). Same
 # posture as gfrc (:8088) and hermes-dashboard (:8642).
 BOT_SESSION_API_BIND = os.environ.get("BOT_SESSION_API_BIND", "172.17.0.1").strip()
+# ── MCP bridge (owner pilot; docs/MCP_BRIDGE.md) ────────────────────────────
+# OFF by default: activation is an explicit deploy decision (set the env in
+# the unit, restart). Scope is intersected with the registered projects and
+# the bound console chat at every write; Telegram and MCP share ONE
+# SessionManager, ONE execution_slot cap and ONE nonce/rate budget.
+BOT_MCP_ENABLED = os.environ.get("BOT_MCP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+BOT_MCP_PROJECTS = os.environ.get("BOT_MCP_PROJECTS", mcp_bridge.MCP_DEFAULT_PROJECTS)
 _SESSAPI_RUNNER = None
 
 
@@ -5888,6 +5968,11 @@ def _schedule_model_refresh():
 
 def _sessapi_authorized(req) -> bool:
     token = req.headers.get("X-Session-API-Token", "")
+    if not token:
+        # MCP clients send standard Authorization: Bearer — same secret, no
+        # new key. Compare with the SAME timing-safe path, never a fallback.
+        auth = req.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
     return bool(token) and bool(BOT_SESSION_API_TOKEN) and hmac.compare_digest(
         token.encode(), BOT_SESSION_API_TOKEN.encode())
 
@@ -6722,6 +6807,56 @@ async def _sessapi_models(req):
     })
 
 
+# ── MCP bridge wiring (owner pilot; docs/MCP_BRIDGE.md) ─────────────────────
+_MCP_NONCE_SEQ = None
+
+
+def _mcp_next_nonce() -> int:
+    """Monotonic per-process nonce for bridge-initiated console writes
+    (session_new). Same HWM namespace as console/client nonces, so the
+    generator must TRACK THE CLOCK, not just count (M1 after review): a
+    plain count seeded once falls behind real time and gets poisoned by
+    any client that sent its own epoch-ms nonce, after which every
+    session_new fails as 'duplicate'. Clock-tracked: never below now."""
+    global _MCP_NONCE_SEQ
+    now_ms = int(time.time() * 1000)
+    if _MCP_NONCE_SEQ is None or _MCP_NONCE_SEQ < now_ms:
+        _MCP_NONCE_SEQ = now_ms
+    else:
+        _MCP_NONCE_SEQ += 1
+    return _MCP_NONCE_SEQ
+
+
+def _mcp_model_metadata(session) -> dict:
+    """Requested alias vs effective model, honestly separated (phase-2 rule:
+    unknown stays unknown). The alias is passed through to the CLI verbatim —
+    the bot never rewrites or pins it. 'effective' is claimed ONLY when the
+    gateway config itself maps the alias; a full model id or an unmapped
+    alias stays null with its evidence status. Billing is never guessed."""
+    requested = (getattr(session, "claude_model", "") or BOT_DEFAULT_CLAUDE_MODEL or "")
+    effective = None
+    route = None
+    try:
+        if claude_gateway.settings():
+            route = "openrouter-gateway"
+            effective = claude_gateway.configured_models().get(requested, "") or None
+    except Exception:
+        route = effective = None
+    return {"engine": getattr(session, "engine", "claude"),
+            "requested_alias": requested,
+            "effective_model": effective,
+            "provider_route": route,
+            "route_evidence": "gateway config" if route else "unverified",
+            "billing_source": "unknown"}
+
+
+async def _sessapi_mcp_rpc(req):
+    """POST /mcp/rpc — MCP streamable-HTTP envelope. Auth and dispatch live
+    in mcp_bridge (same token as every console route, no new credential);
+    every tool call lands in the SAME console handlers as Telegram."""
+    return await mcp_bridge.handle_http(req)
+
+
 async def _sessapi_start(app):
     global _SESSAPI_RUNNER
     if not BOT_SESSION_API_TOKEN:
@@ -6738,6 +6873,30 @@ async def _sessapi_start(app):
     a.router.add_post("/voice", _sessapi_voice)
     a.router.add_get("/speak", _sessapi_speak)
     a.router.add_post("/control", _sessapi_control)
+    if BOT_MCP_ENABLED:
+        # Owner-only MCP bridge on the SAME app/token/manager/queue. Wired
+        # here (not at import) so the handlers exist and the bot instance is
+        # bound; every dep is a bot.py-owned callable so the bridge stays
+        # logic-free and unit-testable with fakes.
+        mcp_bridge.wire({
+            "token": BOT_SESSION_API_TOKEN,
+            "authorized": _sessapi_authorized,
+            "send": _sessapi_send, "control": _sessapi_control,
+            "output": _sessapi_output, "sessions": _sessapi_sessions,
+            "models": _sessapi_models,
+            "lookup_session": _console_session,
+            "cancel_tasks": CONC.cancel_session_tasks,
+            "project_names": get_project_names,
+            "next_nonce": _mcp_next_nonce,
+            "report_for": _report_for_session,
+            "model_metadata": _mcp_model_metadata,
+            "audit": _console_audit,
+            "mcp_projects": BOT_MCP_PROJECTS,
+            "bot": app.bot,
+        })
+        a.router.add_post("/mcp/rpc", _sessapi_mcp_rpc)
+        log.info(f"mcp_bridge.enabled projects={BOT_MCP_PROJECTS} engine=claude "
+                  f"cancel=queued-only")
     runner = _aw.AppRunner(a)
     await runner.setup()
     try:
