@@ -6813,15 +6813,20 @@ _MCP_NONCE_SEQ = None
 
 def _mcp_next_nonce() -> int:
     """Monotonic per-process nonce for bridge-initiated console writes
-    (session_new). Same HWM namespace as console/client nonces, so the
-    generator must TRACK THE CLOCK, not just count (M1 after review): a
-    plain count seeded once falls behind real time and gets poisoned by
-    any client that sent its own epoch-ms nonce, after which every
-    session_new fails as 'duplicate'. Clock-tracked: never below now."""
+    (session_new / ask-create). Same HWM namespace as console/client
+    nonces, so the generator must TRACK BOTH the clock and the console
+    high-water mark (M1 after review): a plain count seeded once falls
+    behind real time and gets poisoned by any client that sent its own
+    epoch-ms nonce, after which every session_new fails as 'duplicate'.
+    Clock+HWM-tracked: never below now, never below an accepted nonce."""
     global _MCP_NONCE_SEQ
-    now_ms = int(time.time() * 1000)
-    if _MCP_NONCE_SEQ is None or _MCP_NONCE_SEQ < now_ms:
-        _MCP_NONCE_SEQ = now_ms
+    floor = max(int(time.time() * 1000), _CONSOLE_NONCE_HWM)
+    if _MCP_NONCE_SEQ is None:
+        _MCP_NONCE_SEQ = floor
+    elif _MCP_NONCE_SEQ < floor:
+        # strictly ABOVE the floor: _console_duplicate refuses <= HWM, so a
+        # landing-on-the-floor value would be refused as a duplicate itself.
+        _MCP_NONCE_SEQ = floor + 1
     else:
         _MCP_NONCE_SEQ += 1
     return _MCP_NONCE_SEQ

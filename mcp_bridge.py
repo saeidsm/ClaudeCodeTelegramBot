@@ -354,6 +354,12 @@ _TOOLS = [
      "inputSchema": {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}},
     {"name": "report", "description": "Build the report ZIP: summary + latest captured worktree delta (status/diff/changed files/sha256 manifest).",
      "inputSchema": {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}},
+    {"name": "ask", "description": "Ask a question without managing sessions: routed to an existing in-scope session, or one is created (same scope rules as session_new) and the question is submitted to it. State: follow up with status/report by the same label.",
+     "inputSchema": {"type": "object", "required": ["label", "project", "message"],
+                     "properties": {"label": {"type": "string"}, "project": {"type": "string"},
+                                    "message": {"type": "string"}, "model": {"type": "string"},
+                                    "nonce": {"type": "integer",
+                                              "description": "Optional. Epoch milliseconds, strictly increasing per client; supply it to make an exact replay of this ask a refused duplicate. Generated (clock-tracked) when absent."}}}},
 ]
 
 
@@ -431,6 +437,50 @@ async def _tool_send(a: dict) -> dict:
     return _tool_text(payload, status)
 
 
+async def _tool_ask(a: dict) -> dict:
+    """Q&A in v1 (owner item 2/7): ask WITHOUT managing sessions. The question
+    is routed through the same two seams every other tool uses — no new logic
+    beside them:
+      - an existing IN-SCOPE claude session with that label -> _sessapi_send;
+      - no such session -> _sessapi_control action:new (same scope/engine
+        gates as session_new), then the question is submitted to it.
+    So the answer lands in the session's normal output (status/report), the
+    question goes through the SAME rate limit, nonce dedup and audit as a
+    console/Telegram turn, and nothing new is reachable that send +
+    session_new could not already reach. Same-key duplicate questions do not
+    re-run: the create nonce is generated, the send nonce is the caller's."""
+    label = str(a.get("label") or "").strip()
+    _, session = _DEPS["lookup_session"](label)
+    if session is None:
+        project = str(a.get("project") or "").strip()
+        if project not in _allowed_projects():
+            return _tool_text({"ok": False, "error": "POLICY_DENIED",
+                               "detail": f"project '{project}' is not in the MCP pilot scope",
+                               "allowed": _allowed_projects()}, 403)
+        body = {"action": "new", "label": label, "project": project,
+                "engine": "claude", "model": a.get("model") or "",
+                "nonce": _DEPS["next_nonce"]()}
+        status, payload = await _call(_DEPS["control"], body)
+        if status >= 400 or not payload.get("ok", True):
+            return _tool_text(payload, status)
+    err = _scope_error(_DEPS["lookup_session"](label)[1])
+    if err:
+        return _tool_text({"ok": False, "error": err[0], "detail": err[2]}, err[1])
+    # Caller nonce dedups the turn (same-key duplicate = refused below the
+    # HWM); generated fresh when absent so ask works without a nonce too.
+    nonce = a.get("nonce")
+    body = {"label": label, "message": a.get("message"),
+            "nonce": nonce if isinstance(nonce, int) and nonce > 0 else _DEPS["next_nonce"]()}
+    status, payload = await _call(_DEPS["send"], body)
+    if status == 409 and nonce is None:
+        # generated nonce collided (should not happen; clock-tracked) — retry once
+        body["nonce"] = _DEPS["next_nonce"]()
+        status, payload = await _call(_DEPS["send"], body)
+    payload["ask_note"] = ("answer arrives in the session output; poll `status` "
+                           "(label) or build the `report` ZIP — same as any turn")
+    return _tool_text(payload, status)
+
+
 async def _tool_status(a: dict) -> dict:
     label = str(a.get("label") or "").strip()
     _, session = _DEPS["lookup_session"](label)
@@ -482,7 +532,7 @@ _DISPATCH = {
     "projects_list": _tool_projects_list, "models_list": _tool_models_list,
     "sessions_list": _tool_sessions_list, "session_new": _tool_session_new,
     "send": _tool_send, "status": _tool_status, "cancel": _tool_cancel,
-    "report": _tool_report,
+    "report": _tool_report, "ask": _tool_ask,
 }
 
 

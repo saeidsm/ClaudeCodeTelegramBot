@@ -25,6 +25,7 @@ same objects — there is no parallel SessionManager and no second queue.
 | `status` | alias/effective model reported separately |
 | `cancel` | queued-only. A running turn answers `cancel_unavailable` (409): TERM requires proven identity+ownership+process-end, which the bridge does not claim |
 | `report` | same report pipeline as Telegram; the ZIP now carries `capture/` (status, diff, untracked files, sha256 manifest) |
+| `ask` | Q&A (owner item 2/7): the question goes to an existing in-scope session, or one is created (identical gates to `session_new`) and the question is submitted to it — both through the same `_sessapi_send`/`_sessapi_control` seams. Answer arrives in the session output: poll `status`, build `report`. Caller nonce optional (generated clock/HWM-tracked when absent; a supplied nonce dedups an exact replay) |
 
 Scope gate: **every** label-resolving tool (`send`/`status`/`cancel`/`report`)
 refuses sessions whose project is outside `BOT_MCP_PROJECTS`
@@ -34,9 +35,10 @@ a Codex session created via Telegram is visible but not drivable from MCP
 no-capture rm-rf this pilot closes).
 
 `send` with the same `nonce` never runs twice — same `_console_duplicate`
-high-water mark as the console. The bridge's own nonces (for `session_new`)
-track the wall clock, so a client that sent its own epoch-ms nonce cannot
-poison or brick later generated ones; the `nonce` schema says epoch-ms.
+high-water mark as the console. The bridge's own nonces (for `session_new`
+and `ask`'s create step) track the wall clock AND the console HWM, so a
+client that sent its own epoch-ms nonce can neither poison nor brick later
+generated ones; the `nonce` schema says epoch-ms.
 
 ## Auth
 
@@ -102,8 +104,10 @@ lazily per capture.
 
 ## Known limits (v1)
 
-- Q&A (ask-the-bot a question outside a work session) is **not** wired to
-  MCP yet; Telegram keeps it. Owner item 2 lists it for a later pass.
+- Q&A is session-scoped: `ask` routes the question through a session (new
+  or existing) — there is no stateless one-shot path in the bot, and none
+  was invented for the pilot. The answer comes back via `status`/`report`,
+  like any turn.
 - Cancel of a *running* turn is unavailable by design (no TERM without
   proven process ownership).
 - Resume binds to the same owner/session/branch/model via the existing

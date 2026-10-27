@@ -138,7 +138,7 @@ async def test_initialize_and_tools_list():
                                                   "method": "tools/list"})
     names = {t["name"] for t in json.loads(body)["result"]["tools"]}
     assert names == {"projects_list", "models_list", "sessions_list", "session_new",
-                     "send", "status", "cancel", "report"}
+                     "send", "status", "cancel", "report", "ask"}
 
 
 async def test_notification_202_and_unknown_method_error():
@@ -294,6 +294,75 @@ async def test_mcp_and_telegram_share_one_manager_and_queue(env, monkeypatch):
     assert {c[1] for c in calls["execute"]} == {s.id}, \
         "both transports must hit the SAME session in the SAME manager"
     bot.SM.kill(bot._console_chat_id(), "shared-probe")
+
+
+# ── ask (Q&A, owner item 2/7) ───────────────────────────────────────────────
+async def test_ask_routes_to_existing_session(env, monkeypatch):
+    """ask = send when the label exists (in scope): no create, same seam."""
+    calls = wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    s = bot.SM.create(bot._console_chat_id(), "qa-1")
+    s.project = "Rag4Engineers"
+    s.status = "idle"
+    _, res = await _call_tool("ask", {"label": "qa-1", "project": "Rag4Engineers",
+                                      "message": "what changed?", "nonce": bot._mcp_next_nonce() + 5})
+    await _drain()
+    p = _payload(res)
+    assert p["http_status"] == 200, p
+    assert len(calls["execute"]) == 1 and calls["execute"][0][1] == s.id, \
+        "the question must run as a normal turn in the SAME session/manager"
+    bot.SM.kill(bot._console_chat_id(), "qa-1")
+
+
+async def test_ask_creates_session_when_none_exists(env, monkeypatch):
+    """ask with no such label: same create path as session_new (scope + engine
+    gates verbatim), then the question is submitted — one turn total."""
+    calls = wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    _, res = await _call_tool("ask", {"label": "qa-2", "project": "Rag4Engineers",
+                                      "message": "one question", "nonce": bot._mcp_next_nonce() + 5})
+    await _drain()
+    p = _payload(res)
+    assert p["http_status"] == 200, p
+    _, session = bot._console_session("qa-2")
+    assert session is not None, "the session must exist after ask"
+    assert session.project == "Rag4Engineers"
+    assert session.engine == "claude"
+    assert len(calls["execute"]) == 1, "exactly one engine turn"
+    bot.SM.kill(bot._console_chat_id(), "qa-2")
+
+
+async def test_ask_refuses_out_of_scope_project(env, monkeypatch):
+    """ask inherits session_new's scope gate verbatim."""
+    calls = wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    _, res = await _call_tool("ask", {"label": "qa-3", "project": "ZigguratKids4",
+                                      "message": "x", "nonce": bot._mcp_next_nonce() + 5})
+    await _drain()
+    p = _payload(res)
+    assert p["http_status"] == 403 and p["error"] == "POLICY_DENIED", p
+    assert not calls["execute"], "no engine turn from a denied ask"
+    _, session = bot._console_session("qa-3")
+    assert session is None, "no session may be created outside the scope"
+
+
+async def test_ask_duplicate_nonce_never_reruns(env, monkeypatch):
+    """Same-key duplicate: the caller nonce dedups the question turn."""
+    calls = wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    s = bot.SM.create(bot._console_chat_id(), "qa-4")
+    s.project = "Rag4Engineers"
+    s.status = "idle"
+    args = {"label": "qa-4", "project": "Rag4Engineers",
+            "message": "same question", "nonce": bot._mcp_next_nonce() + 5}
+    _, res = await _call_tool("ask", args)
+    await _drain()
+    assert _payload(res)["http_status"] == 200
+    _, res = await _call_tool("ask", args)          # exact replay
+    await _drain()
+    assert _payload(res)["http_status"] == 409, "replayed ask nonce must be refused"
+    assert len(calls["execute"]) == 1, "duplicate ask MUST NOT run the engine twice"
+    bot.SM.kill(bot._console_chat_id(), "qa-4")
 
 
 async def test_restart_preserves_branch_and_model_binding(env, monkeypatch):
@@ -518,9 +587,9 @@ async def test_nonce_generator_tracks_the_clock(env, monkeypatch):
     # the client's value it resumes above it. (HWM is monkeypatch-scoped:
     # the module-level HWM is shared across tests in this process.)
     monkeypatch.setattr(bot, "_CONSOLE_NONCE_HWM", n1 + 10_000)   # client sent a future nonce
-    monkeypatch.setattr(bot.time, "time", lambda: t0 + 20.0)      # 20s later
-    n3 = bot._mcp_next_nonce()
-    assert n3 > bot._CONSOLE_NONCE_HWM, "after the clock passes it, nonces stay above the HWM"
+    n2b = bot._mcp_next_nonce()
+    assert n2b > bot._CONSOLE_NONCE_HWM, \
+        "the generator must never emit below a client-raised HWM (M1)"
     monkeypatch.setattr(bot, "_MCP_NONCE_SEQ", None)
 
 
