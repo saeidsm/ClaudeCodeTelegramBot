@@ -28,6 +28,8 @@ from engines.openrouter_chat import (
 )
 import coordination as coord
 import resource_footer
+from engines.project_context import project_context, validate_codex_project
+from engines import claude_gateway
 
 from telegram import (
     Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -193,8 +195,7 @@ COORDINATION_FILE = os.environ.get("BOT_COORDINATION_FILE", f"{BOT_CONFIGS_DIR}/
 # so a relative path is useless there — we inject the validated ABSOLUTE path
 # (AGENT_COORD_PUBLISHER) into the child env. BOT_COORD_PUBLISHER overrides the
 # default for non-standard deploy layouts; it is preflighted before injection.
-_COORD_PUBLISHER_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "scripts", "coord_publish.py")
+_COORD_PUBLISHER_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coord_publish.py")
 BOT_COORD_PUBLISHER = os.environ.get("BOT_COORD_PUBLISHER", "").strip() or _COORD_PUBLISHER_SRC
 CHAT_CATALOG_TTL = _positive_int_env("BOT_CHAT_CATALOG_TTL", 3600)
 CHAT_CONCURRENCY = _positive_int_env("BOT_CHAT_CONCURRENCY", 4)  # independent of heavy cap
@@ -374,12 +375,24 @@ def load_projects() -> list[dict]:
 
 
 def save_projects(projects: list[dict]):
+    temporary = None
     try:
         os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
-        with open(PROJECTS_FILE, "w") as f:
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(PROJECTS_FILE), delete=False) as f:
+            temporary = f.name
             json.dump(projects, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(PROJECTS_FILE):
+            shutil.copymode(PROJECTS_FILE, temporary)
+        os.replace(temporary, PROJECTS_FILE)
+        return True
     except Exception as e:
         log.error(f"Failed to save projects: {e}")
+        return False
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def get_project_names() -> list[str]:
@@ -401,8 +414,7 @@ def add_project(name: str, path: str) -> str | None:
     if any(p["name"] == name for p in projects):
         return "Project already exists"
     projects.append({"name": name, "path": path})
-    save_projects(projects)
-    return None
+    return None if save_projects(projects) else "Could not save project registry"
 
 
 def get_project_path(name: str) -> str:
@@ -1778,6 +1790,8 @@ async def _spawn_claude_in(cmd, cwd, session_key: str | None = None, extra_env: 
     env = {**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"}
     if extra_env:
         env.update(extra_env)
+    if os.path.basename(cmd[0]) == 'codex':
+        env = {k: v for k, v in env.items() if not k.startswith(('ANTHROPIC_', 'CLAUDE_OR_')) and k != 'CLAUDE_CODE_OAUTH_TOKEN'}
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env=env)
@@ -1841,7 +1855,14 @@ def _cotenancy_line(session, project) -> str:
 
 
 def _divergence_line(repo: str) -> str:
-    """`git fetch` then one line if this repo has diverged from its upstream.
+    """One line about the SHARED CLONE's own branch — never about the session.
+
+    The session worktree is created detached at origin/<branch>, so its own
+    divergence is always 0/0 and saying so is noise. What IS worth one line is
+    stranded work: local commits on the clone's branch that origin does not
+    have. The «behind» count is deliberately NOT printed — this clone is
+    fetched --depth=50 and rev-list over a shallow history reports the shallow
+    boundary, not a distance (DL-249).
 
     MUST NOT block session start. A network failure, a missing remote or a slow
     fetch all degrade to SILENCE - the line is emitted only when the fetch
@@ -1864,18 +1885,16 @@ def _divergence_line(repo: str) -> str:
             _FETCH_CACHE[repo] = (now, "")          # fetch failed: stay silent
             return ""
         cnt = subprocess.run(
-            ["git", "-C", repo, "rev-list", "--left-right", "--count", "@{u}...HEAD"],
+            ["git", "-C", repo, "rev-list", "--count", "@{u}..HEAD"],
             capture_output=True, text=True, timeout=10)
-        if cnt.returncode == 0 and cnt.stdout.split():
-            behind, ahead = (cnt.stdout.split() + ["0", "0"])[:2]
-            if behind != "0" or ahead != "0":
-                files = subprocess.run(
-                    ["git", "-C", repo, "diff", "--name-only", "HEAD...@{u}"],
-                    capture_output=True, text=True, timeout=10)
-                touched = [x for x in files.stdout.split() if x][:4]
-                extra = f" — upstream touches {', '.join(touched)}" if touched else ""
-                line = (f"NOTE: upstream is {behind} commit(s) ahead and this branch "
-                        f"is {ahead} ahead (fetched just now){extra}.")
+        br = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+        if cnt.returncode == 0 and cnt.stdout.strip().isdigit():
+            ahead = cnt.stdout.strip()
+            if ahead != "0":
+                line = (f"NOTE: the shared clone at {repo} has {ahead} local commit(s) "
+                        f"on '{br}' that origin does not have (stranded work). This is "
+                        f"NOT about your worktree, which is detached at origin.")
     except Exception:
         line = ""                                    # never block on this
     _FETCH_CACHE[repo] = (now, line)
@@ -1958,10 +1977,12 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                 _ctx = await _session_context_note(session, project, repo)
                 full_prompt = _ctx + prompt + fnote
 
+                gateway_config = claude_gateway.settings()
+                executable, chosen_model = claude_gateway.launch(
+                    session.claude_model if gateway_config else session.claude_model or BOT_DEFAULT_CLAUDE_MODEL)
                 def build_cmd(mode, uuid_str):
                     flag = "--resume" if mode == "resume" else "--session-id"
-                    cmd = ["claude", "--print"]
-                    chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
+                    cmd = [executable, "--print"]
                     if chosen_model:
                         cmd += ["--model", chosen_model]
                     # Permission mode: skip / allowlist / strict
@@ -1985,7 +2006,7 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                 mode = "resume" if session.claude_created else "create"
                 cmd = build_cmd(mode, session.session_uuid)
                 log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
-                         f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                         f"model={chosen_model or 'default'} provider={'openrouter' if gateway_config else 'anthropic'} "
                          f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
                 proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id, extra_env=_coord_env(session))
@@ -2016,6 +2037,14 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                     session.claude_created = True
 
                 USAGE.record(len(full_prompt), len(r), session.label)
+
+                if proc.returncode != 0 and gateway_config:
+                    # Child-only credentials are not in the parent's scrubber.
+                    # Never echo raw gateway errors or trigger subscription retries.
+                    message = claude_gateway.failure_message(r + e)
+                    session.status_reason = 'execution_failed'
+                    session.error_text = message
+                    return message
 
                 # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
                 # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
@@ -2226,13 +2255,10 @@ async def run_codex(prompt, project, session, files=None):
     adapter module. First turn captures ``thread.started``; later turns resume it.
     """
     repo = get_project_path(project)
-    if not os.path.isdir(repo):
-        repo = f"{REPOS}/{project}"
-    if not os.path.isdir(repo):
-        try:
-            os.makedirs(repo, exist_ok=True)
-        except Exception as e:
-            return f"❌ Not found: {project}\nCould not create: {e}"
+    try:
+        validate_codex_project(repo)
+    except ValueError as exc:
+        return f'❌ {exc}'
 
     starting_branch = getattr(session, 'starting_branch', 'main')
     sid_safe = session.id.replace(':', '_')
@@ -2261,10 +2287,31 @@ async def run_codex(prompt, project, session, files=None):
                     # Same advisory context as the claude path - a codex session can
                     # collide with a claude session just as easily.
                     _ctx = await _session_context_note(session, project, repo)
-                    full_prompt = _ctx + prompt + fnote
+                    full_prompt = _ctx + project_context(project, repo, load_projects(), BOT_CONFIGS_DIR) + prompt + fnote
 
                     thread_id = session.provider_session_id or None
                     cmd = build_codex_cmd(full_prompt, model, thread_id, images)
+                    # RAG_CODEX_SCOPED_ACCESS_V1
+                    if os.path.realpath(repo) == "/opt/alumglass-rag":
+                        _rag_roots = [
+                            "/opt/alumglass-rag/.git",
+                            "/opt/shahrzad-devops/reports",
+                            "/mnt/devopsstorage/alumglass-rag/handoffs",
+                        ]
+                        _rag_flags = [
+                            "-c", "sandbox_workspace_write.network_access=true",
+                            "-c", "sandbox_workspace_write.writable_roots="
+                                  + json.dumps(_rag_roots),
+                        ]
+                        for _key, _value in _coord_env(session).items():
+                            if _key.startswith("AGENT_COORD_"):
+                                _rag_flags += [
+                                    "-c",
+                                    "shell_environment_policy.set."
+                                    + _key + "=" + json.dumps(_value),
+                                ]
+                        _rag_pos = cmd.index("--json")
+                        cmd[_rag_pos:_rag_pos] = _rag_flags
                     log.info(f"spawn.codex sid={session.id} project={project} "
                              f"mode={'resume' if thread_id else 'create'} model={model or 'default'} "
                              f"worktree={wt_path}")
@@ -2284,6 +2331,12 @@ async def run_codex(prompt, project, session, files=None):
                     USAGE.record(len(full_prompt), len(result.text), session.label)
 
                     kind = classify_codex_failure(proc.returncode, r, e)
+                    if kind != 'ok':
+                        session.status_reason = 'execution_failed'
+                        session.error_text = f'Codex provider failure: {kind}'
+                    else:
+                        session.status_reason = ''
+                        session.error_text = ''
                     if kind == "auth":
                         return ("❌ Codex is not logged in on the server. "
                                 "Run <code>codex login</code> as the bot user, then retry.")
@@ -2291,6 +2344,10 @@ async def run_codex(prompt, project, session, files=None):
                         log.warning(f"Codex rate-limited sid={session.id} rc={proc.returncode}")
                         return ("⏳ Codex is rate-limited or over quota right now. "
                                 "Try again shortly, or switch engine/model with /model.")
+
+                    if kind == 'nonzero':
+                        detail = result.diagnostics[-1] if result.diagnostics else (e or 'provider turn failed')
+                        return '❌ Codex turn failed.\n' + _scrub_secrets(detail[:500])
 
                     text = result.text
                     if not text:
@@ -2303,7 +2360,7 @@ async def run_codex(prompt, project, session, files=None):
                             text = "⚠️ Codex produced no parseable output."
                         else:
                             text = "(no output)"
-                    else:
+                    elif kind == 'ok':
                         cr.mark_ok()
                     return text.strip() or "(no output)"
     except RuntimeError as rt_err:
@@ -2373,6 +2430,8 @@ async def run_chat(prompt, session, files=None):
 async def dispatch_turn(prompt, project, session, files=None):
     """Single engine dispatch point — handlers never branch on engine name.
     Unknown/removed engine fails safely with a recovery hint."""
+    if project != session.project:
+        return '❌ Project changed since this request was scheduled; resend in the intended project.'
     adapter = engines.get_adapter(session.engine)
     if adapter is None:
         return (f"⚠️ This session's engine (<code>{esc(session.engine)}</code>) is not "
@@ -3302,14 +3361,32 @@ async def cmd_project(u, c):
             parse_mode=ParseMode.HTML, reply_markup=project_kb(key))
         return
     proj = parts[1].strip()
-    if not os.path.isdir(f"{REPOS}/{proj}"):
-        await u.message.reply_text(f"❌ Project <b>{esc(proj)}</b> not found.", parse_mode=ParseMode.HTML)
+    try:
+        change_session_project(session, proj)
+    except ValueError as exc:
+        await u.message.reply_text(f'❌ {esc(str(exc))}', parse_mode=ParseMode.HTML)
         return
-    session.project = proj
     sent = await u.message.reply_text(
         f"{session_prefix(session)} | 📂 Project → <b>{esc(proj)}</b>",
         parse_mode=ParseMode.HTML)
     await track_reply(sent, session)
+
+
+def change_session_project(session, project: str) -> None:
+    """Shared UI/Telegram transition: never carry a provider thread across repos."""
+    if project not in get_project_names():
+        raise ValueError('unknown_project')
+    if session.status in ('running', 'queued'):
+        raise ValueError('session_busy')
+    if project != session.project:
+        session.provider_session_id = ''
+        session.session_uuid = str(uuid.uuid4())
+        session.claude_created = False
+        session.starting_branch = 'main'
+        if session.engine == engines.ENGINE_CODEX:
+            session.model = ''
+        session.project = project
+        save_state()
 
 # ═══════════════════════════════════════════
 #  /model — Fallback Model Selection
@@ -3345,7 +3422,7 @@ async def cmd_model(u, c):
     if active_session and active_engine != engines.ENGINE_CLAUDE:
         current_cc = active_session.model or active_adapter.default_model()
     else:
-        current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
+        current_cc = (active_session.claude_model if active_session else "") or active_adapter.default_model() or BOT_DEFAULT_CLAUDE_MODEL
     cc_label = current_cc if current_cc else "default (CLI default — latest Sonnet/Opus)"
     engine_label = active_adapter.caps.label if active_adapter else "Claude Code"
 
@@ -3993,7 +4070,11 @@ async def on_callback(u, c):
         if session_key:
             session = SM.get_by_key(session_key)
         if session:
-            session.project = proj_name
+            try:
+                change_session_project(session, proj_name)
+            except ValueError as exc:
+                await q.edit_message_text(f'❌ {esc(str(exc))}', parse_mode=ParseMode.HTML)
+                return
             await q.edit_message_text(
                 f"{session_prefix(session)} | 📂 → <b>{proj_name}</b>",
                 parse_mode=ParseMode.HTML)
@@ -5758,6 +5839,8 @@ MODEL_FAMILIES = [f.strip() for f in os.environ.get(
 def _probe_model(alias: str) -> str:
     """Ask the CLI what an alias resolves to. Returns '' if it cannot."""
     try:
+        if claude_gateway.settings():
+            return claude_gateway.configured_models().get(alias, '')
         pr = subprocess.run(
             ["claude", "--print", "--model", alias, "--output-format", "json",
              "--max-turns", "1", "hi"],
@@ -5793,6 +5876,8 @@ def _schedule_model_refresh():
     """Kick a background refresh at most once at a time. Never awaited by a
     request - a cold cache returns {} and fills in within a minute or two."""
     global _MODEL_REFRESH_TASK
+    if os.environ.get("BOT_RESOLVE_CLAUDE_MODELS", "false").lower() != "true":
+        return
     if _MODEL_REFRESH_TASK is not None and not _MODEL_REFRESH_TASK.done():
         return
     try:
@@ -5848,6 +5933,7 @@ async def _sessapi_sessions(req):
     return _aw.json_response({
         "ok": True,
         "sessions": sessions,
+        "projects": get_project_names(),
         "active_session": {str(cid): key for cid, key in ACTIVE_SESSION.items()},
         "counts": dict(counts),
     })
@@ -5892,7 +5978,7 @@ def _agent_load():
             continue
         try:
             with open(f"/proc/{pid}/comm") as fh:
-                if fh.read().strip() != "claude":
+                if fh.read().strip() not in ("claude", "codex"):
                     continue
             with open(f"/proc/{pid}/cgroup") as fh:
                 in_bot = "claude-telegram-bot" in fh.read()
@@ -6468,6 +6554,17 @@ async def _sessapi_control(req):
     if not cid:
         return _aw.json_response({"ok": False, "error": "no_bound_chat"}, status=503)
 
+    if action == "register_project":
+        project = str(body.get("project") or "").strip()
+        path = str(body.get("path") or "").strip()
+        if not project or not os.path.isabs(path) or not os.path.isdir(path):
+            return _aw.json_response({"ok": False, "error": "existing_absolute_path_required"}, status=400)
+        error = add_project(project, os.path.realpath(path))
+        if error:
+            return _aw.json_response({"ok": False, "error": error}, status=400)
+        _console_audit("register_project", label, project)
+        return _aw.json_response({"ok": True, "project": project})
+
     if action == "new":
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,30}", label):
             return _aw.json_response({"ok": False, "error": "bad_label"}, status=400)
@@ -6479,12 +6576,23 @@ async def _sessapi_control(req):
         _, existing = _console_session(label)
         if existing is not None:
             return _aw.json_response({"ok": False, "error": "label_in_use"}, status=409)
+        engine = str(body.get("engine") or engines.ENGINE_CLAUDE).strip()
+        adapter = engines.get_adapter(engine)
+        if adapter is None or adapter.caps.is_chat:
+            return _aw.json_response({"ok": False, "error": "bad_engine"}, status=400)
+        model = str(body.get("model") or "").strip()
+        if not adapter.validate_model(model):
+            return _aw.json_response({"ok": False, "error": "bad_model"}, status=400)
         session = SM.create(cid, label)
-        _apply_engine(session, engines.ENGINE_CLAUDE)
+        _apply_engine(session, engine, model)
+        if engine == engines.ENGINE_CLAUDE:
+            session.claude_model = model
         session.project = project
+        save_state()
         _console_audit("new", label, project)
         return _aw.json_response({"ok": True, "label": session.label,
-                                  "project": session.project})
+                                  "project": session.project, "engine": session.engine,
+                                  "model": model})
 
     _, session = _console_session(label)
     if session is None:
@@ -6507,8 +6615,11 @@ async def _sessapi_control(req):
 
     if action == "model":
         model = str(body.get("model") or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9._\-]{1,64}", model):
+        adapter = engines.get_adapter(session.engine)
+        if adapter is None or not adapter.validate_model(model):
             return _aw.json_response({"ok": False, "error": "bad_model"}, status=400)
+        if session.status in ("running", "queued"):
+            return _aw.json_response({"ok": False, "error": "session_busy"}, status=409)
         # Claude reads session.claude_model; every other engine reads
         # session.model. Setting the wrong one made a Codex model switch report
         # success and change nothing.
@@ -6516,15 +6627,17 @@ async def _sessapi_control(req):
             session.claude_model = model
         else:
             session.model = model
+        save_state()
         _console_audit("model", label, model, f"engine={session.engine}")
         return _aw.json_response({"ok": True, "label": label, "model": model,
                                   "engine": session.engine})
 
     if action == "project":
         project = str(body.get("project") or "").strip()
-        if project not in get_project_names():
-            return _aw.json_response({"ok": False, "error": "unknown_project"}, status=400)
-        session.project = project
+        try:
+            change_session_project(session, project)
+        except ValueError as exc:
+            return _aw.json_response({'ok': False, 'error': str(exc)}, status=409 if str(exc) == 'session_busy' else 400)
         _console_audit("project", label, project)
         return _aw.json_response({"ok": True, "label": label, "project": project})
 
@@ -6545,17 +6658,29 @@ async def _sessapi_mcp(req):
         with open("/root/.claude.json") as fh:
             cfg = json.load(fh).get("mcpServers", {})
     except Exception as ex:
-        return _aw.json_response({"ok": False, "error": "config_unreadable",
-                                  "detail": type(ex).__name__}, status=503)
+        cfg = {}  # Codex-only installations need no Claude configuration.
     for name, c in sorted(cfg.items()):
         cmd = c.get("command") or ""
         out.append({
             "name": name,
+            "engine": "claude",
             "type": c.get("type") or ("url" if c.get("url") else "stdio"),
             "command": os.path.basename(cmd) if cmd else "",
             "arg_count": len(c.get("args") or []),
             "env_names": sorted((c.get("env") or {}).keys()),
         })
+    try:
+        import tomllib
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        codex_cfg = tomllib.loads((home / "config.toml").read_text()).get("mcp_servers", {})
+        for name, c in sorted(codex_cfg.items()):
+            out.append({"name": name, "engine": "codex",
+                        "type": "url" if c.get("url") else "stdio",
+                        "command": os.path.basename(c.get("command") or ""),
+                        "arg_count": len(c.get("args") or []),
+                        "env_names": sorted((c.get("env") or {}).keys())})
+    except (OSError, ValueError, ImportError):
+        pass
     return _aw.json_response({"ok": True, "servers": out, "count": len(out)})
 
 
@@ -6572,14 +6697,28 @@ async def _sessapi_models(req):
     # them serially took >2 minutes, which hung the console's startup fetch.
     # Serve whatever is cached and refresh in the background.
     resolved = dict(_MODEL_CACHE)
-    if not resolved or (time.time() - _MODEL_CACHE_AT) >= MODEL_CACHE_TTL:
+    if (os.environ.get("BOT_RESOLVE_CLAUDE_MODELS", "false").lower() == "true"
+            and (not resolved or (time.time() - _MODEL_CACHE_AT) >= MODEL_CACHE_TTL)):
         _schedule_model_refresh()
+    catalogs = {}
+    for adapter in engines.all_engines():
+        if adapter.caps.is_chat:
+            continue
+        try:
+            catalogs[adapter.caps.engine] = {
+                'label': adapter.caps.label, 'default': adapter.default_model(), 'available': True,
+                'models': [{'id': m.id, 'label': m.label} for m in adapter.list_models() if m.available],
+            }
+        except (ValueError, OSError):
+            catalogs[adapter.caps.engine] = {'label': adapter.caps.label, 'default': '',
+                'available': False, 'models': [], 'error': 'configuration_unavailable'}
     return _aw.json_response({
         "ok": True,
         "families": MODEL_FAMILIES,
         "resolved": resolved,
-        "default": BOT_DEFAULT_CLAUDE_MODEL or "",
+        "default": catalogs.get('claude', {}).get('default') or BOT_DEFAULT_CLAUDE_MODEL or "",
         "cached_at": _MODEL_CACHE_AT,
+        "engines": catalogs,
     })
 
 

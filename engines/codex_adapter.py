@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from pathlib import Path
 from dataclasses import dataclass, field
 
 from .base import Capabilities, EngineAdapter, ModelInfo, ENGINE_CODEX
@@ -175,12 +177,35 @@ _AUTH_KW = ("not logged in", "unauthorized", "401", "authentication",
 def classify_codex_failure(rc: int | None, stdout: str, stderr: str) -> str:
     """Return 'ok' | 'rate_limit' | 'auth' | 'nonzero'. ('timeout'/'malformed'
     are decided by the caller / parser respectively.)"""
-    combined = f"{stdout}\n{stderr}".lower()
-    if any(k in combined for k in _AUTH_KW):
+    # Only terminal provider errors are evidence. Agent messages and tool output
+    # routinely discuss authentication/401, even on a completely successful turn.
+    errors = []
+    structured = False
+    failed = False
+    completed = False
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        structured = True
+        completed |= event.get("type") == "turn.completed"
+        failed |= event.get("type") == "turn.failed"
+        if event.get("type") in ("error", "turn.failed"):
+            error = event.get("error", event.get("message", ""))
+            errors.append(str(error.get("message", "")) if isinstance(error, dict) else str(error))
+    if rc in (0, None) and not failed:
+        return "ok"
+    if completed and not failed:
+        errors = []  # recovered streaming errors must not mask the final answer
+    combined = "\n".join([*errors, stderr, "" if structured else stdout]).lower()
+    if any(k in combined for k in _AUTH_KW if k != "401") or re.search(r"\b401\b", combined):
         return "auth"
     if any(k in combined for k in _RATE_KW):
         return "rate_limit"
-    if rc not in (0, None):
+    if failed or rc not in (0, None):
         return "nonzero"
     return "ok"
 
@@ -210,6 +235,15 @@ class CodexAdapter(EngineAdapter):
             return env
         if self._discovered:
             return list(self._discovered)
+        # The CLI maintains this account-visible cache. Reading it is free and
+        # avoids pinning the menu to model names from the bot's release date.
+        try:
+            home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+            cached = parse_codex_models((home / "models_cache.json").read_text())
+            if cached:
+                return cached
+        except (OSError, ValueError):
+            pass
         return list(_DEFAULT_CATALOG)
 
     def set_discovered(self, models: list[ModelInfo]) -> None:
