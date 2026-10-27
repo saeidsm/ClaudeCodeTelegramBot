@@ -35,6 +35,7 @@ import re
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,12 +71,26 @@ _SECRET_NAME_RE = re.compile(
     r"secret|token|passwd|password|credential|api[_-]?key"
     r"|\.pem$|\.key$|\.age$|\.env($|\.)|(^|/)id_(rsa|ed25519)$", re.I)
 # Skips that are deliberate POLICY (content is either forbidden or exists
-# elsewhere) and so do NOT invalidate the capture. Anything else — a path
-# git printed that we could not read/copy — downgrades ok to False, which
-# makes the caller preserve the tree instead of trusting the capture.
+# elsewhere) and so NOT invalidate the capture. Anything else — a path git
+# printed that we could not read/copy — downgrades ok to False, which makes
+# the caller preserve/quarantine the tree instead of trusting the capture.
 _POLICY_SKIP = {"secret_looking_name", "capture_budget"}
-# Captures follow the same retention as reports (15 days, pruned lazily).
-CAPTURE_RETENTION_DAYS = 15
+# Capture auto-deletion (owner R-revisit): DISABLED by default. Quarantined
+# stale trees are RAW (unfiltered — they can contain secret-looking files), so
+# nothing under capture/quarantine roots may be auto-deleted or auto-published
+# without an explicit owner decision; set BOT_MCP_CAPTURE_RETENTION_DAYS > 0
+# to enable pruning, and expect the owner to also review what it would remove.
+CAPTURE_RETENTION_DAYS = int(os.environ.get("BOT_MCP_CAPTURE_RETENTION_DAYS", "0") or 0)
+# Quarantine lives under its OWN root, deliberately OUTSIDE the capture tree:
+# latest_capture_dir() feeds _report_for_session()'s include_dir, so a
+# quarantined raw worktree under CAPTURE_ROOT would ride into a report ZIP.
+# Separate root = structurally impossible (owner finding: "quarantine must be
+# separate from the output ZIP").
+QUARANTINE_ROOT = Path(os.environ.get(
+    "BOT_MCP_QUARANTINE_DIR", str(Path(os.environ.get("BOT_DATA_ROOT", "/opt/shahrzad-devops")) / "quarantine")))
+# A capture directory stamp (created by capture_worktree_delta). Only these
+# are ever candidates for latest_capture_dir/report inclusion.
+_CAPTURE_STAMP_RE = re.compile(r"^\d{8}-\d{6}$")
 
 
 @dataclass
@@ -212,8 +227,12 @@ def capture_worktree_delta(wt_path: str, session_id: str) -> CaptureResult:
 
 
 def _prune_old_captures(safe: str) -> None:
-    """15-day retention (same as reports), this session's dirs only,
-    best-effort — never a reason to fail a capture."""
+    """Optional capture retention. OFF unless the owner sets
+    BOT_MCP_CAPTURE_RETENTION_DAYS > 0 (default 0 = keep everything — see
+    CAPTURE_RETENTION_DAYS). Best-effort, this session's capture dirs only;
+    NEVER touches the quarantine root."""
+    if CAPTURE_RETENTION_DAYS <= 0:
+        return
     try:
         cutoff = time.time() - CAPTURE_RETENTION_DAYS * 86400
         root = Path(CAPTURE_ROOT) / safe
@@ -221,7 +240,7 @@ def _prune_old_captures(safe: str) -> None:
             return
         for p in root.iterdir():
             try:
-                if p.is_dir() and p.stat().st_mtime < cutoff:
+                if p.is_dir() and _CAPTURE_STAMP_RE.match(p.name) and p.stat().st_mtime < cutoff:
                     shutil.rmtree(p, ignore_errors=True)
             except OSError:
                 pass
@@ -229,31 +248,51 @@ def _prune_old_captures(safe: str) -> None:
         pass
 
 
-def quarantine_stale_worktree(wt_path: str, session_id: str) -> str:
-    """C1 after review: a stale worktree whose capture could NOT be proven
-    is moved aside under the session's capture root — NEVER rm -rf'd. The
-    path is then free for the fresh spawn; `git worktree prune` (caller)
-    clears the stale registration. Returns the quarantine dir, '' on
-    failure (the caller then refuses the destructive path)."""
+def quarantine_stale_worktree(wt_path: str, session_id: str, project_path: str = "") -> str:
+    """A leftover tree whose capture could NOT be proven is moved aside under
+    the QUARANTINE root (own root, outside the capture/report tree) — NEVER
+    rm -rf'd. The path is then free for the fresh spawn; `git worktree
+    prune` (caller, AFTER this) clears the dangling registration.
+
+    Item 1: dirty files AND the git INDEX survive. The index/HEAD of a
+    registered worktree live in <project>/.git/worktrees/<name>/ — which the
+    caller's prune would delete — so that metadata is copied into the
+    quarantine as git-meta/ BEFORE anyone prunes. Returns the quarantine
+    dir, '' on failure (the caller then refuses the destructive path)."""
     safe = _safe_session_dir(session_id)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    dst = Path(CAPTURE_ROOT) / safe / f"stale-{stamp}"
+    dst = Path(QUARANTINE_ROOT) / safe / f"stale-{stamp}"
+    # meta staged to a SIBLING first: copying into dst would CREATE dst, and
+    # shutil.move of a directory into an existing directory nests it inside
+    # instead of renaming (found by the item-1 regression test).
+    meta_tmp = Path(QUARANTINE_ROOT) / safe / f"gitmeta-{stamp}"
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
+        # git-meta BEFORE the move+prune: once pruned, the index is gone.
+        meta = Path(project_path) / ".git" / "worktrees" / os.path.basename(wt_path)
+        if project_path and meta.is_dir():
+            shutil.copytree(meta, meta_tmp, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("lock"))
         shutil.move(wt_path, str(dst))
+        if meta_tmp.exists():
+            shutil.move(str(meta_tmp), str(dst / "git-meta"))
         return str(dst)
     except Exception:
+        # '' -> the caller refuses the destructive path. A half-quarantined
+        # tree (moved but meta not attached) is still safe on disk.
         return ""
 
 
 def latest_capture_dir(session_id: str) -> str:
-    """Newest capture directory for a session ('' when none). Best-effort:
-    a missing/empty tree is not an error, it just means no turn left
-    anything behind yet."""
+    """Newest CAPTURE directory for a session ('' when none). Capture-stamp
+    dirs only — never anything else that might appear under the capture
+    root. Best-effort: a missing/empty tree is not an error, it just means
+    no turn left anything behind yet."""
     safe = _safe_session_dir(session_id)
     try:
-        latest = max((Path(CAPTURE_ROOT) / safe).iterdir(), key=lambda p: p.stat().st_mtime)
-        return str(latest)
+        stamps = [p for p in (Path(CAPTURE_ROOT) / safe).iterdir()
+                  if p.is_dir() and _CAPTURE_STAMP_RE.match(p.name)]
+        return str(max(stamps, key=lambda p: p.stat().st_mtime))
     except (OSError, ValueError):
         return ""
 
@@ -331,6 +370,20 @@ def _scope_error(session) -> "tuple[str, int, str] | None":
     return None
 
 
+# ── awaited questions (owner item 6) ─────────────────────────────────────────
+# question_id -> {"session": <session id>, "label": ..., "answered": bool}.
+# In-memory by design in v1: a restart clears it and `answer` then honestly
+# refuses with unknown_question (the session itself resumes by label —
+# only the question BINDING is lost, never session state, which lives in
+# the bot's SessionManager/state file).
+_QUESTIONS: dict = {}
+
+
+def _pending_questions(session_id: str) -> list:
+    return sorted(qid for qid, q in _QUESTIONS.items()
+                  if q.get("session") == session_id and not q.get("answered"))
+
+
 _TOOLS = [
     {"name": "projects_list", "description": "Projects this MCP surface may drive (owner pilot scope).",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -354,12 +407,18 @@ _TOOLS = [
      "inputSchema": {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}},
     {"name": "report", "description": "Build the report ZIP: summary + latest captured worktree delta (status/diff/changed files/sha256 manifest).",
      "inputSchema": {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}},
-    {"name": "ask", "description": "Ask a question without managing sessions: routed to an existing in-scope session, or one is created (same scope rules as session_new) and the question is submitted to it. State: follow up with status/report by the same label.",
-     "inputSchema": {"type": "object", "required": ["label", "project", "message"],
+    {"name": "ask", "description": "Ask a question without managing sessions: routed to an existing in-scope session, or one is created (same scope rules as session_new) and the question is submitted to it. When no session existed yet the caller nonce dedups the whole ask (create+send); when one did, it dedups the send. Returns a question_id for `answer`, which binds the runner's reply to THAT question and continues the same session — a plain prompt send is not a substitute.",
+     "inputSchema": {"type": "object", "required": ["label", "project", "message", "nonce"],
                      "properties": {"label": {"type": "string"}, "project": {"type": "string"},
                                     "message": {"type": "string"}, "model": {"type": "string"},
                                     "nonce": {"type": "integer",
-                                              "description": "Optional. Epoch milliseconds, strictly increasing per client; supply it to make an exact replay of this ask a refused duplicate. Generated (clock-tracked) when absent."}}}},
+                                              "description": "Epoch milliseconds, strictly increasing per client; an exact replay of this ask (same nonce) is refused as a duplicate and never re-run."}}}},
+    {"name": "answer", "description": "Answer an AWAITED question of a session: binds to the question_id returned by `ask`, submits into the SAME session (which is how it continues), one answer per question. Unknown question_id is refused — the in-memory binding is lost on a bot restart (the session itself still resumes by label).",
+     "inputSchema": {"type": "object", "required": ["label", "question_id", "message", "nonce"],
+                     "properties": {"label": {"type": "string"}, "question_id": {"type": "string"},
+                                    "message": {"type": "string"},
+                                    "nonce": {"type": "integer",
+                                              "description": "Epoch milliseconds, strictly increasing per client; dedups the answer turn exactly like `send`."}}}},
 ]
 
 
@@ -393,19 +452,19 @@ def _tool_text(payload: "dict | None", status: int = 200) -> dict:
         "isError": status >= 400}
 
 
-async def _tool_projects_list() -> dict:
+async def _tool_projects_list(a: dict) -> dict:
     return _tool_text({"ok": True, "projects": _allowed_projects(),
                        "registered_count": len(_DEPS["project_names"]()),
                        "all_registered": False})
 
 
-async def _tool_models_list() -> dict:
-    status, payload = await _call(_DEPS["models"])
+async def _tool_models_list(a: dict) -> dict:
+    status, payload = await _call(_DEPS["models"], {})
     return _tool_text({"ok": True, **payload}, status)
 
 
-async def _tool_sessions_list() -> dict:
-    status, payload = await _call(_DEPS["sessions"])
+async def _tool_sessions_list(a: dict) -> dict:
+    status, payload = await _call(_DEPS["sessions"], {})
     return _tool_text(payload, status)
 
 
@@ -438,19 +497,30 @@ async def _tool_send(a: dict) -> dict:
 
 
 async def _tool_ask(a: dict) -> dict:
-    """Q&A in v1 (owner item 2/7): ask WITHOUT managing sessions. The question
-    is routed through the same two seams every other tool uses — no new logic
-    beside them:
-      - an existing IN-SCOPE claude session with that label -> _sessapi_send;
-      - no such session -> _sessapi_control action:new (same scope/engine
-        gates as session_new), then the question is submitted to it.
-    So the answer lands in the session's normal output (status/report), the
-    question goes through the SAME rate limit, nonce dedup and audit as a
-    console/Telegram turn, and nothing new is reachable that send +
-    session_new could not already reach. Same-key duplicate questions do not
-    re-run: the create nonce is generated, the send nonce is the caller's."""
+    """Q&A in v1 (owner items 2/7 + 6): ask WITHOUT managing sessions, and
+    get an AWAITED-QUESTION ID the runner's answer can bind back to.
+
+    Coordination (owner item 5): when the label has no session yet, the
+    CREATE leg consumes the CALLER's nonce (a replay of the whole ask then
+    dies on that nonce at create/send — no double run), and the send leg
+    uses a GENERATED nonce (strictly above the HWM the caller raised, so
+    the internal nonce can never invalidate the caller's request). When the
+    session already exists, the caller's nonce goes to the send leg — the
+    first ask consumes it, the replay is refused. Both legs route through
+    the same _sessapi_control/_sessapi_send seams as every other tool: same
+    rate limit (real 3s window, answered honestly as 429), same audit.
+
+    The question turn lands in the session's normal output; the response
+    carries a question_id (owner item 6) for `answer` to bind to."""
     label = str(a.get("label") or "").strip()
+    nonce = a.get("nonce")
+    caller = nonce if isinstance(nonce, int) and nonce > 0 else None
+    if caller is None:
+        return _tool_text({"ok": False, "error": "nonce_required",
+                           "detail": "ask needs a client nonce (epoch ms, strictly "
+                                     "increasing) so a replay can never re-run"}, 400)
     _, session = _DEPS["lookup_session"](label)
+    created = False
     if session is None:
         project = str(a.get("project") or "").strip()
         if project not in _allowed_projects():
@@ -459,25 +529,62 @@ async def _tool_ask(a: dict) -> dict:
                                "allowed": _allowed_projects()}, 403)
         body = {"action": "new", "label": label, "project": project,
                 "engine": "claude", "model": a.get("model") or "",
-                "nonce": _DEPS["next_nonce"]()}
+                "nonce": caller}
         status, payload = await _call(_DEPS["control"], body)
         if status >= 400 or not payload.get("ok", True):
             return _tool_text(payload, status)
-    err = _scope_error(_DEPS["lookup_session"](label)[1])
+        created = True
+        session = _DEPS["lookup_session"](label)[1]
+    err = _scope_error(session)
     if err:
         return _tool_text({"ok": False, "error": err[0], "detail": err[2]}, err[1])
-    # Caller nonce dedups the turn (same-key duplicate = refused below the
-    # HWM); generated fresh when absent so ask works without a nonce too.
-    nonce = a.get("nonce")
-    body = {"label": label, "message": a.get("message"),
-            "nonce": nonce if isinstance(nonce, int) and nonce > 0 else _DEPS["next_nonce"]()}
+    # Send leg nonce: the caller's when create did NOT consume it (session
+    # existed), else generated (above the HWM the caller's nonce raised).
+    send_nonce = caller if not created else _DEPS["next_nonce"]()
+    body = {"label": label, "message": a.get("message"), "nonce": send_nonce}
     status, payload = await _call(_DEPS["send"], body)
-    if status == 409 and nonce is None:
-        # generated nonce collided (should not happen; clock-tracked) — retry once
-        body["nonce"] = _DEPS["next_nonce"]()
-        status, payload = await _call(_DEPS["send"], body)
-    payload["ask_note"] = ("answer arrives in the session output; poll `status` "
-                           "(label) or build the `report` ZIP — same as any turn")
+    if status < 400 and payload.get("ok", True):
+        question_id = f"q-{uuid.uuid4().hex[:12]}"
+        _QUESTIONS[question_id] = {"session": session.id, "label": label,
+                                   "asked_at": int(time.time() * 1000), "answered": False}
+        payload["question_id"] = question_id
+        payload["pending_questions"] = _pending_questions(session.id)
+        payload["ask_note"] = ("answer arrives in the session output; bind the runner's "
+                               "reply with `answer` (label, question_id) — same session")
+    return _tool_text(payload, status)
+
+
+async def _tool_answer(a: dict) -> dict:
+    """Owner item 6: the runner's ANSWER, bound to the SAME awaited question
+    (by question_id) and submitted into the SAME session — which is how the
+    session continues (claude --resume inside the persistent worktree). A
+    plain prompt send is NOT a substitute: it carries no question binding and
+    nothing enforces one-answer-per-question."""
+    label = str(a.get("label") or "").strip()
+    question_id = str(a.get("question_id") or "").strip()
+    _, session = _DEPS["lookup_session"](label)
+    err = _scope_error(session)
+    if err:
+        return _tool_text({"ok": False, "error": err[0], "detail": err[2]}, err[1])
+    q = _QUESTIONS.get(question_id)
+    if not q or q.get("session") != session.id:
+        return _tool_text({"ok": False, "error": "unknown_question",
+                           "detail": "question_id does not name an awaited question of THIS "
+                                     "session (registry is in-memory: a bot restart clears it; "
+                                     "the session itself still resumes by label)"}, 404)
+    if q.get("answered"):
+        return _tool_text({"ok": False, "error": "question_already_answered",
+                           "detail": "one answer per question — resubmit as a normal send "
+                                     "if you really meant another turn"}, 409)
+    # In-band binding so the engine's session log shows the connection.
+    message = f"[answer {question_id}] {a.get('message') or ''}".strip()
+    body = {"label": label, "message": message, "nonce": a.get("nonce")}
+    status, payload = await _call(_DEPS["send"], body)
+    if status < 400 and payload.get("ok", True):
+        q["answered"] = True
+        payload["question_id"] = question_id
+        payload["continues"] = label
+        payload["pending_questions"] = _pending_questions(session.id)
     return _tool_text(payload, status)
 
 
@@ -490,6 +597,8 @@ async def _tool_status(a: dict) -> dict:
     status, payload = await _call(
         _DEPS["output"], {}, {"label": label, "full": "1" if a.get("full") else ""})
     payload["model"] = _DEPS["model_metadata"](session)
+    if status < 400 and payload.get("ok", True):
+        payload["pending_questions"] = _pending_questions(session.id)
     return _tool_text(payload, status)
 
 
@@ -532,7 +641,7 @@ _DISPATCH = {
     "projects_list": _tool_projects_list, "models_list": _tool_models_list,
     "sessions_list": _tool_sessions_list, "session_new": _tool_session_new,
     "send": _tool_send, "status": _tool_status, "cancel": _tool_cancel,
-    "report": _tool_report, "ask": _tool_ask,
+    "report": _tool_report, "ask": _tool_ask, "answer": _tool_answer,
 }
 
 

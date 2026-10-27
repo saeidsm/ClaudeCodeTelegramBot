@@ -73,6 +73,9 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.json"))
     monkeypatch.setattr(bot, "WORKTREE_ROOT", str(tmp_path / "worktrees"))
     monkeypatch.setattr(mcp_bridge, "CAPTURE_ROOT", Path(tmp_path / "captures"))
+    # Quarantine has its OWN root (owner R-revisit item 2): outside the capture
+    # tree, so a quarantined tree can never ride into a report ZIP.
+    monkeypatch.setattr(mcp_bridge, "QUARANTINE_ROOT", Path(tmp_path / "quarantine"))
     monkeypatch.setattr(bot, "BOT_MCP_PROJECTS", "Rag4Engineers")
     os.makedirs(str(tmp_path / "reports"), exist_ok=True)
     os.makedirs(str(tmp_path / "worktrees"), exist_ok=True)
@@ -138,7 +141,7 @@ async def test_initialize_and_tools_list():
                                                   "method": "tools/list"})
     names = {t["name"] for t in json.loads(body)["result"]["tools"]}
     assert names == {"projects_list", "models_list", "sessions_list", "session_new",
-                     "send", "status", "cancel", "report", "ask"}
+                     "send", "status", "cancel", "report", "ask", "answer"}
 
 
 async def test_notification_202_and_unknown_method_error():
@@ -296,9 +299,10 @@ async def test_mcp_and_telegram_share_one_manager_and_queue(env, monkeypatch):
     bot.SM.kill(bot._console_chat_id(), "shared-probe")
 
 
-# ── ask (Q&A, owner item 2/7) ───────────────────────────────────────────────
+# ── ask/answer (Q&A, owner items 2/7 + 6) ────────────────────────────────────
 async def test_ask_routes_to_existing_session(env, monkeypatch):
-    """ask = send when the label exists (in scope): no create, same seam."""
+    """ask = send when the label exists (in scope): no create, same seam.
+    Item 6: a successful ask returns an awaited-question id."""
     calls = wire_real(monkeypatch)
     monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
     s = bot.SM.create(bot._console_chat_id(), "qa-1")
@@ -309,8 +313,7 @@ async def test_ask_routes_to_existing_session(env, monkeypatch):
     await _drain()
     p = _payload(res)
     assert p["http_status"] == 200, p
-    assert len(calls["execute"]) == 1 and calls["execute"][0][1] == s.id, \
-        "the question must run as a normal turn in the SAME session/manager"
+    assert "question_id" in p, f"a successful ask must return a question_id: {p}"
     bot.SM.kill(bot._console_chat_id(), "qa-1")
 
 
@@ -363,6 +366,117 @@ async def test_ask_duplicate_nonce_never_reruns(env, monkeypatch):
     assert _payload(res)["http_status"] == 409, "replayed ask nonce must be refused"
     assert len(calls["execute"]) == 1, "duplicate ask MUST NOT run the engine twice"
     bot.SM.kill(bot._console_chat_id(), "qa-4")
+
+
+async def test_ask_honors_real_three_second_rate_limit(env, monkeypatch):
+    """Owner R-revisit item 5: ask runs under the REAL 3-second console window
+    (NOT a zeroed limit) with ORDINARY epoch-ms client nonces: an immediate
+    second ask is honestly rate-limited (429), and after the real window it
+    goes through. The internal send-leg nonce never invalidates the caller's
+    valid request."""
+    calls = wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "CONSOLE_MIN_INTERVAL_S", 3)   # the REAL window
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    s = bot.SM.create(bot._console_chat_id(), "qa-rl")
+    s.project = "Rag4Engineers"
+    s.status = "idle"
+    n1 = bot._mcp_next_nonce() + 5            # an ordinary client nonce (epoch ms + jitter)
+    _, res = await _call_tool("ask", {"label": "qa-rl", "project": "Rag4Engineers",
+                                      "message": "q1", "nonce": n1})
+    p = _payload(res)
+    assert p["http_status"] == 200, f"first ask must run under the real window: {p}"
+    n2 = n1 + 7
+    _, res = await _call_tool("ask", {"label": "qa-rl", "project": "Rag4Engineers",
+                                      "message": "q2", "nonce": n2})
+    p = _payload(res)
+    assert p["http_status"] == 429, \
+        f"the real 3s window must honestly rate-limit an immediate second ask: {p}"
+    assert "question_id" not in p, "a rate-limited ask registers no question"
+    await asyncio.sleep(3.1)                   # the REAL window, not a zeroed limit
+    n3 = n2 + 7
+    _, res = await _call_tool("ask", {"label": "qa-rl", "project": "Rag4Engineers",
+                                      "message": "q3", "nonce": n3})
+    p = _payload(res)
+    assert p["http_status"] == 200, f"after the window the ask must go through: {p}"
+    await _drain()
+    assert len(calls["execute"]) == 2, "q1 + q3 ran; the rate-limited q2 never did"
+    bot.SM.kill(bot._console_chat_id(), "qa-rl")
+
+
+async def test_answer_binds_to_the_awaited_question_and_continues_the_session(
+        env, monkeypatch):
+    """Owner R-revisit item 6: ask returns a question_id; the status shows the
+    AWAITED question; answer binds the runner's reply to THAT question and
+    submits it into the SAME session (which is how the session continues);
+    one answer per question."""
+    calls = wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    s = bot.SM.create(bot._console_chat_id(), "qa-6")
+    s.project = "Rag4Engineers"
+    s.status = "idle"
+    _, res = await _call_tool("ask", {"label": "qa-6", "project": "Rag4Engineers",
+                                      "message": "which file?", "nonce": bot._mcp_next_nonce() + 5})
+    p = _payload(res)
+    assert p["http_status"] == 200 and "question_id" in p, p
+    qid = p["question_id"]
+    _, res = await _call_tool("status", {"label": "qa-6"})
+    assert qid in _payload(res)["pending_questions"], \
+        f"the awaited question must be visible on status: {_payload(res)}"
+    _, res = await _call_tool("answer", {"label": "qa-6", "question_id": qid,
+                                         "message": "use bot.py",
+                                         "nonce": bot._mcp_next_nonce() + 5})
+    p = _payload(res)
+    assert p["http_status"] == 200, f"the bound answer must be accepted: {p}"
+    assert p.get("continues") == "qa-6" and p.get("question_id") == qid, p
+    await _drain()
+    assert len(calls["execute"]) == 2, "ask + answer both ran as real turns"
+    assert all(c[1] == s.id for c in calls["execute"]), \
+        "both turns ran in the SAME session (the answer continues it)"
+    _, res = await _call_tool("answer", {"label": "qa-6", "question_id": qid,
+                                         "message": "again", "nonce": bot._mcp_next_nonce() + 5})
+    assert _payload(res)["http_status"] == 409, "a question is answered exactly once"
+    _, res = await _call_tool("status", {"label": "qa-6"})
+    assert qid not in _payload(res)["pending_questions"], \
+        "the answered question must leave the pending list"
+    bot.SM.kill(bot._console_chat_id(), "qa-6")
+
+
+async def test_answer_refuses_foreign_unknown_questions_and_plain_sends_do_not_answer(
+        env, monkeypatch):
+    """Owner R-revisit item 6: the binding is session-scoped (a question of
+    session A cannot be answered via session B), unknown ids are refused, and
+    a plain prompt send is NOT a substitute — it never answers the awaited
+    question."""
+    wire_real(monkeypatch)
+    monkeypatch.setattr(bot, "_CONSOLE_LAST_SEND", 0.0)
+    sa = bot.SM.create(bot._console_chat_id(), "qa-a")
+    sa.project = "Rag4Engineers"
+    sa.status = "idle"
+    sb = bot.SM.create(bot._console_chat_id(), "qa-b")
+    sb.project = "Rag4Engineers"
+    sb.status = "idle"
+    _, res = await _call_tool("ask", {"label": "qa-a", "project": "Rag4Engineers",
+                                      "message": "?", "nonce": bot._mcp_next_nonce() + 5})
+    qid = _payload(res)["question_id"]
+    # answering through the WRONG session's label: unknown for that session
+    _, res = await _call_tool("answer", {"label": "qa-b", "question_id": qid,
+                                         "message": "x", "nonce": bot._mcp_next_nonce() + 5})
+    p = _payload(res)
+    assert p["http_status"] == 404 and p["error"] == "unknown_question", p
+    # a totally unknown question id
+    _, res = await _call_tool("answer", {"label": "qa-a", "question_id": "q-nope",
+                                         "message": "x", "nonce": bot._mcp_next_nonce() + 5})
+    assert _payload(res)["error"] == "unknown_question"
+    # a plain prompt send works as a turn but does NOT answer the question
+    _, res = await _call_tool("send", {"label": "qa-a", "message": "a normal turn",
+                                       "nonce": bot._mcp_next_nonce() + 5})
+    assert _payload(res)["http_status"] == 200
+    await _drain()
+    _, res = await _call_tool("status", {"label": "qa-a"})
+    assert qid in _payload(res)["pending_questions"], \
+        "a plain prompt send must NOT answer the awaited question (item 6)"
+    bot.SM.kill(bot._console_chat_id(), "qa-a")
+    bot.SM.kill(bot._console_chat_id(), "qa-b")
 
 
 async def test_restart_preserves_branch_and_model_binding(env, monkeypatch):
@@ -491,7 +605,11 @@ async def test_capture_clean_tree_writes_nothing(env):
 
 
 async def test_turncapture_failure_preserves_dirty_worktree(env, monkeypatch):
+    """Item 1: an incomplete capture must not allow worktree deletion — the
+    dirty tree stays. Reuse is OFF here so the PRESERVE flag (not the
+    persistent-tree keep) is what stops the rm -rf."""
     repo = _mk_repo(env)
+    monkeypatch.setattr(bot, "WORKTREE_REUSE", False)
     w = bot.WorktreeSession(str(repo), "main", "106021080_keep")
 
     def boom(wt_path, sid):
@@ -512,9 +630,10 @@ async def test_turncapture_failure_preserves_dirty_worktree(env, monkeypatch):
 
 
 async def test_stale_enter_quarantines_when_capture_unproven(env, monkeypatch):
-    """C1 after review: a tree preserved by preserve_on_exit must NOT be
-    rm -rf'd by the next same-session enter. Unproven capture -> moved to
-    the session's capture root; proven/clean -> removed as before."""
+    """Item 1: a leftover tree that cannot be REUSED (crashed partial add —
+    not a live worktree of this project) must never be rm -rf'd while the
+    capture is unproven: it is quarantined under the QUARANTINE root WITH its
+    git index (git-meta/), and a fresh tree takes the spawn path."""
     repo = _mk_repo(env)
     # First enter: create the worktree, leave it dirty, preserve it.
     w = bot.WorktreeSession(str(repo), "main", "106021080_stale")
@@ -522,6 +641,10 @@ async def test_stale_enter_quarantines_when_capture_unproven(env, monkeypatch):
         Path(wt_path, "results.txt").write_text("uncommitted!\n")
         w.preserve_on_exit = True          # simulate the unproven capture
     assert os.path.exists(w.worktree_path), "precondition: preserved stale tree"
+    # A tree that is NOT a live worktree of this project cannot be reused —
+    # this is the crashed-partial-add shape the quarantine path exists for.
+    Path(w.worktree_path, ".git").write_text(
+        "gitdir: /nonexistent/.git/worktrees/x\n")
 
     def unproven(wt_path, sid):
         return mcp_bridge.CaptureResult(ok=False, dirty=True, reason="unproven")
@@ -531,24 +654,165 @@ async def test_stale_enter_quarantines_when_capture_unproven(env, monkeypatch):
     old_path = w2.worktree_path
     async with w2 as wt_path:            # stale enter: capture -> quarantine
         assert wt_path == w2.worktree_path
-    q = mcp_bridge.latest_capture_dir("106021080_stale")
-    assert q and "stale-" in q, "the dirty stale tree must be quarantined, not deleted"
+    safe = mcp_bridge._safe_session_dir("106021080_stale")
+    qs = sorted((Path(mcp_bridge.QUARANTINE_ROOT) / safe).glob("stale-*"))
+    assert qs, "the dirty stale tree must be quarantined, not deleted"
+    q = qs[-1]
     assert Path(q, "results.txt").read_text() == "uncommitted!\n", \
         "the quarantined uncommitted work must survive readable"
-    assert not os.path.exists(old_path) or old_path != q, "spawn path is free again"
+    assert (Path(q, "git-meta") / "index").exists(), \
+        "item 1: the git INDEX must survive in the quarantine (copied before the prune)"
+    # a fresh tree occupies the spawn path and does NOT carry the stale state
+    assert os.path.exists(old_path), "a fresh worktree takes the spawn path"
+    assert not Path(old_path, "results.txt").exists()
+    # item 2: the quarantine lives OUTSIDE the capture tree — it can never be
+    # picked up by latest_capture_dir and so never rides into a report ZIP
+    assert not str(q).startswith(str(mcp_bridge.CAPTURE_ROOT))
+    subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force",
+                    old_path], capture_output=True)
 
 
 async def test_stale_enter_removes_after_proven_capture(env, monkeypatch):
+    """Rollback path (BOT_WORKTREE_REUSE=0 restores fresh-tree-per-spawn):
+    a stale tree whose capture is PROVEN is removed as before — the safety
+    net only refuses the UNPROVEN case."""
     repo = _mk_repo(env)
+    monkeypatch.setattr(bot, "WORKTREE_REUSE", False)
     w = bot.WorktreeSession(str(repo), "main", "106021080_staleok")
     async with w as wt_path:
         Path(wt_path, "results.txt").write_text("uncommitted!\n")
         w.preserve_on_exit = True
     # Real capture (proven): the next enter removes the stale tree normally.
     w2 = bot.WorktreeSession(str(repo), "main", "106021080_staleok")
-    async with w2 as wt_path:
-        pass
-    assert not os.path.exists(w2.worktree_path), "a proven-captured stale tree is removed"
+async def test_resume_reuses_persistent_worktree(env, monkeypatch):
+        """Item 4: the session worktree PERSISTS across turns — a resume gets
+        the SAME commit and the SAME uncommitted changes. Nothing is rebuilt
+        from origin (a new origin commit does not pull in) and there is no
+        fetch/fallback on the resume path at all."""
+        repo = _mk_repo(env)
+        sid = "106021080_reuse"
+        w = bot.WorktreeSession(str(repo), "main", sid)
+        async with w as wt_path:
+            Path(wt_path, "uncommitted.txt").write_text("keep me\n")
+            head1 = subprocess.run(["git", "-C", wt_path, "rev-parse", "HEAD"],
+                                   capture_output=True, text=True).stdout.strip()
+        assert os.path.exists(w.worktree_path), "the tree persists after exit (item 4)"
+        # a NEW commit lands on origin between turns — a rebuild-from-origin
+        # would pick it up; a reuse must not
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty",
+                        "-m", "c2"], capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "main"],
+                       capture_output=True)
+        w2 = bot.WorktreeSession(str(repo), "main", sid)
+        async with w2 as wt_path:
+            assert wt_path == w2.worktree_path == w.worktree_path, "same path"
+            head2 = subprocess.run(["git", "-C", wt_path, "rev-parse", "HEAD"],
+                                   capture_output=True, text=True).stdout.strip()
+            assert head2 == head1, \
+                "the SAME commit must be reused, not rebuilt from origin (item 4)"
+            assert Path(w2.worktree_path, "uncommitted.txt").read_text() == "keep me\n", \
+                "the session's uncommitted changes must survive the resume"
+        assert os.path.exists(w2.worktree_path), "the tree persists for the next resume"
+        subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force",
+                        w2.worktree_path], capture_output=True)
+
+
+async def test_no_fallback_to_main_when_branch_missing(env, monkeypatch):
+        """Item 4: a session bound to a branch that no longer exists on
+        origin fails LOUD — no silent rebinding to main."""
+        repo = _mk_repo(env)
+        w = bot.WorktreeSession(str(repo), "feature-gone", "106021080_branch")
+        with pytest.raises(RuntimeError, match="worktree.branch_missing"):
+            w._enter_sync()
+
+
+async def test_quarantine_never_rides_into_report_and_retention_is_off_by_default(
+            env, monkeypatch):
+        """Item 2: only capture-STAMP dirs feed a report ZIP (an old-style
+        stale- dir under the capture root is invisible to the picker), the
+        quarantine root is never pruned, and capture auto-deletion is OFF by
+        default (0 = keep everything)."""
+        repo = _mk_repo(env)
+        wt = _wt(repo, env / "wt-q")
+        Path(wt, "dirty.txt").write_text("d\n")
+        cap = mcp_bridge.capture_worktree_delta(wt, "106021080:q")
+        assert cap.ok and cap.dirty, cap.reason
+        safe = mcp_bridge._safe_session_dir("106021080:q")
+        # an old-style stale- move under the capture root must NOT be picked
+        stale = Path(mcp_bridge.CAPTURE_ROOT) / safe / "stale-20260101-000000"
+        stale.mkdir(parents=True)
+        Path(stale, "secret.txt").write_text("s\n")
+        assert mcp_bridge.latest_capture_dir("106021080:q") == cap.path, \
+            "only capture-STAMP dirs may feed a report ZIP"
+        # default retention 0 = auto-delete OFF: a 400-day-old capture stays
+        monkeypatch.setattr(mcp_bridge, "CAPTURE_RETENTION_DAYS", 0)
+        old_mtime = os.path.getmtime(cap.path) - 400 * 86400
+        os.utime(cap.path, (old_mtime, old_mtime))
+        mcp_bridge._prune_old_captures(safe)
+        assert os.path.exists(cap.path), \
+            "default 0 must keep everything — auto-delete is OFF (item 2)"
+        # the knob still works when the owner sets it explicitly
+        monkeypatch.setattr(mcp_bridge, "CAPTURE_RETENTION_DAYS", 1)
+        mcp_bridge._prune_old_captures(safe)
+        assert not os.path.exists(cap.path), "an explicit retention day prunes"
+        # pruning NEVER touches the quarantine root (whatever day count)
+        qdir = Path(mcp_bridge.QUARANTINE_ROOT) / safe / "stale-20260102-000000"
+        qdir.mkdir(parents=True)
+        Path(qdir, "x.txt").write_text("x\n")
+        mcp_bridge._prune_old_captures(safe)
+        assert qdir.exists(), "pruning must never touch the quarantine root"
+        subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", wt],
+                       capture_output=True)
+
+
+async def test_list_tools_run_through_the_real_dispatcher(env, monkeypatch):
+        """Item 3: all three list tools through the REAL dispatch_rpc with the
+        REAL console handlers wired (only the engine seam is faked)."""
+        calls = wire_real(monkeypatch)
+        _, res = await _call_tool("projects_list", {})
+        p = _payload(res)
+        assert p["http_status"] == 200 and p["ok"], p
+        assert "Rag4Engineers" in p["projects"], p
+        _, res = await _call_tool("models_list", {})
+        p = _payload(res)
+        assert p["http_status"] == 200 and p["ok"], p
+        assert "families" in p, p
+        s = bot.SM.create(bot._console_chat_id(), "list-probe")
+        s.project = "Rag4Engineers"
+        _, res = await _call_tool("sessions_list", {})
+        p = _payload(res)
+        assert p["http_status"] == 200 and p["ok"], p
+        labels = {row.get("label") for row in p.get("sessions") or []}
+        assert "list-probe" in labels, f"a live session must be listed: {p}"
+        bot.SM.kill(bot._console_chat_id(), "list-probe")
+
+
+async def test_bot_mcp_enabled_off_really_stops_the_bridge(env, monkeypatch):
+        """Item 3: BOT_MCP_ENABLED off => the new behavior REALLY stops —
+        neither mcp_bridge.wire NOR the /mcp/rpc route comes to exist, while
+        every console route stays as before."""
+        wired = []
+        monkeypatch.setattr(mcp_bridge, "wire", lambda deps: wired.append(deps))
+        # aiohttp 3.13 made Resource.canonical a property; older versions a method
+        def paths(a):
+            out = set()
+            for r in a.router.routes():
+                c = r.resource.canonical
+                out.add(c() if callable(c) else c)
+            return out
+        monkeypatch.setattr(bot, "BOT_MCP_ENABLED", False)
+        a = bot._sessapi_build_app(FakeBot())
+        routes = paths(a)
+        assert not wired, "the bridge must NOT be wired while disabled"
+        assert "/mcp/rpc" not in routes, "the route must not exist while disabled"
+        assert {"/sessions", "/send", "/control", "/models", "/output"} <= routes, \
+            "the console routes are untouched by the gate"
+        monkeypatch.setattr(bot, "BOT_MCP_ENABLED", True)
+        a2 = bot._sessapi_build_app(FakeBot())
+        routes2 = paths(a2)
+        assert wired and wired[0].get("token") == bot.BOT_SESSION_API_TOKEN, \
+            "enablement wires the bridge with the SAME session-API token"
+        assert "/mcp/rpc" in routes2, "enablement registers the route"
 
 
 async def test_mcp_drives_only_claude_sessions(env, monkeypatch):
@@ -577,10 +841,11 @@ async def test_nonce_generator_tracks_the_clock(env, monkeypatch):
     generated nonces (they track the real clock, never fall behind)."""
     t0 = 1_800_000_000.0
     monkeypatch.setattr(bot.time, "time", lambda: t0)
-    bot._MCP_NONCE_SEQ = None
+    monkeypatch.setattr(bot, "_MCP_NONCE_SEQ", None)
     n1 = bot._mcp_next_nonce()
     n2 = bot._mcp_next_nonce()
-    assert n1 == int(t0 * 1000) and n2 == n1 + 1, "same-ms calls count up"
+    assert n1 == int(t0 * 1000) + 1 and n2 == n1 + 1, \
+        "same-ms calls count up; the FIRST is strictly above the floor/HWM"
     # A client nonce far above the clock raises the HWM; the generator must
     # still never emit a duplicate-bait value below it… but it must also not
     # be bricked by lagging: it tracks the clock, so after the clock passes
@@ -590,6 +855,24 @@ async def test_nonce_generator_tracks_the_clock(env, monkeypatch):
     n2b = bot._mcp_next_nonce()
     assert n2b > bot._CONSOLE_NONCE_HWM, \
         "the generator must never emit below a client-raised HWM (M1)"
+    monkeypatch.setattr(bot, "_MCP_NONCE_SEQ", None)
+
+
+async def test_first_generated_nonce_is_strictly_above_hwm(env, monkeypatch):
+    """Owner R-revisit item 5 (the found bug): the FIRST generated nonce must
+    be STRICTLY above the HWM. A first value landing exactly ON the floor —
+    which is what happened when a client had just raised the HWM to the
+    clock with its own epoch-ms nonce — was refused by _console_duplicate
+    as a duplicate of the caller's own request."""
+    t0 = 1_800_000_000.0
+    monkeypatch.setattr(bot.time, "time", lambda: t0)
+    # a client just sent the exact clock nonce, raising the HWM to it
+    monkeypatch.setattr(bot, "_CONSOLE_NONCE_HWM", int(t0 * 1000))
+    monkeypatch.setattr(bot, "_MCP_NONCE_SEQ", None)
+    n1 = bot._mcp_next_nonce()
+    assert n1 > bot._CONSOLE_NONCE_HWM, \
+        "the first nonce must be strictly above the HWM, never exactly on it"
+    assert n1 == int(t0 * 1000) + 1
     monkeypatch.setattr(bot, "_MCP_NONCE_SEQ", None)
 
 

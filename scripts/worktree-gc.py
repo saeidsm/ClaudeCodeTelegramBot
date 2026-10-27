@@ -13,10 +13,18 @@ remove --force` followed by `rm -rf` as a fallback.
 2. Latest file modification in worktree tree (skip if < AGE_THRESHOLD)
 3. Presence of `.active` marker file (skip if exists)
 
+**Dirty-tree protection (owner R-revisit item 1)**: worktrees now persist
+across a session's turns (BOT_WORKTREE_REUSE), so this GC is their main
+deletion path. A DIRTY tree is never rm -rf'd — it is QUARANTINED (moved
+under $BOT_DATA_ROOT/quarantine/<sid>/stale-<stamp>/ with its git index
+metadata copied in) and left for the owner. A tree that cannot be proven
+clean, or whose quarantine fails, is skipped — never deleted.
+
 Run via systemd timer (preferred) or cron.
 """
 import os
 import subprocess
+import sys
 import time
 import glob
 
@@ -33,6 +41,7 @@ cleaned = 0
 failed = 0
 skipped_young = 0
 skipped_active = 0
+quarantined_dirty = 0
 
 if not os.path.isdir(WORKTREE_ROOT):
     print(f"worktree-gc: WORKTREE_ROOT not present ({WORKTREE_ROOT}) — nothing to do")
@@ -79,6 +88,32 @@ def is_active_session(worktree_path: str) -> bool:
     return False
 
 
+def _quarantine_dirty(path: str, owner: str) -> str:
+    """Move a dirty tree into the quarantine root (files + git index meta),
+    reusing mcp_bridge.quarantine_stale_worktree. '' on failure — the
+    caller then refuses the destructive path."""
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import mcp_bridge
+        sid = os.path.basename(path).replace(":", "_")
+        return mcp_bridge.quarantine_stale_worktree(path, sid, owner or "")
+    except Exception:
+        return ""
+
+
+def _is_dirty(path: str) -> bool:
+    """True when the tree has uncommitted/untracked work (or is not a
+    regular git worktree at all — treat as untouchable, not as clean)."""
+    if not os.path.isfile(os.path.join(path, ".git")):
+        return True
+    try:
+        r = subprocess.run(["git", "-C", path, "status", "--porcelain=v1", "-z"],
+                           capture_output=True, timeout=30)
+        return bool(r.stdout.strip())
+    except Exception:
+        return True
+
+
 for path in glob.glob(f"{WORKTREE_ROOT}/*"):
     if not os.path.isdir(path):
         continue
@@ -109,6 +144,24 @@ for path in glob.glob(f"{WORKTREE_ROOT}/*"):
                 owner = repo_path
                 break
 
+    # Dirty-tree protection (owner R-revisit item 1): never delete what was
+    # not proven clean — quarantine it (files + git index) instead. This
+    # does NOT depend on finding the owner repo: quarantine needs only the
+    # path. A quarantine failure skips the tree (never deletes it).
+    if _is_dirty(path):
+        q = _quarantine_dirty(path, owner or "")
+        if q:
+            print(f"worktree-gc: quarantined dirty tree {path} -> {q}")
+            if owner:
+                subprocess.run(["git", "-C", owner, "worktree", "prune"],
+                               capture_output=True, timeout=30)
+            quarantined_dirty += 1
+        else:
+            print(f"worktree-gc: dirty tree {path} NOT quarantinable — "
+                  f"skipped (NOT removed)")
+            failed += 1
+        continue
+
     if owner:
         subprocess.run(
             ["git", "-C", owner, "worktree", "remove", "--force", path],
@@ -120,4 +173,6 @@ for path in glob.glob(f"{WORKTREE_ROOT}/*"):
     else:
         failed += 1
 
-print(f"worktree-gc: cleaned={cleaned} failed={failed} skipped_young={skipped_young} skipped_active={skipped_active} root={WORKTREE_ROOT}")
+print(f"worktree-gc: cleaned={cleaned} quarantined_dirty={quarantined_dirty} "
+      f"failed={failed} skipped_young={skipped_young} "
+      f"skipped_active={skipped_active} root={WORKTREE_ROOT}")

@@ -168,11 +168,15 @@ BOT_MCP_CONFIG = os.environ.get("BOT_MCP_CONFIG", "").strip()
 # settings.json deny list, so it costs two deliberate acts, not one.
 BOT_ALLOW_SKIP_MODE = os.environ.get("BOT_ALLOW_SKIP_MODE", "").strip() == "1"
 
-# Per-session ephemeral worktrees live here. Each spawn gets its own
-# subdir (<session_id>) so concurrent sessions on the same project don't
-# collide. Cleaned on session exit; orphans GC'd by claude-worktree-gc.timer.
+# Per-session worktrees live here. Each session gets its own subdir
+# (<session_id>) so concurrent sessions on the same project don't collide.
+# Owner R-revisit item 4: the tree PERSISTS across the session's own turns
+# (resume keeps the same commit + uncommitted changes). Rollback knob:
+# BOT_WORKTREE_REUSE=0 restores the old fresh-tree-per-spawn behavior
+# (delete on exit, rebuild from origin each turn).
 WORKTREE_ROOT = os.environ.get("BOT_WORKTREE_ROOT", "/tmp/claude-sessions")
 os.makedirs(WORKTREE_ROOT, exist_ok=True)
+WORKTREE_REUSE = os.environ.get("BOT_WORKTREE_REUSE", "1").strip().lower() not in ("0", "false", "off", "no")
 
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -1349,7 +1353,7 @@ def _release_worktree_owner_if_current(canonical: str, token: object) -> None:
 
 
 class WorktreeSession:
-    """Per-session ephemeral git worktree.
+    """Per-session PERSISTENT git worktree.
 
     Each Claude Code spawn runs inside its own worktree at
     WORKTREE_ROOT/<session_id> with an independent .git/HEAD. Concurrent
@@ -1357,10 +1361,15 @@ class WorktreeSession:
 
     Replaces Phase A's reset_repo_to_main pattern (which was destroying
     in-progress work in a sibling session every time another session
-    spawned). Sessions still must not depend on uncommitted state across
-    spawns — each spawn re-creates the worktree from origin/<branch>.
-    To carry work forward, Claude Code must commit + push within a spawn;
-    the next spawn picks the change up via origin.
+    spawned).
+
+    Owner R-revisit item 4: the worktree now PERSISTS across the turns of
+    its own session — a resume reuses the SAME commit and the SAME
+    uncommitted changes (no fetch, no rebuild from origin/<branch>, no
+    fallback to main). To carry work to a DIFFERENT session, Claude Code
+    must still commit + push; origin pickup only happens on the FIRST
+    spawn of a session (or with BOT_WORKTREE_REUSE=0, which restores the
+    old fresh-tree-per-spawn behavior).
 
     Non-git projects fall back to rsync of the project dir into the
     worktree path (no isolation guarantees, but matches the spirit of
@@ -1373,6 +1382,8 @@ class WorktreeSession:
         self.session_id = session_id
         self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
         self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
+        # Item 4: persistent per-session worktree (rollback: BOT_WORKTREE_REUSE=0)
+        self.reuse_tree = WORKTREE_REUSE
         self._enter_task = None
         self._orphan_cleanup_scheduled = False
         self._canonical = None
@@ -1383,6 +1394,25 @@ class WorktreeSession:
         # the worktree on disk (next same-session enter does stale_cleanup)
         # instead of rm -rf-ing uncommitted work away.
         self.preserve_on_exit = False
+
+    def _is_project_worktree(self) -> bool:
+        """True when worktree_path is a live git worktree OF THIS project:
+        its .git FILE points into <project>/.git/worktrees/ and that gitdir
+        still exists. A crashed partial add, a corrupted tree or another
+        repo's tree all fail this and take the capture/quarantine path."""
+        dotgit = os.path.join(self.worktree_path, ".git")
+        if not os.path.isfile(dotgit):
+            return False
+        try:
+            with open(dotgit, encoding="utf-8") as fh:
+                line = fh.readline().strip()
+        except OSError:
+            return False
+        if not line.startswith("gitdir:"):
+            return False
+        gitdir = os.path.abspath(line[len("gitdir:"):].strip())
+        prefix = os.path.abspath(os.path.join(self.project_path, ".git", "worktrees")) + os.sep
+        return gitdir.startswith(prefix) and os.path.isdir(gitdir)
 
     def _enter_sync(self):
         if not self.is_git:
@@ -1395,6 +1425,15 @@ class WorktreeSession:
                      f"sid={self.session_id} type=non-git")
             return self.worktree_path
 
+        # Owner R-revisit item 4: REUSE this session's persistent worktree
+        # when it is a live git worktree of THIS project — same commit, same
+        # uncommitted changes. No fetch, no rebuild from origin, no fallback
+        # to main: a resume must find the prior state exactly as it was.
+        if self.reuse_tree and self._is_project_worktree():
+            log.info(f"worktree.reused sid={self.session_id} "
+                     f"path={self.worktree_path} (persistent session tree)")
+            return self.worktree_path
+
         # Idempotent enter: clean up any stale dir from a previous crash.
         # C1 (post-review): a stale dir may be a tree preserved by
         # preserve_on_exit (capture unproven) — it is still uncommitted
@@ -1403,7 +1442,11 @@ class WorktreeSession:
         if os.path.exists(self.worktree_path):
             cap = mcp_bridge.capture_worktree_delta(self.worktree_path, self.session_id)
             if cap.dirty and not cap.ok:
-                q = mcp_bridge.quarantine_stale_worktree(self.worktree_path, self.session_id)
+                # project_path: copy the git index/HEAD (<project>/.git/
+                # worktrees/<name>/) into the quarantine BEFORE the prune
+                # below deletes it — dirty files AND index survive (item 1).
+                q = mcp_bridge.quarantine_stale_worktree(
+                    self.worktree_path, self.session_id, self.project_path)
                 if not q:
                     # Quarantine failed (disk?): fail LOUD — a visible failed
                     # turn beats silent data loss. Never the destructive path.
@@ -1424,7 +1467,9 @@ class WorktreeSession:
                     capture_output=True, timeout=30)
                 subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True)
 
-        # Fetch latest (best-effort — don't fail spawn on network blip)
+        # Fetch latest (best-effort — don't fail spawn on network blip).
+        # Only on the FRESH-create path: a reused session tree must NOT be
+        # rebuilt from origin (item 4) — the reuse branch returned above.
         try:
             subprocess.run(
                 ["git", "-C", self.project_path, "fetch", "origin", "--quiet", "--depth=50"],
@@ -1432,14 +1477,18 @@ class WorktreeSession:
         except subprocess.TimeoutExpired:
             log.warning(f"worktree.fetch_timeout project={os.path.basename(self.project_path)}")
 
-        # Validate branch exists on origin; fall back to main
+        # Branch must exist on origin. NO silent fallback to main (owner
+        # item 4): a session bound to a branch that vanished from origin
+        # fails LOUD instead of silently rebinding to main and resuming on
+        # the wrong tree.
         check = subprocess.run(
             ["git", "-C", self.project_path, "rev-parse", "--verify", f"origin/{self.branch}"],
             capture_output=True, timeout=10)
         if check.returncode != 0:
-            log.warning(f"worktree.branch_missing branch={self.branch} "
-                        f"project={os.path.basename(self.project_path)} fallback=main")
-            self.branch = "main"
+            raise RuntimeError(
+                f"worktree.branch_missing branch={self.branch} "
+                f"project={os.path.basename(self.project_path)} "
+                f"(no fallback to main; session is bound to this branch)")
 
         # --detach: avoid "branch already checked out elsewhere" when two
         # concurrent sessions ask for the same branch. Claude can `git
@@ -1468,6 +1517,16 @@ class WorktreeSession:
             # in place (the next same-session enter does stale_cleanup).
             log.warning(f"worktree.preserved_dirty sid={self.session_id} "
                         f"path={self.worktree_path} (capture unproven; NOT removed)")
+            return False
+        if self.is_git and self.reuse_tree:
+            # Owner R-revisit items 1+4: the session tree PERSISTS for the
+            # next turn/resume of THIS session — same commit, same changes,
+            # nothing deleted on the happy path (TurnCapture already saved
+            # this turn's delta into the capture/report ZIP on the way out).
+            # Deletion only ever happens via the stale path (unproven
+            # capture -> quarantine, never rm -rf) or with
+            # BOT_WORKTREE_REUSE=0 (old ephemeral behavior).
+            log.info(f"worktree.kept_for_resume sid={self.session_id} path={self.worktree_path}")
             return False
         if not os.path.exists(self.worktree_path):
             return False
@@ -1957,10 +2016,12 @@ async def _session_context_note(session, project, repo) -> str:
 async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
     """Invoke Claude Code for a session inside a per-session git worktree.
 
-    Phase B: each spawn runs in WORKTREE_ROOT/<session_id>, a fresh worktree
-    detached at origin/<branch>. The shared repo is never modified. Claude
-    Code's session-uuid persistence lives in ~/.claude/, not the project
-    dir, so --resume works regardless of cwd.
+    Phase B + owner R-revisit item 4: each session runs in
+    WORKTREE_ROOT/<session_id>, a worktree detached at origin/<branch> that
+    PERSISTS across the session's turns — a resume reuses the same commit
+    and the same uncommitted changes (WorktreeSession). The shared repo is
+    never modified. Claude Code's session-uuid persistence lives in
+    ~/.claude/, not the project dir, so --resume works regardless of cwd.
 
     First call uses --session-id (creates session with our UUID).
     Subsequent calls use --resume (preserves conversation context).
@@ -6818,14 +6879,15 @@ def _mcp_next_nonce() -> int:
     high-water mark (M1 after review): a plain count seeded once falls
     behind real time and gets poisoned by any client that sent its own
     epoch-ms nonce, after which every session_new fails as 'duplicate'.
-    Clock+HWM-tracked: never below now, never below an accepted nonce."""
+    Clock+HWM-tracked: never below now, never below an accepted nonce —
+    and STRICTLY ABOVE both on EVERY call (owner R-revisit, first-call
+    bug): _console_duplicate refuses <= HWM, so a first value landing
+    exactly ON the floor (== a HWM a client just raised to the clock)
+    was refused as a duplicate of the caller's own nonce."""
     global _MCP_NONCE_SEQ
     floor = max(int(time.time() * 1000), _CONSOLE_NONCE_HWM)
-    if _MCP_NONCE_SEQ is None:
-        _MCP_NONCE_SEQ = floor
-    elif _MCP_NONCE_SEQ < floor:
-        # strictly ABOVE the floor: _console_duplicate refuses <= HWM, so a
-        # landing-on-the-floor value would be refused as a duplicate itself.
+    if _MCP_NONCE_SEQ is None or _MCP_NONCE_SEQ < floor:
+        # strictly ABOVE the floor on the first call too
         _MCP_NONCE_SEQ = floor + 1
     else:
         _MCP_NONCE_SEQ += 1
@@ -6862,13 +6924,13 @@ async def _sessapi_mcp_rpc(req):
     return await mcp_bridge.handle_http(req)
 
 
-async def _sessapi_start(app):
-    global _SESSAPI_RUNNER
-    if not BOT_SESSION_API_TOKEN:
-        log.warning("session_api.disabled reason=missing_secret")
-        return
+def _sessapi_build_app(bot_obj) -> "_aw.Application":
+    """Build the session-API aiohttp app: the console routes plus the
+    BOT_MCP_ENABLED-gated MCP bridge. Split out of _sessapi_start (owner
+    R-revisit item 3) so the gate is directly testable: with the gate off,
+    NEITHER mcp_bridge.wire NOR the /mcp/rpc route comes to exist."""
     a = _aw.Application()
-    a["bot"] = app.bot
+    a["bot"] = bot_obj
     a.router.add_get("/sessions", _sessapi_sessions)
     a.router.add_get("/metrics", _sessapi_metrics)
     a.router.add_get("/output", _sessapi_output)
@@ -6897,11 +6959,20 @@ async def _sessapi_start(app):
             "model_metadata": _mcp_model_metadata,
             "audit": _console_audit,
             "mcp_projects": BOT_MCP_PROJECTS,
-            "bot": app.bot,
+            "bot": bot_obj,
         })
         a.router.add_post("/mcp/rpc", _sessapi_mcp_rpc)
         log.info(f"mcp_bridge.enabled projects={BOT_MCP_PROJECTS} engine=claude "
                   f"cancel=queued-only")
+    return a
+
+
+async def _sessapi_start(app):
+    global _SESSAPI_RUNNER
+    if not BOT_SESSION_API_TOKEN:
+        log.warning("session_api.disabled reason=missing_secret")
+        return
+    a = _sessapi_build_app(app.bot)
     runner = _aw.AppRunner(a)
     await runner.setup()
     try:
