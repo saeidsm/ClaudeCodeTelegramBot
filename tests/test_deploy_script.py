@@ -226,7 +226,16 @@ case "$url" in
       none) : ;;
     esac; exit 0 ;;
   *openrouter*)
+    if [ "${OR_REQUIRE_BOUNDS:-0}" = 1 ]; then
+      [[ " $* " = *" --http1.1 "* && " $* " = *" --compressed "* && " $* " = *" --connect-timeout 10 "* && " $* " = *" --max-time 90 "* && " $* " = *" --max-filesize 20971520 "* ]] || exit 91
+    fi
     case "${OR_MODE:-ok}" in
+      timeout) printf '{"data":[' > "$out"; echo 200; exit 28 ;;
+      transport_valid_json) printf '{"data":[{"id":"x"}]}' > "$out"; echo 200; exit 28 ;;
+      truncated) printf '{"data":[{"id":"x"}' > "$out"; echo 200 ;;
+      trailing) printf '{"data":[{"id":"x"}]}garbage' > "$out"; echo 200 ;;
+      badshape) printf '{"data":[{}]}' > "$out"; echo 200 ;;
+
       ok)      [ -n "$out" ] && printf '{"data":[{"id":"z-ai/glm-5.2"}]}' > "$out"; echo 200 ;;
       e401)    [ -n "$out" ] && printf '{"error":"unauthorized"}' > "$out"; echo 401 ;;
       e429)    [ -n "$out" ] && printf '{"error":"rate"}' > "$out"; echo 429 ;;
@@ -646,6 +655,10 @@ def test_healthz_contract_rejects_wrong_response(fs):
 @pytest.mark.parametrize("mode,expect", [
     ("e401", "http=401"), ("e429", "http=429"),
     ("badjson", "payload invalid"), ("empty", "payload invalid"),
+    ("timeout", "transfer failed rc=28 http=200"),
+    ("transport_valid_json", "transfer failed rc=28 http=200"),
+    ("truncated", "payload invalid"), ("trailing", "payload invalid"),
+    ("badshape", "payload invalid"),
 ])
 def test_openrouter_probe_fails_closed(fs, mode, expect):
     r = _execute(fs, env_extra={"OR_MODE": mode})
@@ -1323,3 +1336,9 @@ def test_missing_service_path_refuses_before_mutation(fs):
     assert 'service PATH unavailable or ambiguous' in r.stderr
     assert _status(fs) == 'STOPPED_BEFORE_MUTATION'
     assert _field(fs, 'QUIESCE_STOPS') == '0'
+
+
+def test_catalog_transfer_is_bounded_and_compressed(fs):
+    r = _run(fs, '--preflight', '--merged-sha', _SHA, env_extra={'OR_REQUIRE_BOUNDS': '1'})
+    assert r.returncode == 0, r.stderr
+    assert 'sk-or-SECRET-KEEP' not in r.stdout + r.stderr

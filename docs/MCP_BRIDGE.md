@@ -120,3 +120,11 @@ redirects and exhausted explicit budgets, and never logs credentials or response
 bodies. Only literal values and references to preceding literal variables are
 accepted; shell commands and unresolved references refuse. Authentication failure
 never triggers a subscription-to-gateway or gateway-to-subscription fallback.
+
+The independent OpenRouter catalog check uses HTTP/1.1 with compression, bounds connection
+setup to 10 seconds and the complete transfer to 90 seconds, and limits accepted
+payloads to 20 MiB. HTTP status alone is insufficient: any nonzero curl exit
+refuses even a seemingly valid partial body. The full JSON document must parse,
+contain a nonempty data list, and provide a nonempty string id for every model.
+Timeouts and truncated responses remain deployment blockers; no cached or partial
+catalog is substituted. Provider configuration and authentication are unchanged.
