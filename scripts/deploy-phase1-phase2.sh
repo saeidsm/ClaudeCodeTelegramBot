@@ -230,6 +230,9 @@ ARMED=0; RESTARTED_FWD=0; TIMER_ACTIVATED=0
 MANIFEST=""; BACKUP=""; OLD_PID=""; NEW_PID=""; RESTART_CURSOR=""
 TIMER_WAS_ENABLED=""; TIMER_WAS_ACTIVE=""
 ROLLBACK_ERRORS=""
+GC_TOUCHED=0; GC_WAS_ACTIVE=""
+PUBLISHER_CONFIG=""
+PUBLISHER_PLAN="$SCRATCH/publisher-plan.json"
 SVC_UID=""; SVC_GID=""
 R_STATE=""; R_CHAT=""; R_COORD=""; R_COORDLOCK=""; R_CACHE=""; R_TOKEN=""; R_RETENTION_ENV=""
 NW_ENABLED=""; NW_BIND=""; NW_BIND2=""; NW_PORT=""
@@ -334,6 +337,9 @@ resolve_paths() {
 # ── artifact table ──────────────────────────────────────────────────────────
 artifacts() {
   echo "$LIVE_SCRIPTS/claude-telegram-bot.py|$SOURCE/bot.py|file"
+  echo "$LIVE_SCRIPTS/mcp_bridge.py|$SOURCE/mcp_bridge.py|file"
+  echo "$LIVE_SCRIPTS/worktree-gc.py|$SOURCE/scripts/worktree-gc.py|file"
+  echo "$SYSTEMD_DIR/claude-worktree-gc.service|$SOURCE/systemd/claude-worktree-gc.service|gc-render"
   echo "$LIVE_SCRIPTS/coordination.py|$SOURCE/coordination.py|file"
   echo "$LIVE_SCRIPTS/resource_footer.py|$SOURCE/resource_footer.py|file"
   echo "$LIVE_SCRIPTS/log_filters.py|$SOURCE/log_filters.py|file"
@@ -345,6 +351,7 @@ artifacts() {
   echo "$SYSTEMD_DIR/reports-cleanup.timer|$SOURCE/systemd/reports-cleanup.timer|file"
 }
 backup_only() {
+  [ -z "$PUBLISHER_CONFIG" ] || echo "$PUBLISHER_CONFIG"
   echo "$ENV_FILE"; echo "$R_STATE"; echo "$R_COORD"; echo "$R_COORDLOCK"
   echo "$R_CACHE"; echo "$R_CHAT"; echo "$R_RETENTION_ENV"
   echo "$CRON_DIR/cleanup-reports"; echo "$CRON_DIR/nightwatch-reports-cleanup"; echo "$NIGHTLY"
@@ -456,6 +463,10 @@ rollback() {
   else
     $SYSTEMCTL stop reports-cleanup.timer >/dev/null 2>&1 || rb_err "re-stop timer"
   fi
+  if [ -n "$PUBLISHER_CONFIG" ]; then
+    "$PYTHON" "$SOURCE/scripts/publisher-deploy.py" rollback-smoke "$PUBLISHER_PLAN" \
+      || rb_err "restored publisher loader/pin verification failed"
+  fi
   # 5) restart the OLD bot and verify it is genuinely back
   $SYSTEMCTL restart "$SERVICE" >/dev/null 2>&1 || rb_err "restart old bot"
   $SYSTEMCTL is-active --quiet "$SERVICE" || rb_err "old bot not active after restore"
@@ -464,6 +475,43 @@ rollback() {
   [ -n "$rbpid" ] && [ "$rbpid" != "0" ] || rb_err "old bot has no MainPID after restore"
   # rollback verifies the ORIGINAL pre-deploy endpoints, never forward values
   check_listeners "$rbpid" original || rb_err "listeners unhealthy after restore (original profile)"
+}
+
+# GC must not observe a partially installed module/unit. Never kill a live sweep.
+quiesce_gc() {
+  [ -f "$SYSTEMD_DIR/claude-worktree-gc.service" ] || return 0
+  GC_WAS_ACTIVE="$($SYSTEMCTL show claude-worktree-gc.timer -p ActiveState --value)" || die "GC timer state unavailable"
+  case "$GC_WAS_ACTIVE" in active|inactive) ;; *) die "GC timer state unknown";; esac
+  GC_TOUCHED=1
+  $SYSTEMCTL stop claude-worktree-gc.timer || die "GC timer stop failed"
+  $SYSTEMCTL is-active --quiet claude-worktree-gc.timer && die "GC timer still active"
+  local state
+  state="$($SYSTEMCTL show claude-worktree-gc.service -p ActiveState --value)" || die "GC service state unavailable"
+  [ "$state" = inactive ] || die "GC sweep active or unknown; refusing mutation"
+}
+restore_gc() {
+  [ "$GC_TOUCHED" -eq 1 ] || return 0
+  if [ "$GC_WAS_ACTIVE" = active ]; then
+    $SYSTEMCTL start claude-worktree-gc.timer || return 1
+    $SYSTEMCTL is-active --quiet claude-worktree-gc.timer || return 1
+  else
+    $SYSTEMCTL stop claude-worktree-gc.timer || return 1
+    if $SYSTEMCTL is-active --quiet claude-worktree-gc.timer; then return 1; fi
+  fi
+  GC_TOUCHED=0
+}
+# The active publisher pins the application digest. Prepare a source-pinned
+# transaction before any mutation; unknown bootstrap versions remain refused.
+gate_bootstrap() {
+  local command
+  command="$($SYSTEMCTL show "$SERVICE" -p ExecStart --value)" || die "startup command unavailable"
+  case "$command" in
+    *publisher-bootstrap.py*)
+      PUBLISHER_CONFIG="$("$PYTHON" "$SOURCE/scripts/publisher-deploy.py" prepare "$command" "$SOURCE/bot.py" "$PUBLISHER_PLAN")" \
+        || die "publisher bootstrap pins application_sha256; source-pinned preparation failed"
+      [ -n "$PUBLISHER_CONFIG" ] && [ -s "$PUBLISHER_PLAN" ] || die "publisher plan missing"
+      ;;
+  esac
 }
 
 on_exit() {
@@ -480,7 +528,14 @@ on_exit() {
     $SYSTEMCTL start "$SERVICE" >/dev/null 2>&1
     if $SYSTEMCTL is-active --quiet "$SERVICE"; then QUIESCE_RESTORE="ok"; else QUIESCE_RESTORE="FAILED"; fi
   fi
+  if [ "$GC_TOUCHED" -eq 1 ] && [ "$STATUS" != ROLLBACK_FAILED ]; then
+    if ! restore_gc; then
+      STATUS="ROLLBACK_FAILED"; rc=1
+      rb_err "GC timer state restore failed"
+    fi
+  fi
   {
+    echo "GC_TIMER_WAS: ${GC_WAS_ACTIVE:-not-managed}"
     echo "# Deploy transaction report"
     echo "STATUS: $STATUS"
     echo "MODE: $MODE"
@@ -530,9 +585,9 @@ gate_source() {
 gate_suite() {
   fail_at gate_suite && die "forced: gate_suite"
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m py_compile \
-     "$SOURCE/bot.py" "$SOURCE/coordination.py" "$SOURCE/resource_footer.py" \
+     "$SOURCE/bot.py" "$SOURCE/mcp_bridge.py" "$SOURCE/scripts/worktree-gc.py" "$SOURCE/coordination.py" "$SOURCE/resource_footer.py" \
      "$SOURCE/log_filters.py" "$SOURCE"/engines/*.py "$SOURCE"/video_module/*.py \
-     "$SOURCE/scripts/coord_publish.py" || die "py_compile failed on source"
+     "$SOURCE/scripts/coord_publish.py" "$SOURCE/scripts/publisher-deploy.py" || die "py_compile failed on source"
   for s in "$SOURCE"/scripts/*.sh; do bash -n "$s" || die "bash -n failed: $s"; done
   local out passed
   out="$( cd "$SOURCE" && PYTHONDONTWRITEBYTECODE=1 \
@@ -899,6 +954,10 @@ install_artifacts() {
         rm -rf -- "$dest"; cp -a "$src" "$dest"
         [ "$(tree_hash "$src")" = "$(tree_hash "$dest")" ] || die "tree manifest mismatch after install: $dest"
         ;;
+      gc-render)
+        sed "s|^ExecStart=.*$|ExecStart=$PYTHON $LIVE_SCRIPTS/worktree-gc.py|" "$src" > "$SCRATCH/gc-unit"
+        install -D -m 0644 "$SCRATCH/gc-unit" "$dest"
+        ;;
       render)
         [ -f "$src" ] || die "source unit missing: $src"
         # render the service unit to the RESOLVED retention config/script/guard
@@ -1025,11 +1084,18 @@ PY
 
 verify_install() {
   fail_at verify_install && die "forced: verify_install"
+  if [ -n "$PUBLISHER_CONFIG" ]; then
+    "$PYTHON" "$SOURCE/scripts/publisher-deploy.py" smoke "$PUBLISHER_PLAN" \
+      || die "publisher loader/construction smoke failed"
+  fi
   PYTHONPATH="$LIVE_SCRIPTS" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY' || die "live-dir import/construction smoke failed"
-import importlib.util, os
+import importlib.util, os, sys
 d=os.environ["PYTHONPATH"]
+sys.path.insert(0, d)
+import mcp_bridge
 spec=importlib.util.spec_from_file_location("livebot", os.path.join(d,"claude-telegram-bot.py"))
-m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m=importlib.util.module_from_spec(spec); sys.modules[spec.name]=m; spec.loader.exec_module(m)
+assert os.path.realpath(mcp_bridge.__file__) == os.path.realpath(os.path.join(d,"mcp_bridge.py"))
 from telegram.ext import Application, ExtBot
 from telegram.request import HTTPXRequest
 b=m.FooterBot("123456:AAHfake-offline-token_xxxxxxxxxxxxxxxxxx",
@@ -1272,13 +1338,18 @@ gate_reviewed_identity() {
 }
 
 gate_reviewed_identity
+gate_bootstrap
 exec 9>"$LOCK"; flock -n 9 || die "another deploy holds the lock"
 
+quiesce_gc
 quiesce_service      # Gap 2: quiescence boundary BEFORE any file mutation
 build_manifest       # backup captures the AUTHORITATIVE post-quiesce state
 ARMED=1
 
 install_artifacts
+if [ -n "$PUBLISHER_CONFIG" ]; then
+  "$PYTHON" "$SOURCE/scripts/publisher-deploy.py" update "$PUBLISHER_PLAN" || die "publisher pin update failed"
+fi
 edit_env
 migrate_retention
 verify_install

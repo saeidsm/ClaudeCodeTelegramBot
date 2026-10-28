@@ -4,12 +4,13 @@ Shahrzad DevOps Telegram Bot v4
 Multi-Session | Voice (Gemini STT + LLM refinement) | Files | Rich UI
 """
 
-import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars
-from datetime import datetime, timedelta
+import os, sys, json, asyncio, subprocess, logging, html, base64, uuid, time, re, signal, hmac, hashlib, random, secrets, shutil, ipaddress, zipfile, contextvars, tempfile
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 
 import aiohttp
 from aiohttp import web as _aw
@@ -27,6 +28,9 @@ from engines.openrouter_chat import (
 )
 import coordination as coord
 import resource_footer
+from engines.project_context import project_context, validate_codex_project
+from engines import claude_gateway
+import mcp_bridge
 
 from telegram import (
     Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -34,7 +38,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, ExtBot
+    TypeHandler, ApplicationHandlerStop, filters, ContextTypes, ExtBot
 )
 from telegram.constants import ParseMode, ChatAction
 from telegram.error import BadRequest
@@ -118,15 +122,21 @@ def _positive_int_env(name: str, default: int) -> int:
 MAX_SESSIONS               = _positive_int_env("BOT_MAX_SESSIONS", 4)
 MAX_RUNNING_AGENTS         = _positive_int_env("BOT_MAX_RUNNING_AGENTS", 2)
 
-# Default Claude Code model for new sessions — empty = CLI default,
-# "sonnet"/"opus" aliases, or full model name like "claude-sonnet-5".
+# Default Claude Code model for new sessions — empty = CLI default. Prefer a
+# FAMILY ALIAS ("sonnet", "opus", "haiku", "fable"): the CLI resolves an alias to
+# the newest model in that family, so an alias never goes stale. A full version
+# id can be set here, but then someone has to remember to bump it.
 # Per-session overrides via /model (Session.claude_model).
 BOT_DEFAULT_CLAUDE_MODEL   = os.environ.get("BOT_DEFAULT_CLAUDE_MODEL", "")
 
-# Sonnet-1M model offered as an immediate switch when Claude (Opus) is
-# overloaded. The "[1m]" suffix selects the 1M-context variant (same syntax the
-# CLI uses for claude-opus-5[1m]). Override via env if the id ever changes.
-SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "claude-sonnet-5[1m]")
+# Sonnet-1M model offered as an immediate switch when Claude is overloaded.
+# The "[1m]" suffix selects the 1M-context variant. Use the FAMILY ALIAS, not a
+# pinned version: `sonnet[1m]` resolves to the newest sonnet's 1M variant, so
+# this follows releases with no code change. The old default was pinned to
+# claude-sonnet-4-6[1m] and had silently kept the overload fallback on Sonnet
+# 4.6 after Sonnet 5 shipped. [verified 2026-08-21: `--model sonnet[1m]` ->
+# modelUsage claude-sonnet-5[1m] on CLI 2.1.237]
+SONNET_1M_MODEL            = os.environ.get("BOT_SONNET_1M_MODEL", "sonnet[1m]")
 # Seconds to wait before the single automatic retry on a Claude rate-limit.
 try:
     RATE_LIMIT_RETRY_DELAY = int(os.environ.get("BOT_RATE_LIMIT_RETRY_DELAY", "60"))
@@ -148,12 +158,25 @@ RL_URGENT_SECS = 300  # the "urgent" override: resend in 5 min
 #   strict    → no flag; default Claude Code --print behavior denies non-approved tools
 BOT_TOOL_PERMISSION_MODE = os.environ.get("BOT_TOOL_PERMISSION_MODE", "strict").lower()
 BOT_ALLOWED_TOOLS = os.environ.get("BOT_ALLOWED_TOOLS", "")
+# Path to a JSON file listing exactly the MCP servers a bot session may start.
+# When set, the spawn adds --mcp-config <path> --strict-mcp-config, which ignores
+# user scope entirely. Empty (the default) leaves behaviour unchanged, so this is
+# opt-in and reverts by clearing one variable. Disabling a server changes the
+# agent's capability surface, which is a founder decision, not a code decision.
+BOT_MCP_CONFIG = os.environ.get("BOT_MCP_CONFIG", "").strip()
+# Second key for `skip` mode. See _assert_permission_mode(): skip disarms the
+# settings.json deny list, so it costs two deliberate acts, not one.
+BOT_ALLOW_SKIP_MODE = os.environ.get("BOT_ALLOW_SKIP_MODE", "").strip() == "1"
 
-# Per-session ephemeral worktrees live here. Each spawn gets its own
-# subdir (<session_id>) so concurrent sessions on the same project don't
-# collide. Cleaned on session exit; orphans GC'd by claude-worktree-gc.timer.
+# Per-session worktrees live here. Each session gets its own subdir
+# (<session_id>) so concurrent sessions on the same project don't collide.
+# Owner R-revisit item 4: the tree PERSISTS across the session's own turns
+# (resume keeps the same commit + uncommitted changes). Rollback knob:
+# BOT_WORKTREE_REUSE=0 restores the old fresh-tree-per-spawn behavior
+# (delete on exit, rebuild from origin each turn).
 WORKTREE_ROOT = os.environ.get("BOT_WORKTREE_ROOT", "/tmp/claude-sessions")
 os.makedirs(WORKTREE_ROOT, exist_ok=True)
+WORKTREE_REUSE = os.environ.get("BOT_WORKTREE_REUSE", "0").strip().lower() not in ("0", "false", "off", "no")
 
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -177,8 +200,7 @@ COORDINATION_FILE = os.environ.get("BOT_COORDINATION_FILE", f"{BOT_CONFIGS_DIR}/
 # so a relative path is useless there — we inject the validated ABSOLUTE path
 # (AGENT_COORD_PUBLISHER) into the child env. BOT_COORD_PUBLISHER overrides the
 # default for non-standard deploy layouts; it is preflighted before injection.
-_COORD_PUBLISHER_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                    "scripts", "coord_publish.py")
+_COORD_PUBLISHER_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coord_publish.py")
 BOT_COORD_PUBLISHER = os.environ.get("BOT_COORD_PUBLISHER", "").strip() or _COORD_PUBLISHER_SRC
 CHAT_CATALOG_TTL = _positive_int_env("BOT_CHAT_CATALOG_TTL", 3600)
 CHAT_CONCURRENCY = _positive_int_env("BOT_CHAT_CONCURRENCY", 4)  # independent of heavy cap
@@ -358,12 +380,24 @@ def load_projects() -> list[dict]:
 
 
 def save_projects(projects: list[dict]):
+    temporary = None
     try:
         os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
-        with open(PROJECTS_FILE, "w") as f:
+        with tempfile.NamedTemporaryFile(mode="w", dir=os.path.dirname(PROJECTS_FILE), delete=False) as f:
+            temporary = f.name
             json.dump(projects, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(PROJECTS_FILE):
+            shutil.copymode(PROJECTS_FILE, temporary)
+        os.replace(temporary, PROJECTS_FILE)
+        return True
     except Exception as e:
         log.error(f"Failed to save projects: {e}")
+        return False
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def get_project_names() -> list[str]:
@@ -385,8 +419,7 @@ def add_project(name: str, path: str) -> str | None:
     if any(p["name"] == name for p in projects):
         return "Project already exists"
     projects.append({"name": name, "path": path})
-    save_projects(projects)
-    return None
+    return None if save_projects(projects) else "Could not save project registry"
 
 
 def get_project_path(name: str) -> str:
@@ -623,6 +656,19 @@ class Session:
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
     claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
+    # Branch the session's worktrees spawn from. Persisted (additive, v1
+    # state schema) so a restart cannot silently re-bind a resumed session
+    # to a different branch; the MCP bridge relies on this binding.
+    starting_branch: str = "main"
+    mcp_managed: bool = False
+    mcp_worktree_created: bool = False
+    # Why this session is in its current status. "error" alone is ambiguous:
+    # until phase 2D it was set ONLY by a restart, never by a real failure, so a
+    # console "show me the error" button would have had nothing to show.
+    #   interrupted_by_restart -> the process died under it; resend resumes it
+    #   execution_failed       -> the engine exited non-zero; error_text has why
+    status_reason: str = ""
+    error_text: str = ""             # scrubbed engine stderr, only for execution_failed
     # ── Phase 2: multi-engine ──
     engine: str = "claude"           # claude | codex | chat  (old sessions => claude)
     model: str = ""                  # generic per-engine model id (codex/chat); Claude keeps claude_model
@@ -1309,7 +1355,7 @@ def _release_worktree_owner_if_current(canonical: str, token: object) -> None:
 
 
 class WorktreeSession:
-    """Per-session ephemeral git worktree.
+    """Per-session PERSISTENT git worktree.
 
     Each Claude Code spawn runs inside its own worktree at
     WORKTREE_ROOT/<session_id> with an independent .git/HEAD. Concurrent
@@ -1317,29 +1363,70 @@ class WorktreeSession:
 
     Replaces Phase A's reset_repo_to_main pattern (which was destroying
     in-progress work in a sibling session every time another session
-    spawned). Sessions still must not depend on uncommitted state across
-    spawns — each spawn re-creates the worktree from origin/<branch>.
-    To carry work forward, Claude Code must commit + push within a spawn;
-    the next spawn picks the change up via origin.
+    spawned).
+
+    Owner R-revisit item 4: the worktree now PERSISTS across the turns of
+    its own session — a resume reuses the SAME commit and the SAME
+    uncommitted changes (no fetch, no rebuild from origin/<branch>, no
+    fallback to main). To carry work to a DIFFERENT session, Claude Code
+    must still commit + push; origin pickup only happens on the FIRST
+    spawn of a session (or with BOT_WORKTREE_REUSE=0, which restores the
+    old fresh-tree-per-spawn behavior).
 
     Non-git projects fall back to rsync of the project dir into the
     worktree path (no isolation guarantees, but matches the spirit of
     "fresh tree per spawn").
     """
-    def __init__(self, project_path: str, branch: str, session_id: str):
+    def __init__(self, project_path: str, branch: str, session_id: str,
+                 require_existing: bool = False):
         self.project_path = project_path
         self.branch = branch
         # Replace ":" (used in our session id format) with "_" for path safety
         self.session_id = session_id
         self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
-        self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
+        self.is_git = os.path.exists(os.path.join(project_path, ".git"))
+        self.require_existing = require_existing
+        # Item 4: persistent per-session worktree (rollback: BOT_WORKTREE_REUSE=0)
+        self.reuse_tree = WORKTREE_REUSE
         self._enter_task = None
         self._orphan_cleanup_scheduled = False
         self._canonical = None
         self._owner_token = None
         self._lifecycle_barrier = None  # spans claim -> real completion of enter-cleanup or exit
+        # Set by mcp_bridge._TurnCapture when the pre-cleanup delta capture
+        # could NOT be proven complete on a dirty tree: the exit then leaves
+        # the worktree on disk (next same-session enter does stale_cleanup)
+        # instead of rm -rf-ing uncommitted work away.
+        self.preserve_on_exit = False
+
+    def _is_project_worktree(self) -> bool:
+        """True when worktree_path is a live git worktree OF THIS project:
+        its .git FILE points into <project>/.git/worktrees/ and that gitdir
+        still exists. A crashed partial add, a corrupted tree or another
+        repo's tree all fail this and take the capture/quarantine path."""
+        dotgit = os.path.join(self.worktree_path, ".git")
+        if not os.path.isfile(dotgit):
+            return False
+        try:
+            with open(dotgit, encoding="utf-8") as fh:
+                line = fh.readline().strip()
+        except OSError:
+            return False
+        if not line.startswith("gitdir:"):
+            return False
+        try:
+            def common(path):
+                r = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"],
+                                   capture_output=True, text=True, timeout=10, check=True)
+                return os.path.realpath(os.path.join(path, r.stdout.strip()))
+            return common(self.worktree_path) == common(self.project_path)
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def _enter_sync(self):
+        if self.require_existing and not self._is_project_worktree():
+            raise RuntimeError("worktree.resume_state_missing: original worktree unavailable; "
+                               "refusing to rebuild this session from a moving branch")
         if not self.is_git:
             os.makedirs(self.worktree_path, exist_ok=True)
             subprocess.run(
@@ -1350,15 +1437,51 @@ class WorktreeSession:
                      f"sid={self.session_id} type=non-git")
             return self.worktree_path
 
-        # Idempotent enter: clean up any stale dir from a previous crash
-        if os.path.exists(self.worktree_path):
-            log.warning(f"worktree.stale_cleanup path={self.worktree_path}")
-            subprocess.run(
-                ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
-                capture_output=True, timeout=30)
-            subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True)
+        # Owner R-revisit item 4: REUSE this session's persistent worktree
+        # when it is a live git worktree of THIS project — same commit, same
+        # uncommitted changes. No fetch, no rebuild from origin, no fallback
+        # to main: a resume must find the prior state exactly as it was.
+        if self.reuse_tree and self._is_project_worktree():
+            log.info(f"worktree.reused sid={self.session_id} "
+                     f"path={self.worktree_path} (persistent session tree)")
+            return self.worktree_path
 
-        # Fetch latest (best-effort — don't fail spawn on network blip)
+        # Idempotent enter: clean up any stale dir from a previous crash.
+        # C1 (post-review): a stale dir may be a tree preserved by
+        # preserve_on_exit (capture unproven) — it is still uncommitted
+        # work. It is removed ONLY after a proven capture; otherwise it is
+        # quarantined under the session's capture root, never rm -rf'd.
+        if os.path.exists(self.worktree_path):
+            cap = mcp_bridge.capture_worktree_delta(self.worktree_path, self.session_id)
+            if not cap.recovery_complete:
+                # project_path: copy the git index/HEAD (<project>/.git/
+                # worktrees/<name>/) into the quarantine BEFORE the prune
+                # below deletes it — dirty files AND index survive (item 1).
+                q = mcp_bridge.quarantine_stale_worktree(
+                    self.worktree_path, self.session_id, self.project_path)
+                if not q:
+                    # Quarantine failed (disk?): fail LOUD — a visible failed
+                    # turn beats silent data loss. Never the destructive path.
+                    raise RuntimeError(
+                        f"worktree.stale_capture_unproven sid={self.session_id} "
+                        f"path={self.worktree_path} quarantine_failed; refusing to remove")
+                log.warning(f"worktree.stale_dirty_kept sid={self.session_id} "
+                            f"quarantine={q} (capture unproven; tree moved aside)")
+            else:
+                log.warning(f"worktree.stale_cleanup path={self.worktree_path} "
+                            f"capture={'clean' if not cap.dirty else 'ok'}")
+            subprocess.run(
+                ["git", "-C", self.project_path, "worktree", "prune"],
+                capture_output=True, timeout=30)
+            if cap.recovery_complete:
+                subprocess.run(
+                    ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
+                    capture_output=True, timeout=30)
+                subprocess.run(["rm", "-rf", self.worktree_path], capture_output=True)
+
+        # Fetch latest (best-effort — don't fail spawn on network blip).
+        # Only on the FRESH-create path: a reused session tree must NOT be
+        # rebuilt from origin (item 4) — the reuse branch returned above.
         try:
             subprocess.run(
                 ["git", "-C", self.project_path, "fetch", "origin", "--quiet", "--depth=50"],
@@ -1366,14 +1489,18 @@ class WorktreeSession:
         except subprocess.TimeoutExpired:
             log.warning(f"worktree.fetch_timeout project={os.path.basename(self.project_path)}")
 
-        # Validate branch exists on origin; fall back to main
+        # Branch must exist on origin. NO silent fallback to main (owner
+        # item 4): a session bound to a branch that vanished from origin
+        # fails LOUD instead of silently rebinding to main and resuming on
+        # the wrong tree.
         check = subprocess.run(
             ["git", "-C", self.project_path, "rev-parse", "--verify", f"origin/{self.branch}"],
             capture_output=True, timeout=10)
         if check.returncode != 0:
-            log.warning(f"worktree.branch_missing branch={self.branch} "
-                        f"project={os.path.basename(self.project_path)} fallback=main")
-            self.branch = "main"
+            raise RuntimeError(
+                f"worktree.branch_missing branch={self.branch} "
+                f"project={os.path.basename(self.project_path)} "
+                f"(no fallback to main; session is bound to this branch)")
 
         # --detach: avoid "branch already checked out elsewhere" when two
         # concurrent sessions ask for the same branch. Claude can `git
@@ -1395,10 +1522,39 @@ class WorktreeSession:
         return self.worktree_path
 
     def _exit_sync(self, exc_type, exc_val, exc_tb):
+        if self.preserve_on_exit:
+            # The pre-cleanup capture could not prove it saved the dirty
+            # tree. Losing uncommitted work to a failed safety net is the
+            # exact failure this flag exists to prevent — leave the tree
+            # in place (the next same-session enter does stale_cleanup).
+            log.warning(f"worktree.preserved_dirty sid={self.session_id} "
+                        f"path={self.worktree_path} (capture unproven; NOT removed)")
+            return False
+        if self.is_git and self.reuse_tree:
+            # Owner R-revisit items 1+4: the session tree PERSISTS for the
+            # next turn/resume of THIS session — same commit, same changes,
+            # nothing deleted on the happy path (TurnCapture already saved
+            # this turn's delta into the capture/report ZIP on the way out).
+            # Deletion only ever happens via the stale path (unproven
+            # capture -> quarantine, never rm -rf) or with
+            # BOT_WORKTREE_REUSE=0 (old ephemeral behavior).
+            log.info(f"worktree.kept_for_resume sid={self.session_id} path={self.worktree_path}")
+            return False
         if not os.path.exists(self.worktree_path):
             return False
 
         if self.is_git:
+            # Never allow a failed Git status (including a missing .git) to
+            # fall through to destructive cleanup. This also protects callers
+            # that do not use the MCP capture context.
+            if not os.path.exists(os.path.join(self.worktree_path, ".git")):
+                self.preserve_on_exit = True
+                return False
+            status = subprocess.run(["git", "-C", self.worktree_path, "status", "--porcelain=v1"],
+                                    capture_output=True, timeout=30)
+            if status.returncode != 0:
+                self.preserve_on_exit = True
+                return False
             result = subprocess.run(
                 ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
                 capture_output=True, timeout=30)
@@ -1755,6 +1911,8 @@ async def _spawn_claude_in(cmd, cwd, session_key: str | None = None, extra_env: 
     env = {**os.environ, "HOME": "/root", "PATH": "/root/.local/bin:/usr/local/bin:/usr/bin:/bin"}
     if extra_env:
         env.update(extra_env)
+    if os.path.basename(cmd[0]) == 'codex':
+        env = {k: v for k, v in env.items() if not k.startswith(('ANTHROPIC_', 'CLAUDE_OR_')) and k != 'CLAUDE_CODE_OAUTH_TOKEN'}
     proc = await asyncio.create_subprocess_exec(
         *cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         env=env)
@@ -1787,13 +1945,106 @@ async def _spawn_claude_in(cmd, cwd, session_key: str | None = None, extra_env: 
     return proc, r, e
 
 
+# ── session context notice (2I) ──────────────────────────────────────────────
+# Two sessions edited bot.py concurrently in 2G and nothing detected it; the
+# collision surfaced only when someone ran merge-tree by hand. Both notices below
+# are ADVISORY. The failure was two agents unaware of each other's INTENT, and
+# information fixes that where a lock does not - a lock on a long-lived agent
+# session blocks work with no clear owner, so its failure mode is worse than the
+# problem. See AP-8 in ADR 0001.
+_FETCH_CACHE: "dict[str, tuple[float, str]]" = {}   # repo -> (checked_at, line)
+FETCH_TTL_S = _positive_int_env("BOT_PREFLIGHT_FETCH_TTL", 900)
+FETCH_TIMEOUT_S = _positive_int_env("BOT_PREFLIGHT_FETCH_TIMEOUT", 15)
+
+
+def _cotenancy_line(session, project) -> str:
+    """Other LIVE sessions working the same project. Pure in-memory read."""
+    try:
+        others = sorted(
+            s.label for s in SM.sessions.values()
+            if s.id != session.id and getattr(s, "project", None) == project
+            and getattr(s, "label", None)
+        )
+    except Exception:
+        return ""
+    if not others:
+        return ""
+    who = ", ".join(f'"{o}"' for o in others)
+    return (f"NOTE: session{'s' if len(others) > 1 else ''} {who} "
+            f"{'are' if len(others) > 1 else 'is'} also working in {project}. "
+            "Coordinate before editing shared files.")
+
+
+def _divergence_line(repo: str) -> str:
+    """One line about the SHARED CLONE's own branch — never about the session.
+
+    The session worktree is created detached at origin/<branch>, so its own
+    divergence is always 0/0 and saying so is noise. What IS worth one line is
+    stranded work: local commits on the clone's branch that origin does not
+    have. The «behind» count is deliberately NOT printed — this clone is
+    fetched --depth=50 and rev-list over a shallow history reports the shallow
+    boundary, not a distance (DL-249).
+
+    MUST NOT block session start. A network failure, a missing remote or a slow
+    fetch all degrade to SILENCE - the line is emitted only when the fetch
+    actually succeeded, so its absence never reads as "no divergence".
+    """
+    now = time.time()
+    hit = _FETCH_CACHE.get(repo)
+    if hit and (now - hit[0]) < FETCH_TTL_S:
+        return hit[1]
+    line = ""
+    try:
+        rc = subprocess.run(["git", "-C", repo, "remote"], capture_output=True,
+                            text=True, timeout=5)
+        if rc.returncode != 0 or not rc.stdout.strip():
+            _FETCH_CACHE[repo] = (now, "")          # no remote: nothing to say
+            return ""
+        f = subprocess.run(["git", "-C", repo, "fetch", "--quiet"],
+                           capture_output=True, text=True, timeout=FETCH_TIMEOUT_S)
+        if f.returncode != 0:
+            _FETCH_CACHE[repo] = (now, "")          # fetch failed: stay silent
+            return ""
+        cnt = subprocess.run(
+            ["git", "-C", repo, "rev-list", "--count", "@{u}..HEAD"],
+            capture_output=True, text=True, timeout=10)
+        br = subprocess.run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+        if cnt.returncode == 0 and cnt.stdout.strip().isdigit():
+            ahead = cnt.stdout.strip()
+            if ahead != "0":
+                line = (f"NOTE: the shared clone at {repo} has {ahead} local commit(s) "
+                        f"on '{br}' that origin does not have (stranded work). This is "
+                        f"NOT about your worktree, which is detached at origin.")
+    except Exception:
+        line = ""                                    # never block on this
+    _FETCH_CACHE[repo] = (now, line)
+    return line
+
+
+async def _session_context_note(session, project, repo) -> str:
+    """Advisory preamble. Empty string when there is nothing to say."""
+    parts = [_cotenancy_line(session, project)]
+    try:
+        parts.append(await asyncio.wait_for(
+            asyncio.to_thread(_divergence_line, repo), timeout=FETCH_TIMEOUT_S + 10))
+    except Exception:
+        pass                                         # degrade to silence
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    return "[SESSION CONTEXT]\n" + "\n".join(parts) + "\n\n"
+
+
 async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
     """Invoke Claude Code for a session inside a per-session git worktree.
 
-    Phase B: each spawn runs in WORKTREE_ROOT/<session_id>, a fresh worktree
-    detached at origin/<branch>. The shared repo is never modified. Claude
-    Code's session-uuid persistence lives in ~/.claude/, not the project
-    dir, so --resume works regardless of cwd.
+    Phase B + owner R-revisit item 4: each session runs in
+    WORKTREE_ROOT/<session_id>, a worktree detached at origin/<branch> that
+    PERSISTS across the session's turns — a resume reuses the same commit
+    and the same uncommitted changes (WorktreeSession). The shared repo is
+    never modified. Claude Code's session-uuid persistence lives in
+    ~/.claude/, not the project dir, so --resume works regardless of cwd.
 
     First call uses --session-id (creates session with our UUID).
     Subsequent calls use --resume (preserves conversation context).
@@ -1828,7 +2079,21 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
         # this; the rate-limit retry re-enters run_claude as a fresh, non-nested
         # acquisition after the first run already released its permit.
         async with execution_slot(session.id, session):
-            async with WorktreeSession(repo, starting_branch, sid_safe) as wt_path:
+            # _wt captured by name so TurnCapture can mark preserve_on_exit.
+            # TurnCapture is the INNER context: its __aexit__ runs BEFORE
+            # WorktreeSession's, so the uncommitted delta is durably saved
+            # (or the tree explicitly preserved) before any rm -rf.
+            # Preserve the recovery contract of already-managed sessions even
+            # when the route is disabled. Unrelated sessions keep old defaults.
+            managed = session.mcp_managed
+            _wt = WorktreeSession(repo, starting_branch, sid_safe,
+                                  require_existing=managed and (session.claude_created or session.mcp_worktree_created))
+            if managed:
+                _wt.reuse_tree = True
+            async with _wt as wt_path, mcp_bridge.TurnCapture(_wt, wt_path, session.id, enabled=managed):
+                if managed:
+                    session.mcp_worktree_created = True
+                    save_state()
                 await _coord.running(wt_path)   # -> 'running' + safe worktree view
                 # Copy uploaded files INSIDE the worktree (not the shared repo)
                 fnote = ""
@@ -1843,12 +2108,20 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                             copied.append(d)
                     if copied:
                         fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-                full_prompt = prompt + fnote
+                # Advisory context: co-tenant sessions and upstream divergence.
+                # Empty when there is nothing to say, so a quiet estate sees no
+                # change at all.
+                _ctx = await _session_context_note(session, project, repo)
+                full_prompt = _ctx + prompt + fnote
+                if managed:
+                    full_prompt += mcp_bridge.WORKER_QUESTION_INSTRUCTION
 
+                gateway_config = claude_gateway.settings()
+                executable, chosen_model = claude_gateway.launch(
+                    session.claude_model if gateway_config else session.claude_model or BOT_DEFAULT_CLAUDE_MODEL)
                 def build_cmd(mode, uuid_str):
                     flag = "--resume" if mode == "resume" else "--session-id"
-                    cmd = ["claude", "--print"]
-                    chosen_model = session.claude_model or BOT_DEFAULT_CLAUDE_MODEL
+                    cmd = [executable, "--print"]
                     if chosen_model:
                         cmd += ["--model", chosen_model]
                     # Permission mode: skip / allowlist / strict
@@ -1857,13 +2130,22 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                     elif BOT_TOOL_PERMISSION_MODE == "allowlist" and BOT_ALLOWED_TOOLS:
                         cmd += ["--allowedTools", BOT_ALLOWED_TOOLS]
                     # else strict: no flag (default Claude Code behavior in --print)
+                    # MCP set, scoped to the SPAWN rather than to a directory.
+                    # Per-project config cannot govern a bot session: the cwd is
+                    # /tmp/claude-sessions/<label> and becomes an ephemeral
+                    # worktree during a turn, so there is no stable path to key an
+                    # entry to. --strict-mcp-config ignores every other source, so
+                    # the file below is the whole answer and is reviewable in one
+                    # place. Unset -> unchanged behaviour (user scope, all servers).
+                    if BOT_MCP_CONFIG:
+                        cmd += ["--mcp-config", BOT_MCP_CONFIG, "--strict-mcp-config"]
                     cmd += [flag, uuid_str, full_prompt]
                     return cmd
 
                 mode = "resume" if session.claude_created else "create"
                 cmd = build_cmd(mode, session.session_uuid)
                 log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
-                         f"model={session.claude_model or BOT_DEFAULT_CLAUDE_MODEL or 'default'} "
+                         f"model={chosen_model or 'default'} provider={'openrouter' if gateway_config else 'anthropic'} "
                          f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
                 proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id, extra_env=_coord_env(session))
@@ -1878,6 +2160,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                     uuid_collision = "already in use" in err_low
 
                     if mode == "resume" and session_missing:
+                        if managed:
+                            raise RuntimeError("session.resume_state_missing: original Claude transcript unavailable; refusing a fresh conversation")
                         log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
                         session.session_uuid = str(uuid.uuid4())
                         session.claude_created = False
@@ -1892,8 +2176,18 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
                 if proc.returncode == 0 and not session.claude_created:
                     session.claude_created = True
+                if proc.returncode == 0 and managed:
+                    mcp_bridge.record_worker_questions(session, r, wt_path)
 
                 USAGE.record(len(full_prompt), len(r), session.label)
+
+                if proc.returncode != 0 and gateway_config:
+                    # Child-only credentials are not in the parent's scrubber.
+                    # Never echo raw gateway errors or trigger subscription retries.
+                    message = claude_gateway.failure_message(r + e)
+                    session.status_reason = 'execution_failed'
+                    session.error_text = message
+                    return message
 
                 # Rate-limit handling (auto-Gemini/GPT fallback removed entirely;
                 # the flow auto-defers, offers urgent-5min, or Sonnet-1M switch)
@@ -1915,6 +2209,16 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
                 if proc.returncode != 0 and e:
                     r += f"\n⚠️ {e[:500]}"
+                if proc.returncode != 0:
+                    # A REAL failure, as opposed to the restart marker. Record why,
+                    # so the console can show something truthful instead of a
+                    # bare "error" that used to mean only "the bot restarted".
+                    session.status_reason = "execution_failed"
+                    session.error_text = _scrub_secrets(
+                        f"exit {proc.returncode}\n{(e or r)[:3000]}")
+                else:
+                    session.status_reason = ""
+                    session.error_text = ""
                 if proc.returncode == 0:
                     _coord_status = "completed"
                 return r.strip() or "(no output)"
@@ -1923,6 +2227,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
         raise
     except RuntimeError as rt_err:
         # WorktreeSession._enter_sync raised — worktree creation failed.
+        session.status_reason = "execution_failed"
+        session.error_text = str(rt_err)
         log.error(f"worktree.fatal sid={session.id} err={rt_err}")
         try:
             if BOT is not None:
@@ -2094,13 +2400,10 @@ async def run_codex(prompt, project, session, files=None):
     adapter module. First turn captures ``thread.started``; later turns resume it.
     """
     repo = get_project_path(project)
-    if not os.path.isdir(repo):
-        repo = f"{REPOS}/{project}"
-    if not os.path.isdir(repo):
-        try:
-            os.makedirs(repo, exist_ok=True)
-        except Exception as e:
-            return f"❌ Not found: {project}\nCould not create: {e}"
+    try:
+        validate_codex_project(repo)
+    except ValueError as exc:
+        return f'❌ {exc}'
 
     starting_branch = getattr(session, 'starting_branch', 'main')
     sid_safe = session.id.replace(':', '_')
@@ -2126,10 +2429,34 @@ async def run_codex(prompt, project, session, files=None):
                                     images.append(d)
                         if copied:
                             fnote = "\n\n[ATTACHED FILES — read before starting]\n" + "\n".join(f"  - {f}" for f in copied) + "\n"
-                    full_prompt = prompt + fnote
+                    # Same advisory context as the claude path - a codex session can
+                    # collide with a claude session just as easily.
+                    _ctx = await _session_context_note(session, project, repo)
+                    full_prompt = _ctx + project_context(project, repo, load_projects(), BOT_CONFIGS_DIR) + prompt + fnote
 
                     thread_id = session.provider_session_id or None
                     cmd = build_codex_cmd(full_prompt, model, thread_id, images)
+                    # RAG_CODEX_SCOPED_ACCESS_V1
+                    if os.path.realpath(repo) == "/opt/alumglass-rag":
+                        _rag_roots = [
+                            "/opt/alumglass-rag/.git",
+                            "/opt/shahrzad-devops/reports",
+                            "/mnt/devopsstorage/alumglass-rag/handoffs",
+                        ]
+                        _rag_flags = [
+                            "-c", "sandbox_workspace_write.network_access=true",
+                            "-c", "sandbox_workspace_write.writable_roots="
+                                  + json.dumps(_rag_roots),
+                        ]
+                        for _key, _value in _coord_env(session).items():
+                            if _key.startswith("AGENT_COORD_"):
+                                _rag_flags += [
+                                    "-c",
+                                    "shell_environment_policy.set."
+                                    + _key + "=" + json.dumps(_value),
+                                ]
+                        _rag_pos = cmd.index("--json")
+                        cmd[_rag_pos:_rag_pos] = _rag_flags
                     log.info(f"spawn.codex sid={session.id} project={project} "
                              f"mode={'resume' if thread_id else 'create'} model={model or 'default'} "
                              f"worktree={wt_path}")
@@ -2149,6 +2476,12 @@ async def run_codex(prompt, project, session, files=None):
                     USAGE.record(len(full_prompt), len(result.text), session.label)
 
                     kind = classify_codex_failure(proc.returncode, r, e)
+                    if kind != 'ok':
+                        session.status_reason = 'execution_failed'
+                        session.error_text = f'Codex provider failure: {kind}'
+                    else:
+                        session.status_reason = ''
+                        session.error_text = ''
                     if kind == "auth":
                         return ("❌ Codex is not logged in on the server. "
                                 "Run <code>codex login</code> as the bot user, then retry.")
@@ -2156,6 +2489,10 @@ async def run_codex(prompt, project, session, files=None):
                         log.warning(f"Codex rate-limited sid={session.id} rc={proc.returncode}")
                         return ("⏳ Codex is rate-limited or over quota right now. "
                                 "Try again shortly, or switch engine/model with /model.")
+
+                    if kind == 'nonzero':
+                        detail = result.diagnostics[-1] if result.diagnostics else (e or 'provider turn failed')
+                        return '❌ Codex turn failed.\n' + _scrub_secrets(detail[:500])
 
                     text = result.text
                     if not text:
@@ -2168,7 +2505,7 @@ async def run_codex(prompt, project, session, files=None):
                             text = "⚠️ Codex produced no parseable output."
                         else:
                             text = "(no output)"
-                    else:
+                    elif kind == 'ok':
                         cr.mark_ok()
                     return text.strip() or "(no output)"
     except RuntimeError as rt_err:
@@ -2238,6 +2575,8 @@ async def run_chat(prompt, session, files=None):
 async def dispatch_turn(prompt, project, session, files=None):
     """Single engine dispatch point — handlers never branch on engine name.
     Unknown/removed engine fails safely with a recovery hint."""
+    if project != session.project:
+        return '❌ Project changed since this request was scheduled; resend in the intended project.'
     adapter = engines.get_adapter(session.engine)
     if adapter is None:
         return (f"⚠️ This session's engine (<code>{esc(session.engine)}</code>) is not "
@@ -2396,7 +2735,11 @@ async def _rate_limit_flow(prompt, project, session, files=None):
 # ═══════════════════════════════════════════
 #  Gemini: Transcribe + Refine
 # ═══════════════════════════════════════════
-async def transcribe(path):
+async def transcribe(path, mime="audio/ogg"):
+    """Transcribe a voice file. `mime` is a parameter because the browser's
+    MediaRecorder emits audio/webm;codecs=opus while Telegram sends audio/ogg -
+    the same function serves both ends, so there is one STT path and one prompt
+    file to fix Farsi errors in."""
     if not GEMINI_OK: return None
     try:
         cfg = load_prompts().get("transcribe", {})
@@ -2405,7 +2748,7 @@ async def transcribe(path):
             model=cfg.get("model", "gemini-3.7-flash"),
             contents=[{"role": "user", "parts": [
                 {"text": cfg.get("prompt", "Transcribe this voice message.")},
-                {"inline_data": {"mime_type": "audio/ogg", "data": base64.b64encode(data).decode()}}
+                {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}}
             ]}])
         return r.text.strip()
     except Exception as e:
@@ -2489,7 +2832,7 @@ def _report_slug(name: str) -> str:
 
 
 def _build_report(reports_dir: str, report_url: str, name: str, content: str,
-                  slug: "str | None" = None) -> ReportResult:
+                  slug: "str | None" = None, include_dir: "str | None" = None) -> ReportResult:
     """Pure, synchronous report builder (no event loop, no external `zip`).
 
     Writes summary.txt (UTF-8), builds the ZIP to a temp path via zipfile and
@@ -2516,6 +2859,18 @@ def _build_report(reports_dir: str, report_url: str, name: str, content: str,
     except Exception as ex:
         log.error(f"make_report.summary_failed slug={slug}: {ex}")
         return ReportResult("error", OrderedDict(), slug, f"summary error: {ex}")
+
+    # Optional captured worktree delta (MCP bridge / TurnCapture): copied
+    # BEFORE the ZIP is built, so the archive carries reviewable output —
+    # status.porcelain, diff.patch, bounded changed files, sha256 manifest —
+    # not a lone summary.txt. Server-derived path (captures root), never
+    # caller input. A failed copy downgrades the report, it never raises:
+    # the capture dir itself stays on disk as the durable copy.
+    if include_dir and os.path.isdir(include_dir):
+        try:
+            shutil.copytree(include_dir, os.path.join(rd, "capture"), dirs_exist_ok=True)
+        except Exception as ex:
+            log.error(f"make_report.capture_copy_failed slug={slug}: {ex}")
 
     # Build ZIP to a temp path, verify, then atomically move into place.
     final_zip = os.path.join(reports_dir, f"{slug}.zip")
@@ -2550,17 +2905,30 @@ def _build_report(reports_dir: str, report_url: str, name: str, content: str,
     return ReportResult("ok", links, slug)
 
 
-async def make_report(name, content) -> ReportResult:
+async def make_report(name, content, include_dir: "str | None" = None) -> ReportResult:
     """Create a report (summary + verified ZIP) and return a ReportResult.
 
     Never raises: on failure the caller still sends a message (via fmt_links),
     just without a ZIP link. The filesystem/zip work runs in a worker thread so
     the Telegram event loop is never blocked."""
     try:
-        return await asyncio.to_thread(_build_report, REPORTS, REPORT_URL, name, content)
+        return await asyncio.to_thread(_build_report, REPORTS, REPORT_URL, name, content,
+                                       None, include_dir)
     except Exception as ex:
         log.error(f"make_report.error name={name}: {ex}")
         return ReportResult("error", OrderedDict(), "", str(ex))
+
+
+async def _report_for_session(session) -> ReportResult:
+    """ONE report builder for both transports: summary (the session's last
+    output) + the session's latest captured worktree delta, so the ZIP is
+    reviewable (status/diff/changed files/sha256 manifest), never a lone
+    summary.txt. Telegram's do:report and the MCP report tool both route
+    through here. The summary text is scrubbed with the SAME _scrub_secrets
+    the /output and /speak routes use (M3 after review: the report path fed
+    raw session.out into a ZIP served over HTTP)."""
+    return await make_report(f"{session.project}-task", _scrub_secrets(getattr(session, "out", "") or ""),
+                             include_dir=mcp_bridge.latest_capture_dir(session.id))
 
 # ═══════════════════════════════════════════
 #  Send
@@ -3163,14 +3531,32 @@ async def cmd_project(u, c):
             parse_mode=ParseMode.HTML, reply_markup=project_kb(key))
         return
     proj = parts[1].strip()
-    if not os.path.isdir(f"{REPOS}/{proj}"):
-        await u.message.reply_text(f"❌ Project <b>{esc(proj)}</b> not found.", parse_mode=ParseMode.HTML)
+    try:
+        change_session_project(session, proj)
+    except ValueError as exc:
+        await u.message.reply_text(f'❌ {esc(str(exc))}', parse_mode=ParseMode.HTML)
         return
-    session.project = proj
     sent = await u.message.reply_text(
         f"{session_prefix(session)} | 📂 Project → <b>{esc(proj)}</b>",
         parse_mode=ParseMode.HTML)
     await track_reply(sent, session)
+
+
+def change_session_project(session, project: str) -> None:
+    """Shared UI/Telegram transition: never carry a provider thread across repos."""
+    if project not in get_project_names():
+        raise ValueError('unknown_project')
+    if session.status in ('running', 'queued'):
+        raise ValueError('session_busy')
+    if project != session.project:
+        session.provider_session_id = ''
+        session.session_uuid = str(uuid.uuid4())
+        session.claude_created = False
+        session.starting_branch = 'main'
+        if session.engine == engines.ENGINE_CODEX:
+            session.model = ''
+        session.project = project
+        save_state()
 
 # ═══════════════════════════════════════════
 #  /model — Fallback Model Selection
@@ -3206,7 +3592,7 @@ async def cmd_model(u, c):
     if active_session and active_engine != engines.ENGINE_CLAUDE:
         current_cc = active_session.model or active_adapter.default_model()
     else:
-        current_cc = (active_session.claude_model if active_session else "") or BOT_DEFAULT_CLAUDE_MODEL
+        current_cc = (active_session.claude_model if active_session else "") or active_adapter.default_model() or BOT_DEFAULT_CLAUDE_MODEL
     cc_label = current_cc if current_cc else "default (CLI default — latest Sonnet/Opus)"
     engine_label = active_adapter.caps.label if active_adapter else "Claude Code"
 
@@ -3774,7 +4160,7 @@ async def _handle_p2(q, c, cid, p: dict, token: str = ""):
         if target is None:
             return
         adapter = engines.get_adapter(target.engine)
-        example = ("opus · sonnet · claude-opus-5" if target.engine == engines.ENGINE_CLAUDE
+        example = ("sonnet · opus · haiku · fable  (aliases track the newest)" if target.engine == engines.ENGINE_CLAUDE
                    else "gpt-5.6-sol · gpt-5.5")
         CONV_STATE[cid] = {"state": "awaiting_engine_model_input",
                            "session_key": target.id, "uuid": target.session_uuid,
@@ -3854,7 +4240,11 @@ async def on_callback(u, c):
         if session_key:
             session = SM.get_by_key(session_key)
         if session:
-            session.project = proj_name
+            try:
+                change_session_project(session, proj_name)
+            except ValueError as exc:
+                await q.edit_message_text(f'❌ {esc(str(exc))}', parse_mode=ParseMode.HTML)
+                return
             await q.edit_message_text(
                 f"{session_prefix(session)} | 📂 → <b>{proj_name}</b>",
                 parse_mode=ParseMode.HTML)
@@ -3890,7 +4280,7 @@ async def on_callback(u, c):
     elif d == "do:report":
         if not session or not session.out:
             await c.bot.send_message(cid, "📭 No output."); return
-        lnk = await make_report(f"{session.project}-task", session.out)
+        lnk = await _report_for_session(session)
         sent = await c.bot.send_message(cid,
             f"{session_prefix(session)} | 📦 <b>Report</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n{fmt_links(lnk)}\n\n💡 <i>Copy Summary → paste in Claude Chat</i>",
             parse_mode=ParseMode.HTML)
@@ -3971,9 +4361,15 @@ async def on_callback(u, c):
                 await c.bot.send_message(cid, msg, parse_mode=ParseMode.HTML)
                 return
             await q.edit_message_text(f"🚀 Deploying <b>{proj}@{br}</b>...", parse_mode=ParseMode.HTML)
+            # AP-3: deploy-to-prod.sh refuses unless DEPLOY_CONFIRM equals the
+            # project. This handler is a deliberate, user-initiated deploy, so it
+            # is the one place entitled to set it. Passing the project (not a
+            # constant like "yes") is the point: a value left in the environment
+            # cannot authorise a different project.
             r = await asyncio.to_thread(
                 subprocess.run, [f"{SCRIPTS}/deploy-to-prod.sh", proj, br],
-                capture_output=True, text=True, timeout=120)
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "DEPLOY_CONFIRM": proj})
             ok = r.returncode == 0
             await c.bot.send_message(cid, f"{'✅' if ok else '❌'} <b>{'Done' if ok else 'Failed'}</b>\n\n<pre>{esc(r.stdout[:3000])}</pre>", parse_mode=ParseMode.HTML)
 
@@ -4858,10 +5254,49 @@ async def _flush_buffer(cid: int, context):
 _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
-    "tasks", "claude_created", "claude_model",
+    "tasks", "claude_created", "claude_model", "starting_branch",
+    "mcp_managed", "mcp_worktree_created",
     # Phase 2 multi-engine fields (absent in old state → safe defaults)
     "engine", "model", "provider_session_id", "chat_history_ref",
+    # Phase 2D: why a session is in its status. Persisting the reason is the
+    # whole point - RAgg lost its reason to a restart precisely because nothing
+    # recorded one, and it cannot be backfilled.
+    "status_reason", "error_text",
 )
+
+# ── Telegram update_id dedup (Phase 0 A3 — risk R3) ──
+# Telegram's update_id increases strictly per bot token; the only way a
+# handler ever sees the same one twice is a transport-level retry (the
+# getUpdates response was lost/timed out client-side, so PTB re-requests the
+# same offset and Telegram resends the same update). This Application never
+# calls .concurrent_updates(...) in main(), so PTB's default
+# max_concurrent_updates=1 applies: process_update() dispatches exactly one
+# update at a time, in delivery order — no other update's dedup check can
+# interleave with this one (single-threaded event loop, no `await` inside
+# _is_duplicate_update). Given those two guarantees, a plain monotonic
+# high-water mark is both correct and O(1):
+#   - it is at least as good as a bounded LRU of seen ids at catching a
+#     retry, since Telegram never reuses or reorders ids for this bot, and
+#   - unlike a bounded LRU, it can NEVER be tricked by a slow retry that
+#     arrives after enough intervening traffic would have evicted the
+#     original id from a capped cache — the ceiling never forgets.
+# A "recent set" alongside the HWM was considered and dropped: it would not
+# add real protection here (any id <= HWM is a genuine duplicate today), and
+# if concurrent_updates is ever turned on later, a small LRU wouldn't fix the
+# resulting race either (a lower id could legitimately arrive after a higher
+# one already advanced the ceiling) — that would need a real windowed/bitmap
+# scheme, not a bigger cache. Flag for revisit if concurrent_updates changes.
+_UPDATE_ID_HWM = 0
+
+
+def _is_duplicate_update(update_id: int) -> bool:
+    """Synchronous check-and-set against the high-water mark. Returns True
+    (and does NOT advance the mark) if `update_id` was already accepted."""
+    global _UPDATE_ID_HWM
+    if update_id <= _UPDATE_ID_HWM:
+        return True
+    _UPDATE_ID_HWM = update_id
+    return False
 
 
 def save_state():
@@ -4880,6 +5315,7 @@ def save_state():
             "msg_to_session": {str(mid): sk for mid, sk in SM.msg_to_session.items()},
             "color_index": {str(cid): idx for cid, idx in SM.color_index.items()},
             "active_session": {str(cid): sk for cid, sk in ACTIVE_SESSION.items()},
+            "update_dedup_hwm": _UPDATE_ID_HWM,
         }
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -4906,8 +5342,10 @@ def load_state():
             # Sessions left "running" or "queued" have a dead subprocess/slot
             # after a restart — mark them "error" so users know to re-send.
             status = s.get("status", "idle")
+            reason = s.get("status_reason", "")
             if status in ("running", "queued"):
                 status = "error"
+                reason = reason or "interrupted_by_restart"
             session = Session(
                 id=s["id"],
                 label=s["label"],
@@ -4915,6 +5353,8 @@ def load_state():
                 session_uuid=s["session_uuid"],
                 project=s.get("project", DEFAULT_PROJECT),
                 status=status,
+                status_reason=reason,
+                error_text=s.get("error_text", ""),
                 started_at=s.get("started_at", time.time()),
                 last_active=s.get("last_active", time.time()),
                 message_ids=s.get("message_ids", []),
@@ -4929,6 +5369,12 @@ def load_state():
                 model=s.get("model", ""),
                 provider_session_id=s.get("provider_session_id", ""),
                 chat_history_ref=s.get("chat_history_ref", ""),
+                # MCP bridge: restart-safe branch binding. Old state lacks
+                # the field → "main", which is what run_claude already
+                # assumed for every pre-bridge session (no behavior change).
+                starting_branch=s.get("starting_branch", "main"),
+                mcp_managed=s.get("mcp_managed", False),
+                mcp_worktree_created=s.get("mcp_worktree_created", False),
             )
             # Migration safety: a restored Chat history path is trusted only if it
             # still passes canonical/no-symlink containment; otherwise replace it
@@ -4958,8 +5404,17 @@ def load_state():
                 ACTIVE_SESSION[int(cid_str)] = sk
             except ValueError:
                 pass
+        # Restore the update_id dedup ceiling. max(...) with the in-memory
+        # value (0 at boot) is defensive only — belt-and-suspenders in case
+        # load_state is ever called more than once in a process lifetime.
+        global _UPDATE_ID_HWM
+        try:
+            _UPDATE_ID_HWM = max(_UPDATE_ID_HWM, int(state.get("update_dedup_hwm", 0) or 0))
+        except (TypeError, ValueError):
+            pass
         saved_ago = int(time.time() - state.get("saved_at", 0))
-        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old)")
+        log.info(f"Restored {restored} session(s) from state ({saved_ago}s old); "
+                 f"update_dedup_hwm={_UPDATE_ID_HWM}")
     except Exception as e:
         log.error(f"load_state restore error: {e}")
 
@@ -5028,7 +5483,48 @@ async def _discover_engine_catalogs():
         log.info(f"chat.catalog warm skipped: {e}")
 
 
+def _assert_permission_mode():
+    """Phase 0 / D3: refuse to let `skip` mode be silently true.
+
+    `--dangerously-skip-permissions` bypasses the permission engine entirely,
+    settings.json `permissions.deny` included. So in skip mode the deny list we
+    rely on protects NOTHING — and it does so invisibly, which is worse than
+    having no deny list at all, because we would believe we were covered.
+
+    REFUSE, not warn. The earlier version of this function warned and started
+    anyway, on the argument that a config mistake should not become an outage.
+    That trade is wrong here: a warning in a log nobody tails is exactly how
+    this hook's predecessor (block-env-edits.sh) failed open for months without
+    anyone noticing. An outage is loud and gets fixed in minutes; a silently
+    disarmed deny list is not, and lasts until someone audits.
+
+    So disarming costs two deliberate acts, not one: the mode itself, plus
+    BOT_ALLOW_SKIP_MODE=1. Neither env var set by accident is enough alone.
+    """
+    if BOT_TOOL_PERMISSION_MODE != "skip":
+        log.info(f"perm_mode.ok mode={BOT_TOOL_PERMISSION_MODE} "
+                 f"(settings.json deny list applies)")
+        return
+
+    if not BOT_ALLOW_SKIP_MODE:
+        log.critical("=" * 72)
+        log.critical("perm_mode.REFUSED BOT_TOOL_PERMISSION_MODE=skip disables the "
+                     "settings.json deny list for every spawn")
+        log.critical("perm_mode.REFUSED refusing to start - set BOT_ALLOW_SKIP_MODE=1 "
+                     "to confirm this is deliberate, or use allowlist/strict")
+        log.critical("=" * 72)
+        raise SystemExit(1)
+
+    log.warning("=" * 72)
+    log.warning("perm_mode.INSECURE BOT_TOOL_PERMISSION_MODE=skip with "
+                "BOT_ALLOW_SKIP_MODE=1 - spawns use --dangerously-skip-permissions")
+    log.warning("perm_mode.INSECURE settings.json permissions.deny DOES NOT APPLY "
+                "to these sessions")
+    log.warning("=" * 72)
+
+
 async def post_init(app):
+    _assert_permission_mode()
     await app.bot.set_my_commands([
         BotCommand("start", "\U0001f3e0 Home"),
         BotCommand("help", "\U0001f4d6 Help"),
@@ -5084,6 +5580,10 @@ async def post_init(app):
         await _nw_ipc_start(app)
     else:
         log.info("nightwatch_ipc.disabled reason=BOT_NIGHTWATCH_IPC_ENABLED=false")
+    # Session query API: same "quiet no-op without a secret" gate as NightWatch
+    # IPC above, so a second bot instance (no BOT_SESSION_API_TOKEN set) never
+    # fights over the port.
+    await _sessapi_start(app)
     log.info(f"Bot v4 ready. Gemini={'\u2705' if GEMINI_OK else '\u274c'} | Consult(GPT)={'\u2705' if OPENAI_API_KEY else '\u274c'} | Sonnet1M={SONNET_1M_MODEL}")
 
 # Bounded deadline for awaiting cancelled run tasks during shutdown. Kept well
@@ -5243,6 +5743,7 @@ async def graceful_shutdown(app):
                 log.info(f"bg_task.cancelled name={task_name} err={type(e).__name__}")
     if BOT_NIGHTWATCH_IPC_ENABLED:
         await _nw_ipc_stop()
+    await _sessapi_stop()
     # Collect active sessions info before killing (running OR queued/waiting).
     active = [(k, s) for k, s in SM.sessions.items() if s.status in ("running", "queued")]
     # Cancel queued/in-flight execution tasks AND await their real cleanup under
@@ -5282,6 +5783,7 @@ async def graceful_shutdown(app):
     # block on restart.
     for key, session in active:
         session.status = "error"
+        session.status_reason = "interrupted_by_restart"
     # Persist final state so sessions can be restored after restart
     save_state()
     log.info(f"Graceful shutdown complete. Killed {len(active)} active sessions.")
@@ -5446,6 +5948,1100 @@ async def _nw_ipc_stop():
     try: await asyncio.wait_for(_NW_RUNNER.cleanup(), timeout=5.0)
     except asyncio.TimeoutError: log.warning("nightwatch_ipc.cleanup_timeout")
 
+
+# ── Session query API (Phase 0 A3 Task 2 — read-only console prerequisite) ──
+# A SECOND aiohttp Application/AppRunner in this same process/event loop —
+# same library, same lifecycle wiring (started in post_init, stopped in
+# graceful_shutdown, right alongside the NightWatch IPC listener) — but
+# deliberately its own `web.Application()`, not a new route on `a` above.
+# aiohttp shares one router across every TCPSite bound to an AppRunner: adding
+# a 172.17.0.1 bind to the NightWatch app would also put /inject (a WRITE
+# endpoint, HMAC-gated, VPC+loopback only today) on the docker bridge — an
+# exposure change to an existing endpoint nobody asked for. A separate
+# Application keeps that change scoped to this brand-new, GET-only endpoint,
+# which is the "does not entangle the two auth schemes" judgment call the
+# task asked for. What IS reused from the NightWatch pattern: AppRunner/
+# TCPSite setup, hmac.compare_digest for the auth check, and the post_init/
+# graceful_shutdown lifecycle hooks.
+#
+# Auth: a plain shared-secret bearer token compared with hmac.compare_digest,
+# not an HMAC-over-body signature like _nw_inject's. _nw_inject signs a POST
+# body because it needs to authenticate THAT payload; a GET has no body worth
+# signing, so borrowing hmac.compare_digest for a timing-safe token compare is
+# the correct-sized version of the same pattern, not a shortcut around it.
+BOT_SESSION_API_TOKEN = os.environ.get("BOT_SESSION_API_TOKEN", "").strip()
+BOT_SESSION_API_PORT = _positive_int_env("BOT_SESSION_API_PORT", 9092)
+# 172.17.0.1 = docker0 bridge — reachable from the Caddy container via
+# host.docker.internal, unreachable from the public internet without an
+# explicit ufw allow (see docs/phase0/a3-*.md for the proposed rule). Same
+# posture as gfrc (:8088) and hermes-dashboard (:8642).
+BOT_SESSION_API_BIND = os.environ.get("BOT_SESSION_API_BIND", "172.17.0.1").strip()
+# ── MCP bridge (owner pilot; docs/MCP_BRIDGE.md) ────────────────────────────
+# OFF by default: activation is an explicit deploy decision (set the env in
+# the unit, restart). Scope is intersected with the registered projects and
+# the bound console chat at every write; Telegram and MCP share ONE
+# SessionManager, ONE execution_slot cap and ONE nonce/rate budget.
+BOT_MCP_ENABLED = os.environ.get("BOT_MCP_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+BOT_MCP_PROJECTS = os.environ.get("BOT_MCP_PROJECTS", mcp_bridge.MCP_DEFAULT_PROJECTS)
+_SESSAPI_RUNNER = None
+
+
+# ── secret scrubbing for anything we surface to a browser ────────────────────
+# Engine stderr can quote a command line, and a command line on this box has
+# historically carried tokens. The console must never render one, so every live
+# secret-shaped value from the environment is replaced before display. This is a
+# safety net, NOT a licence to put secrets on command lines - see 0.5-B.
+_SCRUB_MIN_LEN = 12
+
+
+def _scrub_secrets(text: str) -> str:
+    if not text:
+        return text
+    for k, v in os.environ.items():
+        if len(v or "") < _SCRUB_MIN_LEN:
+            continue
+        if not re.search(r"(TOKEN|KEY|SECRET|PASS|PWD|HMAC)", k, re.I):
+            continue
+        if v in text:
+            text = text.replace(v, f"<{k}:redacted>")
+    return text
+
+
+# ── model alias resolution ──────────────────────────────────────────────────
+# A family alias ("opus") ALWAYS means the newest model in that family - the
+# CLI resolves it, and `claude --model --help` says so explicitly. So the bot
+# passes the alias straight through and pins nothing. This cache exists only to
+# SHOW which concrete model an alias currently resolves to; it is never used to
+# choose a model, so a stale cache cannot pin anything.
+_MODEL_CACHE: dict = {}
+_MODEL_CACHE_AT = 0.0
+MODEL_CACHE_TTL = _positive_int_env("BOT_MODEL_CACHE_TTL", 3600)
+MODEL_FAMILIES = [f.strip() for f in os.environ.get(
+    "BOT_MODEL_FAMILIES", "haiku,sonnet,opus,fable").split(",") if f.strip()]
+
+
+def _probe_model(alias: str) -> str:
+    """Ask the CLI what an alias resolves to. Returns '' if it cannot."""
+    try:
+        if claude_gateway.settings():
+            return claude_gateway.configured_models().get(alias, '')
+        pr = subprocess.run(
+            ["claude", "--print", "--model", alias, "--output-format", "json",
+             "--max-turns", "1", "hi"],
+            capture_output=True, text=True, timeout=120)
+        if pr.returncode != 0:
+            return ""
+        used = (json.loads(pr.stdout or "{}").get("modelUsage") or {})
+        return next(iter(used), "")
+    except Exception as ex:
+        log.info(f"model_probe.failed alias={alias} {type(ex).__name__}")
+        return ""
+
+
+def _resolved_models() -> dict:
+    """alias -> concrete id, cached. Probing costs one tiny turn per alias."""
+    global _MODEL_CACHE, _MODEL_CACHE_AT
+    if _MODEL_CACHE and (time.time() - _MODEL_CACHE_AT) < MODEL_CACHE_TTL:
+        return _MODEL_CACHE
+    out = {}
+    for fam in MODEL_FAMILIES:
+        got = _probe_model(fam)
+        if got:
+            out[fam] = got
+    if out:                      # keep the previous map if every probe failed
+        _MODEL_CACHE, _MODEL_CACHE_AT = out, time.time()
+    return _MODEL_CACHE
+
+
+_MODEL_REFRESH_TASK = None
+
+
+def _schedule_model_refresh():
+    """Kick a background refresh at most once at a time. Never awaited by a
+    request - a cold cache returns {} and fills in within a minute or two."""
+    global _MODEL_REFRESH_TASK
+    if os.environ.get("BOT_RESOLVE_CLAUDE_MODELS", "false").lower() != "true":
+        return
+    if _MODEL_REFRESH_TASK is not None and not _MODEL_REFRESH_TASK.done():
+        return
+    try:
+        _MODEL_REFRESH_TASK = asyncio.create_task(asyncio.to_thread(_resolved_models))
+    except RuntimeError:
+        pass          # no running loop (import-time / tests) - nothing to do
+
+
+def _sessapi_authorized(req) -> bool:
+    token = req.headers.get("X-Session-API-Token", "")
+    if not token:
+        # MCP clients send standard Authorization: Bearer — same secret, no
+        # new key. Compare with the SAME timing-safe path, never a fallback.
+        auth = req.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+    return bool(token) and bool(BOT_SESSION_API_TOKEN) and hmac.compare_digest(
+        token.encode(), BOT_SESSION_API_TOKEN.encode())
+
+
+async def _sessapi_sessions(req):
+    """Read-only snapshot of live SessionManager state.
+
+    Exposes exactly: id/label/engine/model/project, created (started_at) and
+    last-active timestamps, running state (status), active_session per chat,
+    and summary counts. Deliberately excludes session_uuid/provider_session_id
+    (thread ids), message_ids, anchor_message_id, chat_history_ref, and
+    anything from worktree paths, prompts, or transcripts — none of that is
+    on this response.
+    """
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    sessions = [
+        {
+            "id": s.id,
+            "label": s.label,
+            "engine": s.engine,
+            "model": (s.claude_model if s.engine == engines.ENGINE_CLAUDE else s.model) or "",
+            "project": s.project,
+            "status": s.status,
+            # REVIEWED ADDITION (2D): status_reason distinguishes a restart
+            # marker from a real failure; has_error says whether error_text is
+            # worth fetching. Neither carries a path, a uuid or a transcript.
+            "status_reason": getattr(s, "status_reason", ""),
+            "has_error": bool(getattr(s, "error_text", "")),
+            # REVIEWED (2E): a BOOLEAN only - "this session has a reply sitting
+            # unread", which is what makes a card 'waiting on you' rather than
+            # merely idle. Carries no content, no length, no path.
+            "has_output": bool(getattr(s, "out", "")),
+            "started_at": s.started_at,
+            "last_active": s.last_active,
+        }
+        for s in SM.sessions.values()
+    ]
+    counts: dict = defaultdict(int)
+    counts["total"] = len(sessions)
+    for s in SM.sessions.values():
+        counts[s.status] += 1
+    return _aw.json_response({
+        "ok": True,
+        "sessions": sessions,
+        "projects": get_project_names(),
+        "active_session": {str(cid): key for cid, key in ACTIVE_SESSION.items()},
+        "counts": dict(counts),
+    })
+
+
+def _read_cpu_times():
+    """Aggregate jiffies from /proc/stat: (idle_all, total). Unprivileged."""
+    with open("/proc/stat") as fh:
+        parts = fh.readline().split()
+    vals = [int(x) for x in parts[1:]]
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)      # idle + iowait
+    return idle, sum(vals)
+
+
+def _agent_load():
+    """Claude sessions split by whether the concurrency permit governs them.
+
+    MAX_RUNNING_AGENTS is a BOT cap, not a box cap. A `claude` started from a
+    terminal is a full session that counts against neither the permit nor the
+    unit's MemoryMax, because it runs in user.slice rather than the bot's own
+    cgroup. Reporting only the governed half would understate real load - the
+    same failure class as a log that misses successes. Counts only; no command
+    lines, no cwd, no session labels leave this endpoint.
+    """
+    def _footprint_mb(pid):
+        """Pss + SwapPss. Pss counts RESIDENT pages only, so a Pss-only figure is
+        a floor that silently shrinks as the kernel evicts the very process being
+        measured. A memory figure on a swapping box needs both halves."""
+        kb = 0
+        try:
+            with open(f"/proc/{pid}/smaps_rollup") as fh:
+                for line in fh:
+                    if line.startswith("Pss:") or line.startswith("SwapPss:"):
+                        kb += int(line.split()[1])
+        except OSError:
+            pass
+        return kb // 1024
+
+    bot_n = int_n = bot_mb = int_mb = 0
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                if fh.read().strip() not in ("claude", "codex"):
+                    continue
+            with open(f"/proc/{pid}/cgroup") as fh:
+                in_bot = "claude-telegram-bot" in fh.read()
+        except OSError:
+            continue
+        mb = _footprint_mb(pid)
+        if in_bot:
+            bot_n += 1; bot_mb += mb
+        else:
+            int_n += 1; int_mb += mb
+    return {"bot": bot_n, "interactive": int_n, "total": bot_n + int_n,
+            "cap": MAX_RUNNING_AGENTS,
+            "bot_mb": bot_mb, "interactive_mb": int_mb,
+            "total_mb": bot_mb + int_mb}
+
+
+async def _sessapi_metrics(req):
+    """Host resource snapshot for the console (phase 2A / W2).
+
+    Read-only, unprivileged: /proc/meminfo, /proc/loadavg, /proc/stat and
+    statvfs. Deliberately part of the EXISTING session-API app rather than a new
+    daemon - see docs/phase2/2a-console.md for the trade-off. Exposes no paths,
+    no process names, no session data.
+    """
+    # AP-1: authenticate the caller BEFORE reading or parsing anything. In 2A
+    # every route is GET, but 2B inherits this shape.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+
+    mem = {}
+    with open("/proc/meminfo") as fh:
+        for line in fh:
+            k, _, v = line.partition(":")
+            mem[k] = int(v.split()[0]) * 1024          # kB -> bytes
+
+    i0, t0 = _read_cpu_times()
+    await asyncio.sleep(0.12)                          # short delta, not a stall
+    i1, t1 = _read_cpu_times()
+    dt = t1 - t0
+    cpu_pct = round(100.0 * (1.0 - (i1 - i0) / dt), 1) if dt > 0 else 0.0
+
+    st = os.statvfs("/")
+    disk_total = st.f_blocks * st.f_frsize
+    disk_free = st.f_bavail * st.f_frsize
+
+    with open("/proc/loadavg") as fh:
+        la = fh.read().split()[:3]
+    with open("/proc/uptime") as fh:
+        uptime_s = int(float(fh.read().split()[0]))
+
+    mem_total = mem.get("MemTotal", 0)
+    mem_avail = mem.get("MemAvailable", 0)
+    swap_total = mem.get("SwapTotal", 0)
+    swap_free = mem.get("SwapFree", 0)
+    pct = lambda used, total: round(100.0 * used / total, 1) if total else 0.0
+
+    return _aw.json_response({
+        "ok": True,
+        "cpu": {"percent": max(0.0, min(100.0, cpu_pct)),
+                "cores": os.cpu_count() or 1,
+                "load": [float(x) for x in la]},
+        "memory": {"total": mem_total, "available": mem_avail,
+                   "used": mem_total - mem_avail,
+                   "percent": pct(mem_total - mem_avail, mem_total)},
+        "swap": {"total": swap_total, "free": swap_free,
+                 "used": swap_total - swap_free,
+                 "percent": pct(swap_total - swap_free, swap_total)},
+        "disk": {"total": disk_total, "free": disk_free,
+                 "used": disk_total - disk_free,
+                 "percent": pct(disk_total - disk_free, disk_total)},
+        "uptime_s": uptime_s,
+        "agents": _agent_load(),
+        "ts": time.time(),
+    })
+
+
+# ── Console write path (phase 2B) ────────────────────────────────────────────
+# The console is SINGLE-USER. The target chat is bound server-side from
+# TELEGRAM_CHAT_ID and is never accepted from the client: a chat id in a request
+# body is a claim, not a credential (AP-1). The client may name a session LABEL;
+# that label is resolved only within the server-bound chat, so naming another
+# chat's session cannot reach it.
+CONSOLE_AUDIT_LOG = os.environ.get(
+    "CONSOLE_AUDIT_LOG", "/var/log/claude-console-commands.log")
+CONSOLE_MIN_INTERVAL_S = _positive_int_env("CONSOLE_MIN_INTERVAL_S", 3)
+# Display caps for /output. The console polls every 5s, so the default response
+# stays small; `?full=1` bypasses both for an explicit, user-initiated copy.
+OUTPUT_DISPLAY_CAP = _positive_int_env("CONSOLE_OUTPUT_CAP", 20000)
+OUTPUT_ERR_CAP = _positive_int_env("CONSOLE_ERROR_CAP", 4000)
+# Linux caps a SINGLE argv element at 32 pages. The prompt travels as one argv
+# element, so this - not Telegram's 4096 - is what actually bounds a message.
+_MAX_ARG_STRLEN = 32 * os.sysconf("SC_PAGE_SIZE")
+# Headroom for the file note appended to the prompt, the flags, the session uuid
+# and the binary path, all of which share the same exec.
+CONSOLE_MAX_MESSAGE_BYTES = _positive_int_env(
+    "CONSOLE_MAX_MESSAGE_BYTES", _MAX_ARG_STRLEN - 8192)
+_CONSOLE_LAST_SEND = 0.0
+_CONSOLE_NONCE_HWM = 0
+_CONSOLE_NONCES: "deque" = deque(maxlen=512)
+
+
+def _console_chat_id() -> int:
+    """The one chat the console may act on. Server-side, from config only."""
+    return ALLOWED_IDS[0] if ALLOWED_IDS else 0
+
+
+def _console_audit(event: str, label: str, message: str, extra: str = "") -> None:
+    """Append-only record of what the console did. Deliberately a SEPARATE file
+    from the bot log: this is the record consulted when something goes wrong,
+    and it must not be buried in operational noise."""
+    try:
+        line = json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "event": event,
+            "session_label": label,
+            "message": message,
+            "extra": extra,
+        }, ensure_ascii=False)
+        with open(CONSOLE_AUDIT_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception as ex:                       # never let auditing break the request
+        log.error(f"console.audit_failed {ex!r}")
+
+
+def _console_duplicate(nonce: int) -> bool:
+    """Same SHAPE as the Telegram update_id dedup (monotonic high-water mark),
+    deliberately in its OWN namespace. Sharing `_UPDATE_ID_HWM` would be actively
+    harmful: a console nonce above the mark would make every real Telegram update
+    below it look like a duplicate and be silently dropped.
+    The bounded deque additionally catches an exact replay of an older nonce."""
+    global _CONSOLE_NONCE_HWM
+    if nonce in _CONSOLE_NONCES:
+        return True
+    if nonce <= _CONSOLE_NONCE_HWM:
+        return True
+    _CONSOLE_NONCE_HWM = nonce
+    _CONSOLE_NONCES.append(nonce)
+    return False
+
+
+class _ConsoleUpdateShim:
+    """`execute()` reads only `update.message`. Giving it a real Telegram
+    Message means the console runs the IDENTICAL execution path as Telegram —
+    execute() → dispatch_turn() → run_claude() — inheriting the pause window,
+    the global concurrency slots, the rate-limit flow and the permission mode.
+    No second execution path exists."""
+    __slots__ = ("message",)
+
+    def __init__(self, message):
+        self.message = message
+
+
+# ── voice turn (2M) ──────────────────────────────────────────────────────────
+# Push-to-talk, not conversation. Saeid holds the button, speaks as long as he
+# needs, releases. The turn runs normally. Afterwards a SECOND, SEPARATE
+# generation produces a short spoken status - never a reading of the answer.
+#
+# AUDIO RETENTION: the uploaded file is deleted immediately after transcription
+# and never enters a transcript, a log, or the audit entry. The audit records
+# that the send was voice and the transcript LENGTH - never the audio, never a
+# path to it. Raw audio of the founder talking is a category this estate has
+# never held and this does not start holding it.
+VOICE_MAX_BYTES = _positive_int_env("CONSOLE_VOICE_MAX_BYTES", 2 * 1024 * 1024)
+# TTS on the SAME key transcribe() already uses. Chosen on evidence, not docs:
+# a Farsi sentence synthesised in 7.3s, 568320 bytes of 24 kHz PCM, 11.8s long,
+# peak 26931 of 32767 - real speech. Zero new credentials, one provider for both
+# ends of the turn. Voice quality is deliberately not a criterion: this is a
+# status summary, not narration.
+VOICE_TTS_MODEL = os.environ.get("BOT_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+VOICE_TTS_VOICE = os.environ.get("BOT_TTS_VOICE", "Kore")
+
+_SPEECH_PROMPT = (
+    "You are summarising a completed agent turn so it can be READ ALOUD to the "
+    "operator in Persian. This is a status report, not the answer.\n\n"
+    "Rules:\n"
+    "- At most 60 spoken seconds (about 120 Persian words).\n"
+    "- Say what happened in one sentence.\n"
+    "- Then any question that needs a decision, asked directly.\n"
+    "- Then anything about to happen that is hard to undo.\n"
+    "- NEVER read code, file contents, paths character by character, logs, or "
+    "diffs. Naming a file is fine; reciting it is not.\n"
+    "- If the turn failed, say the reason in plain language, not the traceback.\n"
+    "- Persian, conversational, no markdown, no bullet characters.\n\n"
+    "The turn's output follows.\n\n"
+)
+
+
+async def _speech_summary(text: str, label: str, failed: bool = False) -> str:
+    """SECOND generation: a summary FOR SPEECH, not the answer itself.
+
+    Deliberately separate from the turn. It summarises; it cannot act - no tools
+    are available to it, and its output is never fed back into the session.
+    """
+    if not GEMINI_OK or not (text or "").strip():
+        return ""
+    body = text.strip()
+    if len(body) > 12000:                       # a summary needs the shape, not all of it
+        body = body[:6000] + "\n…\n" + body[-6000:]
+    prompt = _SPEECH_PROMPT + f"[session: {label}]\n" + ("[the turn FAILED]\n" if failed else "") + body
+    try:
+        # Its OWN model key, not refine's. Inheriting refine's
+        # gemini-3.1-pro-preview cost 12.8s for a 271-character summary; a flash
+        # model does the same job, because this is compression, not reasoning.
+        cfg = load_prompts().get("speech_summary", {})
+        r = await asyncio.to_thread(
+            gemini_client.models.generate_content,
+            model=cfg.get("model", "gemini-3.7-flash"),
+            contents=[{"role": "user", "parts": [{"text": prompt}]}])
+        return (r.text or "").strip()
+    except Exception as e:
+        log.error(f"speech summary failed: {e}")
+        return ""
+
+
+async def _synthesize(text: str):
+    """Persian TTS -> (opus_bytes, mime). Returns (None, None) on any failure:
+    the voice reply is an enhancement, never a reason for a turn to look broken.
+
+    Gemini returns raw 24 kHz mono PCM. ffmpeg transcodes to opus, which is 16x
+    smaller (568320 -> 34596 bytes measured) and directly playable by a browser.
+    """
+    if not text.strip() or not GEMINI_API_KEY:
+        return None, None
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{VOICE_TTS_MODEL}:generateContent?key={GEMINI_API_KEY}")
+    body = {"contents": [{"parts": [{"text": text}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"],
+                                 "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig":
+                                                                 {"voiceName": VOICE_TTS_VOICE}}}}}
+    try:
+        def _call():
+            req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                  headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=90) as r:
+                return json.load(r)
+        d = await asyncio.to_thread(_call)
+        parts = d["candidates"][0]["content"]["parts"]
+        aud = next((p for p in parts if "inlineData" in p), None)
+        if not aud:
+            return None, None
+        pcm = base64.b64decode(aud["inlineData"]["data"])
+    except Exception as e:
+        log.error(f"tts failed: {e}")
+        return None, None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1", "-i", "pipe:0",
+            "-c:a", "libopus", "-b:a", "24k", "-f", "ogg", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(proc.communicate(pcm), timeout=60)
+        if out:
+            return out, "audio/ogg"
+    except Exception as e:
+        log.error(f"tts transcode failed: {e}")
+    return None, None
+
+
+async def _sessapi_voice(req):
+    """POST /voice — audio in, transcript out, and the turn enqueued.
+
+    A VOICE SEND IS STILL A SEND: same auth, same CSRF header at the edge, same
+    rate limit, same nonce dedup, same audit log. It does not get a second,
+    weaker door because it arrives as bytes instead of text.
+    """
+    # AP-1: authenticate BEFORE reading or parsing any body.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+
+    global _CONSOLE_LAST_SEND
+    now = time.time()
+    if now - _CONSOLE_LAST_SEND < CONSOLE_MIN_INTERVAL_S:
+        return _aw.json_response({"ok": False, "error": "rate_limited",
+                                  "retry_after": CONSOLE_MIN_INTERVAL_S}, status=429)
+
+    label = (req.query.get("label") or "").strip()
+    if not label:
+        return _aw.json_response({"ok": False, "error": "label_required"}, status=400)
+    mime = (req.query.get("mime") or "audio/webm").strip()[:64]
+
+    body = await req.read()
+    if not body:
+        return _aw.json_response({"ok": False, "error": "empty_audio"}, status=400)
+    if len(body) > VOICE_MAX_BYTES:
+        return _aw.json_response({"ok": False, "error": "audio_too_large",
+                                  "max_bytes": VOICE_MAX_BYTES,
+                                  "length_bytes": len(body)}, status=413)
+
+    # Temp file, then unlinked in `finally` whatever happens. Never under a
+    # transcript root, never named after the session.
+    fd, tmp = tempfile.mkstemp(prefix="voice-", suffix=".bin")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(body)
+        text = await transcribe(tmp, mime=mime)
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    del body
+
+    if not text:
+        return _aw.json_response({"ok": False, "error": "transcription_failed"}, status=502)
+
+    text_bytes = len(text.encode("utf-8"))
+    if text_bytes > CONSOLE_MAX_MESSAGE_BYTES:
+        return _aw.json_response({
+            "ok": False, "error": "message_too_long",
+            "detail": (f"the transcript is {text_bytes} bytes, over the "
+                       f"{CONSOLE_MAX_MESSAGE_BYTES}-byte limit. Say less per turn."),
+            "transcript": text[:400], "length_bytes": text_bytes,
+            "max_bytes": CONSOLE_MAX_MESSAGE_BYTES}, status=413)
+
+    # Chat-bound lookup, identical to /send. The label is a hint; the CHAT is
+    # server-bound. A body- or query-supplied owner is a claim, not a credential.
+    cid = _console_chat_id()
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        _console_audit("no_such_session", label, "<voice>", f"chat_bound={cid}")
+        return _aw.json_response({"ok": False, "error": "unknown_session"}, status=404)
+
+    _CONSOLE_LAST_SEND = now
+    # Audit: the fact it was voice and how long the transcript was. Not the audio.
+    _console_audit("voice_send", label, f"<voice transcript, {text_bytes} bytes>", "voice")
+
+    anchor = await bot.send_message(
+        chat_id=cid, text=f"🎙️ <b>{session.label}</b> — voice", parse_mode=ParseMode.HTML)
+    SM.register_message(anchor.message_id, session.id)
+
+    async def _run():
+        try:
+            await execute(_ConsoleUpdateShim(anchor), None, text, session)
+        except Exception as ex:
+            log.error(f"voice send failed: {ex}")
+    asyncio.create_task(_run())
+    return _aw.json_response({"ok": True, "label": label, "transcript": text,
+                              "length_bytes": text_bytes})
+
+
+async def _sessapi_speak(req):
+    """GET /speak?label= — the spoken status for a session's last turn.
+
+    Generated on demand rather than pushed, because the console already polls
+    and a turn takes minutes. Two calls: summarise, then synthesise.
+    """
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    label = (req.query.get("label") or "").strip()
+    cid = _console_chat_id()
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        return _aw.json_response({"ok": False, "error": "unknown_session"}, status=404)
+    out = _scrub_secrets(getattr(session, "out", "") or "")
+    if not out.strip():
+        return _aw.json_response({"ok": False, "error": "no_output"}, status=404)
+    failed = getattr(session, "status", "") == "error"
+    summary = await _speech_summary(out, label, failed=failed)
+    if not summary:
+        return _aw.json_response({"ok": False, "error": "summary_failed"}, status=502)
+    if req.query.get("text_only") == "1":
+        return _aw.json_response({"ok": True, "summary": summary})
+    audio, mime = await _synthesize(summary)
+    if not audio:
+        # Degrade to text: the operator still gets the summary, just silently.
+        return _aw.json_response({"ok": True, "summary": summary, "audio": False})
+    return _aw.Response(body=audio, content_type=mime,
+                        headers={"X-Voice-Summary-Len": str(len(summary))})
+
+
+async def _sessapi_send(req):
+    """POST /send — enqueue a message into a session, as if typed in Telegram."""
+    # AP-1: authenticate FIRST, before reading or parsing any body.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+
+    global _CONSOLE_LAST_SEND
+    now = time.time()
+    if now - _CONSOLE_LAST_SEND < CONSOLE_MIN_INTERVAL_S:
+        return _aw.json_response({"ok": False, "error": "rate_limited",
+                                  "retry_after": CONSOLE_MIN_INTERVAL_S}, status=429)
+
+    try:
+        body = await req.json()
+    except Exception:
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+    if not isinstance(body, dict):
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+
+    label = str(body.get("label") or "").strip()
+    text = str(body.get("message") or "").strip()
+    try:
+        nonce = int(body.get("nonce") or 0)
+    except (TypeError, ValueError):
+        nonce = 0
+
+    # Any chat/session-owner field in the body is refused outright rather than
+    # ignored: silently dropping it would let a caller believe it worked.
+    for forbidden in ("chat_id", "chat", "owner", "session_id", "id"):
+        if forbidden in body:
+            _console_audit("rejected_owner_field", label, text, forbidden)
+            return _aw.json_response(
+                {"ok": False, "error": "owner_fields_not_accepted",
+                 "detail": f"'{forbidden}' is server-bound"}, status=400)
+
+    if not label or not text:
+        return _aw.json_response({"ok": False, "error": "label_and_message_required"},
+                                 status=400)
+    # The real constraint is the KERNEL, not Telegram. run_claude passes the
+    # prompt as a single argv element (`cmd += [flag, uuid_str, full_prompt]`),
+    # and Linux caps one argv string at MAX_ARG_STRLEN = 32 * PAGE_SIZE. Measured
+    # on this box: 131071 bytes execs, 131072 gives E2BIG. Telegram's 4096 limit
+    # applies to the REPLY path only, and that path chunks rather than truncates.
+    # Measure BYTES: len() counts characters, and Farsi is ~2 bytes/char, so a
+    # character cap silently halves the real allowance for the language actually
+    # being typed here.
+    text_bytes = len(text.encode("utf-8"))
+    if text_bytes > CONSOLE_MAX_MESSAGE_BYTES:
+        return _aw.json_response({
+            "ok": False,
+            "error": "message_too_long",
+            "detail": (f"{text_bytes} bytes exceeds the {CONSOLE_MAX_MESSAGE_BYTES}-byte "
+                       f"limit (kernel MAX_ARG_STRLEN {_MAX_ARG_STRLEN} minus headroom "
+                       f"for the file note and command). Split it into two messages."),
+            "length_bytes": text_bytes,
+            "max_bytes": CONSOLE_MAX_MESSAGE_BYTES,
+            "limit_source": "kernel MAX_ARG_STRLEN",
+        }, status=413)
+    if nonce <= 0:
+        return _aw.json_response({"ok": False, "error": "nonce_required"}, status=400)
+    if _console_duplicate(nonce):
+        _console_audit("duplicate", label, text, f"nonce={nonce}")
+        return _aw.json_response({"ok": False, "error": "duplicate"}, status=409)
+
+    cid = _console_chat_id()
+    if not cid:
+        return _aw.json_response({"ok": False, "error": "no_bound_chat"}, status=503)
+
+    # Resolve the label ONLY within the server-bound chat.
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        _console_audit("no_such_session", label, text, f"chat_bound={cid}")
+        return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+    if session.status == "running":
+        return _aw.json_response({"ok": False, "error": "session_busy"}, status=409)
+
+    _CONSOLE_LAST_SEND = now
+    _console_audit("send", session.label, text, f"nonce={nonce} project={session.project}")
+
+    bot = req.app["bot"]
+    anchor = await bot.send_message(
+        cid, f"🖥 <b>console</b> → {esc(session.label)}\n<pre>{esc(text[:1500])}</pre>",
+        parse_mode=ParseMode.HTML)
+    SM.register_message(anchor.message_id, session.id)
+
+    async def _run():
+        try:
+            await execute(_ConsoleUpdateShim(anchor), None, text, session)
+            _console_audit("completed", session.label, text[:200], f"nonce={nonce}")
+        except Exception as ex:
+            log.error(f"console.send_failed {ex!r}")
+            _console_audit("failed", session.label, text[:200], repr(ex)[:300])
+
+    asyncio.create_task(_run())
+    return _aw.json_response({"ok": True, "label": session.label, "queued": True})
+
+
+async def _sessapi_output(req):
+    """GET /output?label= — last reply for one session, for the console to poll.
+
+    A NEW surface, reviewed against the same exclusion list as /sessions: no
+    chat_id, no session_uuid, no worktree path, no transcript, no message ids.
+    `out` is the model's reply text, which is the thing being displayed."""
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    label = str(req.query.get("label") or "").strip()
+    if not label:
+        return _aw.json_response({"ok": False, "error": "label_required"}, status=400)
+    cid = _console_chat_id()
+    session = next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+    if session is None:
+        return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+    # Display is capped so a poll cannot ship megabytes every 5s. `?full=1`
+    # returns the WHOLE thing for the copy button - a copy that silently gives
+    # you only what was on screen is the same failure class as an audit log that
+    # misses successes: it looks like it worked.
+    full = str(req.query.get("full") or "") in ("1", "true", "yes")
+    raw_out = _scrub_secrets(getattr(session, "out", "") or "")
+    raw_err = _scrub_secrets(getattr(session, "error_text", "") or "")
+    return _aw.json_response({
+        "ok": True,
+        "label": session.label,
+        "status": session.status,
+        "last_active": session.last_active,
+        "tasks": session.tasks,
+        "status_reason": getattr(session, "status_reason", ""),
+        "error_text": raw_err if full else raw_err[-OUTPUT_ERR_CAP:],
+        "out": raw_out if full else raw_out[-OUTPUT_DISPLAY_CAP:],
+        # Lengths are of the SCRUBBED text, i.e. exactly what a client can get.
+        "out_len": len(raw_out),
+        "error_len": len(raw_err),
+        "out_truncated": (not full) and len(raw_out) > OUTPUT_DISPLAY_CAP,
+        "error_truncated": (not full) and len(raw_err) > OUTPUT_ERR_CAP,
+        "full": full,
+    })
+
+
+def _console_guard(req, body, need_nonce=True):
+    """Shared write-path guard (phase 2C). Returns an error response, or None.
+
+    Every console WRITE runs this, so a new control cannot accidentally ship
+    with a weaker shape than /send. Callers must have already authenticated -
+    that stays the literal first statement of each handler (AP-1)."""
+    global _CONSOLE_LAST_SEND
+    if not isinstance(body, dict):
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+    for forbidden in ("chat_id", "chat", "owner", "session_id", "id"):
+        if forbidden in body:
+            return _aw.json_response(
+                {"ok": False, "error": "owner_fields_not_accepted",
+                 "detail": f"'{forbidden}' is server-bound"}, status=400)
+    if need_nonce:
+        try:
+            nonce = int(body.get("nonce") or 0)
+        except (TypeError, ValueError):
+            nonce = 0
+        if nonce <= 0:
+            return _aw.json_response({"ok": False, "error": "nonce_required"}, status=400)
+        if _console_duplicate(nonce):
+            return _aw.json_response({"ok": False, "error": "duplicate"}, status=409)
+    now = time.time()
+    if now - _CONSOLE_LAST_SEND < CONSOLE_MIN_INTERVAL_S:
+        return _aw.json_response({"ok": False, "error": "rate_limited",
+                                  "retry_after": CONSOLE_MIN_INTERVAL_S}, status=429)
+    _CONSOLE_LAST_SEND = now
+    return None
+
+
+def _console_session(label: str):
+    """Resolve a label ONLY inside the server-bound chat. A session belonging to
+    any other chat is simply not in this list, so it cannot be named."""
+    cid = _console_chat_id()
+    if not cid:
+        return None, None
+    return cid, next((s for s in SM.active_for_chat(cid) if s.label == label), None)
+
+
+async def _sessapi_control(req):
+    """POST /control — new | kill | model | project.
+
+    Same shape as /send: authenticate first, refuse owner fields, dedup, rate
+    limit, audit. Each action goes through the SAME SessionManager calls the
+    Telegram command handlers use; nothing here reimplements session lifecycle."""
+    # AP-1: authenticate BEFORE reading the body.
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    try:
+        body = await req.json()
+    except Exception:
+        return _aw.json_response({"ok": False, "error": "bad_json"}, status=400)
+    err = _console_guard(req, body)
+    if err is not None:
+        _console_audit("control_rejected", str(body.get("label") or ""),
+                       str(body.get("action") or ""), "guard")
+        return err
+
+    action = str(body.get("action") or "").strip()
+    label = str(body.get("label") or "").strip()[:40]
+    if not action or not label:
+        return _aw.json_response({"ok": False, "error": "action_and_label_required"},
+                                 status=400)
+    cid = _console_chat_id()
+    if not cid:
+        return _aw.json_response({"ok": False, "error": "no_bound_chat"}, status=503)
+
+    if action == "register_project":
+        project = str(body.get("project") or "").strip()
+        path = str(body.get("path") or "").strip()
+        if not project or not os.path.isabs(path) or not os.path.isdir(path):
+            return _aw.json_response({"ok": False, "error": "existing_absolute_path_required"}, status=400)
+        error = add_project(project, os.path.realpath(path))
+        if error:
+            return _aw.json_response({"ok": False, "error": error}, status=400)
+        _console_audit("register_project", label, project)
+        return _aw.json_response({"ok": True, "project": project})
+
+    if action == "new":
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,30}", label):
+            return _aw.json_response({"ok": False, "error": "bad_label"}, status=400)
+        project = str(body.get("project") or "").strip()
+        if project not in get_project_names():
+            return _aw.json_response({"ok": False, "error": "unknown_project"}, status=400)
+        if not SM.can_create(cid):
+            return _aw.json_response({"ok": False, "error": "session_limit"}, status=409)
+        _, existing = _console_session(label)
+        if existing is not None:
+            return _aw.json_response({"ok": False, "error": "label_in_use"}, status=409)
+        engine = str(body.get("engine") or engines.ENGINE_CLAUDE).strip()
+        adapter = engines.get_adapter(engine)
+        if adapter is None or adapter.caps.is_chat:
+            return _aw.json_response({"ok": False, "error": "bad_engine"}, status=400)
+        model = str(body.get("model") or "").strip()
+        if not adapter.validate_model(model):
+            return _aw.json_response({"ok": False, "error": "bad_model"}, status=400)
+        session = SM.create(cid, label)
+        _apply_engine(session, engine, model)
+        if engine == engines.ENGINE_CLAUDE:
+            session.claude_model = model
+        session.project = project
+        save_state()
+        _console_audit("new", label, project)
+        return _aw.json_response({"ok": True, "label": session.label,
+                                  "project": session.project, "engine": session.engine,
+                                  "model": model})
+
+    _, session = _console_session(label)
+    if session is None:
+        _console_audit("no_such_session", label, action)
+        return _aw.json_response({"ok": False, "error": "no_such_session"}, status=404)
+
+    if action == "kill":
+        # A running session is in-flight work. Killing one by accident is the
+        # disruption this endpoint must not enable, so it takes a SECOND,
+        # explicit act - the same two-factors-of-intent rule as AP-3.
+        if session.status == "running" and body.get("force") is not True:
+            return _aw.json_response(
+                {"ok": False, "error": "session_running",
+                 "detail": "resend with force=true to kill a running session"},
+                status=409)
+        ok = SM.kill(cid, label)
+        _console_audit("kill", label, f"force={body.get('force') is True}",
+                       f"was={session.status}")
+        return _aw.json_response({"ok": bool(ok), "label": label})
+
+    if action == "model":
+        model = str(body.get("model") or "").strip()
+        adapter = engines.get_adapter(session.engine)
+        if adapter is None or not adapter.validate_model(model):
+            return _aw.json_response({"ok": False, "error": "bad_model"}, status=400)
+        if session.status in ("running", "queued"):
+            return _aw.json_response({"ok": False, "error": "session_busy"}, status=409)
+        # Claude reads session.claude_model; every other engine reads
+        # session.model. Setting the wrong one made a Codex model switch report
+        # success and change nothing.
+        if session.engine == engines.ENGINE_CLAUDE:
+            session.claude_model = model
+        else:
+            session.model = model
+        save_state()
+        _console_audit("model", label, model, f"engine={session.engine}")
+        return _aw.json_response({"ok": True, "label": label, "model": model,
+                                  "engine": session.engine})
+
+    if action == "project":
+        project = str(body.get("project") or "").strip()
+        try:
+            change_session_project(session, project)
+        except ValueError as exc:
+            return _aw.json_response({'ok': False, 'error': str(exc)}, status=409 if str(exc) == 'session_busy' else 400)
+        _console_audit("project", label, project)
+        return _aw.json_response({"ok": True, "label": label, "project": project})
+
+    return _aw.json_response({"ok": False, "error": "unknown_action"}, status=400)
+
+
+async def _sessapi_mcp(req):
+    """GET /mcp — which MCP servers are configured (read-only, 2C).
+
+    Deliberately exposes NAMES and shape only: no args, no urls, no env values.
+    An MCP arg list routinely carries an API key, and a url can carry a token, so
+    neither is safe to render in a browser. Toggling a server changes the
+    permission surface and stays founder-only."""
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    out = []
+    try:
+        with open("/root/.claude.json") as fh:
+            cfg = json.load(fh).get("mcpServers", {})
+    except Exception as ex:
+        cfg = {}  # Codex-only installations need no Claude configuration.
+    for name, c in sorted(cfg.items()):
+        cmd = c.get("command") or ""
+        out.append({
+            "name": name,
+            "engine": "claude",
+            "type": c.get("type") or ("url" if c.get("url") else "stdio"),
+            "command": os.path.basename(cmd) if cmd else "",
+            "arg_count": len(c.get("args") or []),
+            "env_names": sorted((c.get("env") or {}).keys()),
+        })
+    try:
+        import tomllib
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        codex_cfg = tomllib.loads((home / "config.toml").read_text()).get("mcp_servers", {})
+        for name, c in sorted(codex_cfg.items()):
+            out.append({"name": name, "engine": "codex",
+                        "type": "url" if c.get("url") else "stdio",
+                        "command": os.path.basename(c.get("command") or ""),
+                        "arg_count": len(c.get("args") or []),
+                        "env_names": sorted((c.get("env") or {}).keys())})
+    except (OSError, ValueError, ImportError):
+        pass
+    return _aw.json_response({"ok": True, "servers": out, "count": len(out)})
+
+
+async def _sessapi_models(req):
+    """GET /models — family aliases and what each currently resolves to.
+
+    The console renders FAMILIES. It never sends a version string, and nothing
+    here maps one: the alias goes to the CLI untouched and the CLI picks the
+    newest model in that family. This endpoint is display-only, so a stale cache
+    shows a stale label but can never pin a session to an old model."""
+    if not _sessapi_authorized(req):
+        return _aw.json_response({"ok": False, "error": "auth_failed"}, status=403)
+    # NEVER probe inline: each alias costs a real CLI turn, and probing four of
+    # them serially took >2 minutes, which hung the console's startup fetch.
+    # Serve whatever is cached and refresh in the background.
+    resolved = dict(_MODEL_CACHE)
+    if (os.environ.get("BOT_RESOLVE_CLAUDE_MODELS", "false").lower() == "true"
+            and (not resolved or (time.time() - _MODEL_CACHE_AT) >= MODEL_CACHE_TTL)):
+        _schedule_model_refresh()
+    catalogs = {}
+    for adapter in engines.all_engines():
+        if adapter.caps.is_chat:
+            continue
+        try:
+            catalogs[adapter.caps.engine] = {
+                'label': adapter.caps.label, 'default': adapter.default_model(), 'available': True,
+                'models': [{'id': m.id, 'label': m.label} for m in adapter.list_models() if m.available],
+            }
+        except (ValueError, OSError):
+            catalogs[adapter.caps.engine] = {'label': adapter.caps.label, 'default': '',
+                'available': False, 'models': [], 'error': 'configuration_unavailable'}
+    return _aw.json_response({
+        "ok": True,
+        "families": MODEL_FAMILIES,
+        "resolved": resolved,
+        "default": catalogs.get('claude', {}).get('default') or BOT_DEFAULT_CLAUDE_MODEL or "",
+        "cached_at": _MODEL_CACHE_AT,
+        "engines": catalogs,
+    })
+
+
+# ── MCP bridge wiring (owner pilot; docs/MCP_BRIDGE.md) ─────────────────────
+_MCP_NONCE_SEQ = None
+
+
+def _mcp_next_nonce() -> int:
+    """Monotonic per-process nonce for bridge-initiated console writes
+    (session_new / ask-create). Same HWM namespace as console/client
+    nonces, so the generator must TRACK BOTH the clock and the console
+    high-water mark (M1 after review): a plain count seeded once falls
+    behind real time and gets poisoned by any client that sent its own
+    epoch-ms nonce, after which every session_new fails as 'duplicate'.
+    Clock+HWM-tracked: never below now, never below an accepted nonce —
+    and STRICTLY ABOVE both on EVERY call (owner R-revisit, first-call
+    bug): _console_duplicate refuses <= HWM, so a first value landing
+    exactly ON the floor (== a HWM a client just raised to the clock)
+    was refused as a duplicate of the caller's own nonce."""
+    global _MCP_NONCE_SEQ
+    floor = max(int(time.time() * 1000), _CONSOLE_NONCE_HWM)
+    if _MCP_NONCE_SEQ is None or _MCP_NONCE_SEQ < floor:
+        # strictly ABOVE the floor on the first call too
+        _MCP_NONCE_SEQ = floor + 1
+    else:
+        _MCP_NONCE_SEQ += 1
+    return _MCP_NONCE_SEQ
+
+
+def _mcp_model_metadata(session) -> dict:
+    """Requested alias vs effective model, honestly separated (phase-2 rule:
+    unknown stays unknown). The alias is passed through to the CLI verbatim —
+    the bot never rewrites or pins it. 'effective' is claimed ONLY when the
+    gateway config itself maps the alias; a full model id or an unmapped
+    alias stays null with its evidence status. Billing is never guessed."""
+    requested = (getattr(session, "claude_model", "") or BOT_DEFAULT_CLAUDE_MODEL or "")
+    effective = None
+    route = None
+    try:
+        if claude_gateway.settings():
+            route = "openrouter-gateway"
+            effective = claude_gateway.configured_models().get(requested, "") or None
+    except Exception:
+        route = effective = None
+    return {"engine": getattr(session, "engine", "claude"),
+            "requested_alias": requested,
+            "effective_model": effective,
+            "provider_route": route,
+            "route_evidence": "gateway config" if route else "unverified",
+            "billing_source": "unknown"}
+
+
+async def _sessapi_mcp_rpc(req):
+    """POST /mcp/rpc — MCP streamable-HTTP envelope. Auth and dispatch live
+    in mcp_bridge (same token as every console route, no new credential);
+    every tool call lands in the SAME console handlers as Telegram."""
+    return await mcp_bridge.handle_http(req)
+
+
+def _sessapi_build_app(bot_obj) -> "_aw.Application":
+    """Build the session-API aiohttp app: the console routes plus the
+    BOT_MCP_ENABLED-gated MCP bridge. Split out of _sessapi_start (owner
+    R-revisit item 3) so the gate is directly testable: with the gate off,
+    NEITHER mcp_bridge.wire NOR the /mcp/rpc route comes to exist."""
+    a = _aw.Application()
+    a["bot"] = bot_obj
+    a.router.add_get("/sessions", _sessapi_sessions)
+    a.router.add_get("/metrics", _sessapi_metrics)
+    a.router.add_get("/output", _sessapi_output)
+    a.router.add_get("/mcp", _sessapi_mcp)
+    a.router.add_get("/models", _sessapi_models)
+    a.router.add_post("/send", _sessapi_send)
+    a.router.add_post("/voice", _sessapi_voice)
+    a.router.add_get("/speak", _sessapi_speak)
+    a.router.add_post("/control", _sessapi_control)
+    if BOT_MCP_ENABLED:
+        # Owner-only MCP bridge on the SAME app/token/manager/queue. Wired
+        # here (not at import) so the handlers exist and the bot instance is
+        # bound; every dep is a bot.py-owned callable so the bridge stays
+        # logic-free and unit-testable with fakes.
+        mcp_bridge.wire({
+            "token": BOT_SESSION_API_TOKEN,
+            "authorized": _sessapi_authorized,
+            "send": _sessapi_send, "control": _sessapi_control,
+            "output": _sessapi_output, "sessions": _sessapi_sessions,
+            "models": _sessapi_models,
+            "lookup_session": _console_session,
+            "cancel_tasks": CONC.cancel_session_tasks,
+            "project_names": get_project_names,
+            "next_nonce": _mcp_next_nonce,
+            "claim_nonce": _console_duplicate,
+            "save_state": save_state,
+            "report_for": _report_for_session,
+            "model_metadata": _mcp_model_metadata,
+            "audit": _console_audit,
+            "mcp_projects": BOT_MCP_PROJECTS,
+            "bot": bot_obj,
+        })
+        a.router.add_post("/mcp/rpc", _sessapi_mcp_rpc)
+        log.info(f"mcp_bridge.enabled projects={BOT_MCP_PROJECTS} engine=claude "
+                  f"cancel=queued-only")
+    return a
+
+
+async def _sessapi_start(app):
+    global _SESSAPI_RUNNER
+    if not BOT_SESSION_API_TOKEN:
+        log.warning("session_api.disabled reason=missing_secret")
+        return
+    a = _sessapi_build_app(app.bot)
+    runner = _aw.AppRunner(a)
+    await runner.setup()
+    try:
+        await _aw.TCPSite(runner, BOT_SESSION_API_BIND, BOT_SESSION_API_PORT).start()
+    except Exception as ex:
+        log.error(f"session_api.bind_failed bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}: {ex}")
+        await runner.cleanup()
+        return
+    _SESSAPI_RUNNER = runner
+    log.info(f"session_api.listening bind={BOT_SESSION_API_BIND}:{BOT_SESSION_API_PORT}")
+    # Warm the alias->concrete map in the background so the console's first
+    # /models call is served from cache instead of waiting on four CLI turns.
+    _schedule_model_refresh()
+
+
+async def _sessapi_stop():
+    if _SESSAPI_RUNNER is None:
+        return
+    try:
+        await asyncio.wait_for(_SESSAPI_RUNNER.cleanup(), timeout=5.0)
+    except asyncio.TimeoutError:
+        log.warning("session_api.cleanup_timeout")
+
+
 @authorized
 async def cmd_nightwatch_ping(update, context):
     try:
@@ -5503,6 +7099,27 @@ async def cmd_nightwatch_last(update, context):
         parse_mode=ParseMode.HTML)
 
 
+async def _dedup_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """group=-1 chokepoint — every Update (each CommandHandler, MessageHandler,
+    and the CallbackQueryHandler included) passes through here first, since
+    PTB evaluates handler groups in ascending order and ApplicationHandlerStop
+    halts ALL later groups for this update. This is deliberately the ONE
+    place update_id dedup happens — patching each handler individually would
+    leave any handler someone adds later (or one of the 18 that already exist)
+    unprotected.
+
+    Dedup is on the transport-level `update_id` ONLY. A user double-tapping
+    the same inline button produces two Updates with two DIFFERENT update_ids
+    and both are legitimate, distinct user actions — that is NOT deduped
+    here, same as before this change. Only an exact retry of one already-seen
+    update_id (e.g. Telegram resending because our getUpdates ack was lost)
+    is suppressed.
+    """
+    if _is_duplicate_update(update.update_id):
+        log.warning(f"update_dedup.duplicate update_id={update.update_id}")
+        raise ApplicationHandlerStop
+
+
 def main():
     if not BOT_TOKEN: print("❌ Set TELEGRAM_BOT_TOKEN"); sys.exit(1)
     log.info("🚀 Starting Shahrzad DevOps Bot v4 (Multi-Session)...")
@@ -5532,6 +7149,9 @@ def main():
     BOT = app.bot
     APPLICATION = app
     # The footer is applied by FooterBot (built above); no instance patching.
+    # Dedup gate runs in group -1 — before every other handler below, for
+    # every update kind (see _dedup_gate docstring for why one chokepoint).
+    app.add_handler(TypeHandler(Update, _dedup_gate), group=-1)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("new", cmd_new))

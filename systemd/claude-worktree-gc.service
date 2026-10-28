@@ -1,5 +1,6 @@
 [Unit]
 Description=Claude worktree garbage collection (one-shot)
+OnFailure=zk4-backup-alert@%n.service
 
 [Service]
 Type=oneshot

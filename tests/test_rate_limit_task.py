@@ -87,6 +87,11 @@ async def test_normal_completion_no_stale_entry(monkeypatch):
     monkeypatch.setattr(bot, "RATE_LIMIT_RETRY_DELAY", 0)
 
     async def fake_run(*a, **k):
+        # AP-5 positive control. The flow is mid-execution here, so the
+        # registration must EXIST. Without it, "not in" at the end would also
+        # pass if the task were never registered, or if the key format changed -
+        # the test would assert the absence of something it never proved present.
+        assert "123:rl" in bot.CONC.session_tasks, "never registered; the final assert is vacuous"
         return "short successful output"            # != RL_LIMITED_SENTINEL, < 8000
     monkeypatch.setattr(bot, "run_claude", fake_run)
 

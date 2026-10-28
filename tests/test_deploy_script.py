@@ -89,6 +89,19 @@ _mainpid() {
   fi
   cat "$S/pid"
 }
+for arg in "$@"; do
+ case "$arg" in claude-worktree-gc.*) tgt="$arg";; esac
+done
+if [[ "$tgt" = claude-worktree-gc.* ]]; then
+ case "$1:$tgt" in
+  show:claude-worktree-gc.timer) [ -f "$S/gc_active" ] && echo active || echo inactive ;;
+  show:claude-worktree-gc.service) echo "${GC_SERVICE_STATE:-inactive}" ;;
+  stop:claude-worktree-gc.timer) [ "${GC_STOP_FAIL:-0}" = 1 ] && exit 1; rm -f "$S/gc_active" ;;
+  start:claude-worktree-gc.timer) touch "$S/gc_active" ;;
+  is-active:claude-worktree-gc.timer) [ -f "$S/gc_active" ]; exit $? ;;
+ esac
+ exit 0
+fi
 case "$1" in
   is-active)
     if [ "$tgt" = "reports-cleanup.timer" ]; then
@@ -106,7 +119,7 @@ case "$1" in
       *MainPID*)      _mainpid ;;
       *"-p User"*)    echo "${SVC_USER:-root}" ;;
       *ControlGroup*) echo "${SC_CGROUP:-}" ;;
-      *ExecStart*)    echo "${SC_EXECSTART:-}" ;;
+      *ExecStart*)    if [[ "$*" = *claude-telegram-bot* ]]; then echo "${SC_BOT_EXECSTART:-${SC_EXECSTART:-}}"; else echo "${SC_EXECSTART:-}"; fi ;;
     esac; exit 0 ;;
   restart)  echo $(( $(cat "$S/pid") + 1000 )) > "$S/pid"; echo 0 > "$S/pidreads"; rm -f "$S/svc_down"; exit 0 ;;
   enable)   [ "$2" = "reports-cleanup.timer" ] && touch "$S/timer_enabled"; exit 0 ;;
@@ -584,6 +597,11 @@ def test_cli_content_contracts_fail_closed(fs, mode_env, expect):
     assert not (fs["live"] / "scripts" / "claude-telegram-bot.py").exists()
 
 
+@pytest.mark.slow   # ~26s on an idle box: runs the deploy script all the way
+# to DEPLOYED. It was on the carry-forward list as "hanging"; it is not. It
+# crossed a 45s sweep bound only while three agent sessions were running.
+# The script's waits are already neutralised here (DEPLOY_OBSERVE_SECONDS=0,
+# HEALTH_POLL=1), so the time is real work, not a sleep to tune away.
 def test_separate_cache_dir_and_root_owned_files_chowned(fs):
     # non-default cache dir + pre-existing files: install must chown them and
     # verify service-user replace capability (svcuser via fake sudo)
@@ -1186,3 +1204,113 @@ def test_bot_claude_models_override_validated(fs):
     r = _execute(fs)
     assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
     assert "catalog validation failed" in r.stderr
+
+# MCP release coverage: the real installer, fake services and isolated roots.
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_mcp_gc_transaction_restores_timer_and_files(fs, active, fail):
+    unit = fs["systemd"] / "claude-worktree-gc.service"
+    unit.write_text("old-gc-unit\n")
+    module = fs["live"] / "scripts/mcp_bridge.py"
+    module.write_text("# original MCP\n")
+    gc = fs["live"] / "scripts/worktree-gc.py"
+    gc.write_text("# original GC\n")
+    if active:
+        (fs["sc"] / "gc_active").touch()
+    r = _execute(fs, env_extra={"DEPLOY_FAIL_AT": "verify_install"} if fail else {})
+    assert (fs["sc"] / "gc_active").exists() == active
+    if fail:
+        assert _status(fs) == "ROLLED_BACK", r.stderr[-3000:]
+        assert module.read_text() == "# original MCP\n"
+        assert gc.read_text() == "# original GC\n"
+        assert unit.read_text() == "old-gc-unit\n"
+    else:
+        assert r.returncode == 0, r.stderr[-3000:]
+        assert module.read_bytes() == (_REPO / "mcp_bridge.py").read_bytes()
+        assert gc.read_bytes() == (_REPO / "scripts/worktree-gc.py").read_bytes()
+        assert str(gc) in unit.read_text()
+    log = fs["log"].read_text().splitlines()
+    assert log.index("stop claude-worktree-gc.timer") < log.index("stop claude-telegram-bot")
+
+
+def test_gc_busy_refuses_before_bot_stop_and_restores_timer(fs):
+    (fs["systemd"] / "claude-worktree-gc.service").write_text("old-unit")
+    (fs["sc"] / "gc_active").touch()
+    r = _execute(fs, env_extra={"GC_SERVICE_STATE": "active"})
+    assert r.returncode != 0
+    assert "GC sweep active" in r.stderr
+    assert "stop claude-telegram-bot\n" not in fs["log"].read_text()
+    assert (fs["sc"] / "gc_active").exists()
+
+
+def test_pinned_publisher_bootstrap_refuses_before_mutation(fs):
+    before = _digest(fs["live"])
+    r = _execute(fs, env_extra={"SC_EXECSTART": "/private/publisher-bootstrap.py"})
+    assert r.returncode != 0
+    assert "pins application_sha256" in r.stderr
+    assert _digest(fs["live"]) == before
+    assert "stop claude-telegram-bot\n" not in fs["log"].read_text()
+
+
+def test_gc_stop_failure_preserves_active_timer_and_bot(fs):
+    (fs["systemd"] / "claude-worktree-gc.service").write_text("old-unit")
+    (fs["sc"] / "gc_active").touch()
+    before = _digest(fs["live"])
+    r = _execute(fs, env_extra={"GC_STOP_FAIL": "1"})
+    assert r.returncode != 0
+    assert "GC timer stop failed" in r.stderr
+    assert (fs["sc"] / "gc_active").exists()
+    assert _digest(fs["live"]) == before
+    assert "stop claude-telegram-bot\n" not in fs["log"].read_text()
+
+
+def test_failed_rollback_does_not_restart_gc(fs):
+    (fs["systemd"] / "claude-worktree-gc.service").write_text("old-unit")
+    (fs["sc"] / "gc_active").touch()
+    module = fs["live"] / "scripts/mcp_bridge.py"
+    module.write_text("# original\n")
+    r = _execute(fs, env_extra={"DEPLOY_FAIL_AT": "verify_install",
+        "DEPLOY_RB_CORRUPT_CMD": str(fs["binp"] / "rbcorrupt"),
+        "RB_CORRUPT_MODE": "content", "RB_TARGET": str(module)})
+    assert r.returncode != 0
+    assert _status(fs) == "ROLLBACK_FAILED", r.stderr[-2000:]
+    assert not (fs["sc"] / "gc_active").exists()
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_publisher_config_participates_in_real_installer_manifest(fs, fail):
+    # Exercise the installer plumbing with a synthetic publisher helper. The
+    # separate namespace suite exercises the actual helper and actual loader.
+    source = fs['tmp'] / 'publisher-source'
+    shutil.copytree(_REPO, source, ignore=shutil.ignore_patterns('.git','__pycache__','.pytest_cache'))
+    config = fs['live'] / 'configs/publisher.json'
+    original = '{"application_sha256":"old", "private_root":"unchanged"}\n'
+    config.write_text(original); config.chmod(0o600)
+    helper = source / 'scripts/publisher-deploy.py'
+    helper.write_text('''import json, os, sys
+from pathlib import Path
+config=Path(os.environ['SYNTHETIC_PUBLISHER_CONFIG'])
+action=sys.argv[1]
+if action=='prepare':
+ Path(sys.argv[-1]).write_text('{}')
+ print(config)
+elif action=='update':
+ config.write_text(config.read_text().replace('"old"','"new"'))
+elif action=='smoke':
+ assert json.loads(config.read_text())['application_sha256']=='new'
+elif action=='rollback-smoke':
+ assert json.loads(config.read_text())['application_sha256']=='old'
+''')
+    env = {'DEPLOY_SOURCE':str(source), 'SC_BOT_EXECSTART':'/synthetic/publisher-bootstrap.py',
+           'SYNTHETIC_PUBLISHER_CONFIG':str(config)}
+    if fail:
+        env['DEPLOY_FAIL_AT']='verify_install'
+    r = _execute(fs, env_extra=env)
+    if fail:
+        assert _status(fs)=='ROLLED_BACK', r.stderr[-3000:]
+        assert config.read_text()==original
+    else:
+        assert r.returncode==0, r.stderr[-3000:]
+        assert config.read_text()==original.replace('"old"','"new"')
+    assert config.stat().st_mode & 0o777 == 0o600
+    manifests=list((fs['tmp']/'backups').glob('*/MANIFEST.tsv'))
+    assert manifests and str(config) in manifests[0].read_text()

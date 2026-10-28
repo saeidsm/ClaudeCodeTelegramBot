@@ -9,6 +9,7 @@ Claude choices and to reject cross-engine ids.
 from __future__ import annotations
 
 import os
+from . import claude_gateway
 
 from .base import Capabilities, EngineAdapter, ModelInfo, ENGINE_CLAUDE
 
@@ -60,13 +61,22 @@ class ClaudeAdapter(EngineAdapter):
     )
 
     def default_model(self) -> str:
+        if claude_gateway.settings():
+            return claude_gateway.configured_models()['']
         # Empty => inherit BOT_DEFAULT_CLAUDE_MODEL (handled in bot build_cmd).
         return ""
 
     def list_models(self, *, refresh: bool = False) -> list[ModelInfo]:
+        if claude_gateway.settings():
+            models = claude_gateway.configured_models()
+            result = [ModelInfo(alias, f'{alias or "Default"} → {model} (OpenRouter)') for alias, model in models.items()]
+            result.extend(ModelInfo(model, model) for model in dict.fromkeys(models.values()))
+            return result
         return _parse_env_catalog() or list(_DEFAULT_CATALOG)
 
     def validate_model(self, model_id: str) -> bool:
+        if claude_gateway.settings():
+            return any(m.id == model_id for m in self.list_models())
         if not model_id:
             return True
         mid = model_id.strip()

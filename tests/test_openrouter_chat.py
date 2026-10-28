@@ -274,6 +274,10 @@ def test_history_isolated_per_session(tmp_path):
     a = ChatHistory(str(tmp_path / "A"))
     b = ChatHistory(str(tmp_path / "B"))
     a.append("qa", "ra")
+    # AP-5 positive control: without this, an append that silently wrote nothing
+    # still leaves b.load() == [], and the isolation claim passes while proving
+    # nothing. Assert the stimulus, not only the outcome.
+    assert a.load() != [], "append wrote nothing - the isolation asserts are vacuous"
     assert b.load() == []
     a.purge()
-    assert b.load() == []
+    assert a.load() == [] and b.load() == []
