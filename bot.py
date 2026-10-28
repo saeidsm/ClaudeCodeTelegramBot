@@ -176,7 +176,7 @@ BOT_ALLOW_SKIP_MODE = os.environ.get("BOT_ALLOW_SKIP_MODE", "").strip() == "1"
 # (delete on exit, rebuild from origin each turn).
 WORKTREE_ROOT = os.environ.get("BOT_WORKTREE_ROOT", "/tmp/claude-sessions")
 os.makedirs(WORKTREE_ROOT, exist_ok=True)
-WORKTREE_REUSE = os.environ.get("BOT_WORKTREE_REUSE", "1").strip().lower() not in ("0", "false", "off", "no")
+WORKTREE_REUSE = os.environ.get("BOT_WORKTREE_REUSE", "0").strip().lower() not in ("0", "false", "off", "no")
 
 # ── OpenAI (GPT fallback) ──
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -660,6 +660,8 @@ class Session:
     # state schema) so a restart cannot silently re-bind a resumed session
     # to a different branch; the MCP bridge relies on this binding.
     starting_branch: str = "main"
+    mcp_managed: bool = False
+    mcp_worktree_created: bool = False
     # Why this session is in its current status. "error" alone is ambiguous:
     # until phase 2D it was set ONLY by a restart, never by a real failure, so a
     # console "show me the error" button would have had nothing to show.
@@ -1375,13 +1377,15 @@ class WorktreeSession:
     worktree path (no isolation guarantees, but matches the spirit of
     "fresh tree per spawn").
     """
-    def __init__(self, project_path: str, branch: str, session_id: str):
+    def __init__(self, project_path: str, branch: str, session_id: str,
+                 require_existing: bool = False):
         self.project_path = project_path
         self.branch = branch
         # Replace ":" (used in our session id format) with "_" for path safety
         self.session_id = session_id
         self.worktree_path = f"{WORKTREE_ROOT}/{session_id}"
-        self.is_git = os.path.isdir(os.path.join(project_path, ".git"))
+        self.is_git = os.path.exists(os.path.join(project_path, ".git"))
+        self.require_existing = require_existing
         # Item 4: persistent per-session worktree (rollback: BOT_WORKTREE_REUSE=0)
         self.reuse_tree = WORKTREE_REUSE
         self._enter_task = None
@@ -1410,11 +1414,19 @@ class WorktreeSession:
             return False
         if not line.startswith("gitdir:"):
             return False
-        gitdir = os.path.abspath(line[len("gitdir:"):].strip())
-        prefix = os.path.abspath(os.path.join(self.project_path, ".git", "worktrees")) + os.sep
-        return gitdir.startswith(prefix) and os.path.isdir(gitdir)
+        try:
+            def common(path):
+                r = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"],
+                                   capture_output=True, text=True, timeout=10, check=True)
+                return os.path.realpath(os.path.join(path, r.stdout.strip()))
+            return common(self.worktree_path) == common(self.project_path)
+        except (OSError, subprocess.SubprocessError):
+            return False
 
     def _enter_sync(self):
+        if self.require_existing and not self._is_project_worktree():
+            raise RuntimeError("worktree.resume_state_missing: original worktree unavailable; "
+                               "refusing to rebuild this session from a moving branch")
         if not self.is_git:
             os.makedirs(self.worktree_path, exist_ok=True)
             subprocess.run(
@@ -1441,7 +1453,7 @@ class WorktreeSession:
         # quarantined under the session's capture root, never rm -rf'd.
         if os.path.exists(self.worktree_path):
             cap = mcp_bridge.capture_worktree_delta(self.worktree_path, self.session_id)
-            if cap.dirty and not cap.ok:
+            if not cap.recovery_complete:
                 # project_path: copy the git index/HEAD (<project>/.git/
                 # worktrees/<name>/) into the quarantine BEFORE the prune
                 # below deletes it — dirty files AND index survive (item 1).
@@ -1461,7 +1473,7 @@ class WorktreeSession:
             subprocess.run(
                 ["git", "-C", self.project_path, "worktree", "prune"],
                 capture_output=True, timeout=30)
-            if not (cap.dirty and not cap.ok):
+            if cap.recovery_complete:
                 subprocess.run(
                     ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
                     capture_output=True, timeout=30)
@@ -1532,6 +1544,17 @@ class WorktreeSession:
             return False
 
         if self.is_git:
+            # Never allow a failed Git status (including a missing .git) to
+            # fall through to destructive cleanup. This also protects callers
+            # that do not use the MCP capture context.
+            if not os.path.exists(os.path.join(self.worktree_path, ".git")):
+                self.preserve_on_exit = True
+                return False
+            status = subprocess.run(["git", "-C", self.worktree_path, "status", "--porcelain=v1"],
+                                    capture_output=True, timeout=30)
+            if status.returncode != 0:
+                self.preserve_on_exit = True
+                return False
             result = subprocess.run(
                 ["git", "-C", self.project_path, "worktree", "remove", "--force", self.worktree_path],
                 capture_output=True, timeout=30)
@@ -2060,8 +2083,17 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
             # TurnCapture is the INNER context: its __aexit__ runs BEFORE
             # WorktreeSession's, so the uncommitted delta is durably saved
             # (or the tree explicitly preserved) before any rm -rf.
-            _wt = WorktreeSession(repo, starting_branch, sid_safe)
-            async with _wt as wt_path, mcp_bridge.TurnCapture(_wt, wt_path, session.id):
+            # Preserve the recovery contract of already-managed sessions even
+            # when the route is disabled. Unrelated sessions keep old defaults.
+            managed = session.mcp_managed
+            _wt = WorktreeSession(repo, starting_branch, sid_safe,
+                                  require_existing=managed and (session.claude_created or session.mcp_worktree_created))
+            if managed:
+                _wt.reuse_tree = True
+            async with _wt as wt_path, mcp_bridge.TurnCapture(_wt, wt_path, session.id, enabled=managed):
+                if managed:
+                    session.mcp_worktree_created = True
+                    save_state()
                 await _coord.running(wt_path)   # -> 'running' + safe worktree view
                 # Copy uploaded files INSIDE the worktree (not the shared repo)
                 fnote = ""
@@ -2081,6 +2113,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                 # change at all.
                 _ctx = await _session_context_note(session, project, repo)
                 full_prompt = _ctx + prompt + fnote
+                if managed:
+                    full_prompt += mcp_bridge.WORKER_QUESTION_INSTRUCTION
 
                 gateway_config = claude_gateway.settings()
                 executable, chosen_model = claude_gateway.launch(
@@ -2126,6 +2160,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                     uuid_collision = "already in use" in err_low
 
                     if mode == "resume" and session_missing:
+                        if managed:
+                            raise RuntimeError("session.resume_state_missing: original Claude transcript unavailable; refusing a fresh conversation")
                         log.warning(f"Resume failed for {session.session_uuid[:8]} (session not found); creating fresh")
                         session.session_uuid = str(uuid.uuid4())
                         session.claude_created = False
@@ -2140,6 +2176,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
 
                 if proc.returncode == 0 and not session.claude_created:
                     session.claude_created = True
+                if proc.returncode == 0 and managed:
+                    mcp_bridge.record_worker_questions(session, r, wt_path)
 
                 USAGE.record(len(full_prompt), len(r), session.label)
 
@@ -2189,6 +2227,8 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
         raise
     except RuntimeError as rt_err:
         # WorktreeSession._enter_sync raised — worktree creation failed.
+        session.status_reason = "execution_failed"
+        session.error_text = str(rt_err)
         log.error(f"worktree.fatal sid={session.id} err={rt_err}")
         try:
             if BOT is not None:
@@ -5215,6 +5255,7 @@ _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
     "tasks", "claude_created", "claude_model", "starting_branch",
+    "mcp_managed", "mcp_worktree_created",
     # Phase 2 multi-engine fields (absent in old state → safe defaults)
     "engine", "model", "provider_session_id", "chat_history_ref",
     # Phase 2D: why a session is in its status. Persisting the reason is the
@@ -5332,6 +5373,8 @@ def load_state():
                 # the field → "main", which is what run_claude already
                 # assumed for every pre-bridge session (no behavior change).
                 starting_branch=s.get("starting_branch", "main"),
+                mcp_managed=s.get("mcp_managed", False),
+                mcp_worktree_created=s.get("mcp_worktree_created", False),
             )
             # Migration safety: a restored Chat history path is trusted only if it
             # still passes canonical/no-symlink containment; otherwise replace it
@@ -6955,6 +6998,8 @@ def _sessapi_build_app(bot_obj) -> "_aw.Application":
             "cancel_tasks": CONC.cancel_session_tasks,
             "project_names": get_project_names,
             "next_nonce": _mcp_next_nonce,
+            "claim_nonce": _console_duplicate,
+            "save_state": save_state,
             "report_for": _report_for_session,
             "model_metadata": _mcp_model_metadata,
             "audit": _console_audit,

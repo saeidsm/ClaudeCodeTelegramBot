@@ -64,6 +64,16 @@ class FakeSession:
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     """Isolated owner chat, token, audit log, capture root, worktrees, state."""
+    # The bridge intersects the pilot allowlist with the actual registry.
+    # Never inherit the operator's live projects.json for synthetic tests.
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps([
+        {"name": "Rag4Engineers", "path": str(tmp_path / "rag")},
+        {"name": "ZigguratKids4", "path": str(tmp_path / "zk4")},
+    ]))
+    monkeypatch.setattr(bot, "PROJECTS_FILE", str(registry))
+    monkeypatch.setattr(mcp_bridge, "_QUESTIONS", {})
+    monkeypatch.setattr(mcp_bridge, "_ASK_OPERATIONS", {})
     monkeypatch.setattr(bot, "ALLOWED_IDS", [106021080])
     monkeypatch.setattr(bot, "BOT_SESSION_API_TOKEN", "test-mcp-token")
     monkeypatch.setattr(bot, "CONSOLE_AUDIT_LOG", str(tmp_path / "audit.log"))
@@ -101,6 +111,7 @@ def wire_real(monkeypatch):
         "cancel_tasks": lambda sid: (calls.__setitem__("cancel", calls["cancel"] + 1) or 1),
         "project_names": bot.get_project_names,
         "next_nonce": bot._mcp_next_nonce,
+        "claim_nonce": bot._console_duplicate,
         "report_for": bot._report_for_session,
         "model_metadata": bot._mcp_model_metadata,
         "audit": bot._console_audit,
@@ -313,7 +324,7 @@ async def test_ask_routes_to_existing_session(env, monkeypatch):
     await _drain()
     p = _payload(res)
     assert p["http_status"] == 200, p
-    assert "question_id" in p, f"a successful ask must return a question_id: {p}"
+    assert "question_id" not in p, "submission cannot fabricate a worker question"
     bot.SM.kill(bot._console_chat_id(), "qa-1")
 
 
@@ -403,6 +414,18 @@ async def test_ask_honors_real_three_second_rate_limit(env, monkeypatch):
     bot.SM.kill(bot._console_chat_id(), "qa-rl")
 
 
+def _emit_worker_question(session, root):
+    # Synthetic CHILD output, never the caller's prompt. Integration tests
+    # separately exercise the real run_claude parsing/resume seam.
+    wt = root / "question-worktree"
+    wt.mkdir(exist_ok=True)
+    (wt / ".git").write_text("gitdir: synthetic")
+    session.claude_created = True
+    mcp_bridge.record_worker_questions(session,
+        'MCP_QUESTION {"id":"choose-file","question":"Which file should I edit?"}', str(wt))
+    return mcp_bridge._pending_questions(session.id)[0]
+
+
 async def test_answer_binds_to_the_awaited_question_and_continues_the_session(
         env, monkeypatch):
     """Owner R-revisit item 6: ask returns a question_id; the status shows the
@@ -417,8 +440,9 @@ async def test_answer_binds_to_the_awaited_question_and_continues_the_session(
     _, res = await _call_tool("ask", {"label": "qa-6", "project": "Rag4Engineers",
                                       "message": "which file?", "nonce": bot._mcp_next_nonce() + 5})
     p = _payload(res)
-    assert p["http_status"] == 200 and "question_id" in p, p
-    qid = p["question_id"]
+    assert p["http_status"] == 200 and "question_id" not in p, p
+    await _drain()
+    qid = _emit_worker_question(s, env)
     _, res = await _call_tool("status", {"label": "qa-6"})
     assert qid in _payload(res)["pending_questions"], \
         f"the awaited question must be visible on status: {_payload(res)}"
@@ -457,7 +481,8 @@ async def test_answer_refuses_foreign_unknown_questions_and_plain_sends_do_not_a
     sb.status = "idle"
     _, res = await _call_tool("ask", {"label": "qa-a", "project": "Rag4Engineers",
                                       "message": "?", "nonce": bot._mcp_next_nonce() + 5})
-    qid = _payload(res)["question_id"]
+    await _drain()
+    qid = _emit_worker_question(sa, env)
     # answering through the WRONG session's label: unknown for that session
     _, res = await _call_tool("answer", {"label": "qa-b", "question_id": qid,
                                          "message": "x", "nonce": bot._mcp_next_nonce() + 5})
@@ -629,66 +654,37 @@ async def test_turncapture_failure_preserves_dirty_worktree(env, monkeypatch):
                      w.worktree_path], capture_output=True)
 
 
-async def test_stale_enter_quarantines_when_capture_unproven(env, monkeypatch):
-    """Item 1: a leftover tree that cannot be REUSED (crashed partial add —
-    not a live worktree of this project) must never be rm -rf'd while the
-    capture is unproven: it is quarantined under the QUARANTINE root WITH its
-    git index (git-meta/), and a fresh tree takes the spawn path."""
+async def test_stale_enter_refuses_unknown_git_metadata(env, monkeypatch):
     repo = _mk_repo(env)
-    # First enter: create the worktree, leave it dirty, preserve it.
-    w = bot.WorktreeSession(str(repo), "main", "106021080_stale")
-    async with w as wt_path:
-        Path(wt_path, "results.txt").write_text("uncommitted!\n")
-        w.preserve_on_exit = True          # simulate the unproven capture
-    assert os.path.exists(w.worktree_path), "precondition: preserved stale tree"
-    # A tree that is NOT a live worktree of this project cannot be reused —
-    # this is the crashed-partial-add shape the quarantine path exists for.
-    Path(w.worktree_path, ".git").write_text(
-        "gitdir: /nonexistent/.git/worktrees/x\n")
-
-    def unproven(wt_path, sid):
-        return mcp_bridge.CaptureResult(ok=False, dirty=True, reason="unproven")
-
-    monkeypatch.setattr(mcp_bridge, "capture_worktree_delta", unproven)
-    w2 = bot.WorktreeSession(str(repo), "main", "106021080_stale")
-    old_path = w2.worktree_path
-    async with w2 as wt_path:            # stale enter: capture -> quarantine
-        assert wt_path == w2.worktree_path
-    safe = mcp_bridge._safe_session_dir("106021080_stale")
-    qs = sorted((Path(mcp_bridge.QUARANTINE_ROOT) / safe).glob("stale-*"))
-    assert qs, "the dirty stale tree must be quarantined, not deleted"
-    q = qs[-1]
-    assert Path(q, "results.txt").read_text() == "uncommitted!\n", \
-        "the quarantined uncommitted work must survive readable"
-    assert (Path(q, "git-meta") / "index").exists(), \
-        "item 1: the git INDEX must survive in the quarantine (copied before the prune)"
-    # a fresh tree occupies the spawn path and does NOT carry the stale state
-    assert os.path.exists(old_path), "a fresh worktree takes the spawn path"
-    assert not Path(old_path, "results.txt").exists()
-    # item 2: the quarantine lives OUTSIDE the capture tree — it can never be
-    # picked up by latest_capture_dir and so never rides into a report ZIP
-    assert not str(q).startswith(str(mcp_bridge.CAPTURE_ROOT))
-    subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force",
-                    old_path], capture_output=True)
+    w = bot.WorktreeSession(str(repo), "main", "stale")
+    _wt(repo, Path(w.worktree_path))
+    Path(w.worktree_path, "results.txt").write_text("keep")
+    Path(w.worktree_path, ".git").write_text("gitdir: /nonexistent/metadata\n")
+    with pytest.raises(RuntimeError, match="quarantine_failed"):
+        w._enter_sync()
+    assert Path(w.worktree_path, "results.txt").read_text() == "keep"
 
 
-async def test_stale_enter_removes_after_proven_capture(env, monkeypatch):
-    """Rollback path (BOT_WORKTREE_REUSE=0 restores fresh-tree-per-spawn):
-    a stale tree whose capture is PROVEN is removed as before — the safety
-    net only refuses the UNPROVEN case."""
+async def test_stale_dirty_export_requires_quarantine(env, monkeypatch):
     repo = _mk_repo(env)
-    monkeypatch.setattr(bot, "WORKTREE_REUSE", False)
-    w = bot.WorktreeSession(str(repo), "main", "106021080_staleok")
-    async with w as wt_path:
-        Path(wt_path, "results.txt").write_text("uncommitted!\n")
-        w.preserve_on_exit = True
-    # Real capture (proven): the next enter removes the stale tree normally.
-    w2 = bot.WorktreeSession(str(repo), "main", "106021080_staleok")
+    w = bot.WorktreeSession(str(repo), "main", "stale-dirty")
+    _wt(repo, Path(w.worktree_path))
+    Path(w.worktree_path, "results.txt").write_text("keep")
+    assert mcp_bridge.capture_worktree_delta(w.worktree_path, w.session_id).ok
+    w._enter_sync()
+    quarantines = [p for p in Path(mcp_bridge.QUARANTINE_ROOT).rglob("stale-*") if (p / "git-meta").is_dir()]
+    assert len(quarantines) == 1
+    assert (quarantines[0] / "results.txt").read_text() == "keep"
+    assert (quarantines[0] / "git-meta/index").exists()
+    assert not Path(w.worktree_path, "results.txt").exists()
+
+
 async def test_resume_reuses_persistent_worktree(env, monkeypatch):
         """Item 4: the session worktree PERSISTS across turns — a resume gets
         the SAME commit and the SAME uncommitted changes. Nothing is rebuilt
         from origin (a new origin commit does not pull in) and there is no
         fetch/fallback on the resume path at all."""
+        monkeypatch.setattr(bot, "WORKTREE_REUSE", True)
         repo = _mk_repo(env)
         sid = "106021080_reuse"
         w = bot.WorktreeSession(str(repo), "main", sid)

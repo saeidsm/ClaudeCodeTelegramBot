@@ -90,7 +90,7 @@ QUARANTINE_ROOT = Path(os.environ.get(
     "BOT_MCP_QUARANTINE_DIR", str(Path(os.environ.get("BOT_DATA_ROOT", "/opt/shahrzad-devops")) / "quarantine")))
 # A capture directory stamp (created by capture_worktree_delta). Only these
 # are ever candidates for latest_capture_dir/report inclusion.
-_CAPTURE_STAMP_RE = re.compile(r"^\d{8}-\d{6}$")
+_CAPTURE_STAMP_RE = re.compile(r"^\d{8}-\d{6}(?:-\d{6})?$")
 
 
 @dataclass
@@ -104,6 +104,9 @@ class CaptureResult:
     dirty: bool
     path: str = ""
     reason: str = ""
+    # Report exports are bounded/filtered and are NOT recovery snapshots.
+    # Only a proven clean tree can be discarded on this evidence alone.
+    recovery_complete: bool = False
 
 
 # ═══════════════════════════════════════════
@@ -134,10 +137,10 @@ def capture_worktree_delta(wt_path: str, session_id: str) -> CaptureResult:
     (the caller then preserves the tree; C3 after review)."""
     safe = _safe_session_dir(session_id)
     if not os.path.exists(_GIT_PATH.format(wt=wt_path)):
-        return CaptureResult(ok=True, dirty=False, reason="not_a_git_worktree")
+        return CaptureResult(ok=False, dirty=True, reason="missing_git_metadata")
     try:
         rc, status = _run_git(wt_path, "-c", "core.quotepath=false",
-                              "status", "--porcelain=v1", "-z")
+                              "status", "--porcelain=v1", "--ignored=matching", "-z")
         if rc != 0:
             return CaptureResult(ok=False, dirty=True, reason=f"git_status_rc={rc}")
         recs = [r for r in status.split("\0") if r]
@@ -145,17 +148,22 @@ def capture_worktree_delta(wt_path: str, session_id: str) -> CaptureResult:
         while i < len(recs):
             rec = recs[i]
             i += 1
-            if len(rec) >= 3:
-                listed.append(rec[3:])
-            if len(rec) >= 2 and rec[0] in "RC" and i < len(recs):
-                i += 1  # rename/copy: the OLD path is a second record (we keep the new)
+            if len(rec) < 4 or rec[2] != " ":
+                return CaptureResult(False, True, reason="invalid_status_record")
+            listed.append(rec[3:])
+            if any(c in "RC" for c in rec[:2]):
+                if i >= len(recs):
+                    return CaptureResult(False, True, reason="missing_rename_source")
+                i += 1
         rc_ls, others = _run_git(wt_path, "ls-files", "--others",
                                  "--exclude-standard", "-z")
         untracked = [p for p in (others or "").split("\0") if p] if rc_ls == 0 else []
+        if rc_ls != 0:
+            return CaptureResult(False, True, reason="ls_files_failed")
         others_set = set(untracked)
         if not listed and not untracked:
-            return CaptureResult(ok=True, dirty=False)  # clean: nothing to lose
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+            return CaptureResult(ok=True, dirty=False, recovery_complete=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
         out = Path(CAPTURE_ROOT) / safe / stamp
         (out / "files").mkdir(parents=True, exist_ok=True)
         _prune_old_captures(safe)
@@ -163,6 +171,7 @@ def capture_worktree_delta(wt_path: str, session_id: str) -> CaptureResult:
             "session": session_id, "worktree": os.path.basename(wt_path),
             "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "files": {}, "skipped": [],
+            "recovery_complete": False,
             # ponytail: no test-result sniffing in v1 — any file the session
             # wrote (pytest output included) is a changed file and is
             # captured verbatim as one.
@@ -175,14 +184,18 @@ def capture_worktree_delta(wt_path: str, session_id: str) -> CaptureResult:
         # delta the whole diff is skipped (copies still carry non-secret
         # files); losing the unified view once beats leaking once.
         secret_present = [p for p in paths if _SECRET_NAME_RE.search(p)]
+        ok = True
         if secret_present:
             manifest["diff_skipped"] = "secret-looking paths present in the delta"
         else:
             rc_d, diff = _run_git(wt_path, "diff", "--binary")
+            if rc_d != 0:
+                ok = False
+                manifest["diff_error"] = f"git_diff_rc={rc_d}"
+                diff = ""
             manifest["diff_bytes_capped"] = len(diff or "") > CAPTURE_MAX_DIFF_BYTES
             (out / "diff.patch").write_text((diff or "")[:CAPTURE_MAX_DIFF_BYTES],
                                             encoding="utf-8")
-        ok = True
         total = count = 0
         for rel in paths:
             if count >= CAPTURE_MAX_FILES or total >= CAPTURE_MAX_TOTAL_BYTES:
@@ -191,7 +204,9 @@ def capture_worktree_delta(wt_path: str, session_id: str) -> CaptureResult:
             src = os.path.join(wt_path, rel)
             try:
                 real = os.path.realpath(src)
-                if os.path.islink(src) or not os.path.isfile(real) or real.startswith(os.path.join(wt_path, ".git")):
+                if (not Path(real).is_relative_to(Path(wt_path).resolve())
+                        or os.path.islink(src) or not os.path.isfile(real)
+                        or real.startswith(os.path.join(wt_path, ".git"))):
                     reason = "not_a_regular_file"
                 elif _SECRET_NAME_RE.search(rel):
                     reason = "secret_looking_name"
@@ -260,7 +275,7 @@ def quarantine_stale_worktree(wt_path: str, session_id: str, project_path: str =
     quarantine as git-meta/ BEFORE anyone prunes. Returns the quarantine
     dir, '' on failure (the caller then refuses the destructive path)."""
     safe = _safe_session_dir(session_id)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:12]
     dst = Path(QUARANTINE_ROOT) / safe / f"stale-{stamp}"
     # meta staged to a SIBLING first: copying into dst would CREATE dst, and
     # shutil.move of a directory into an existing directory nests it inside
@@ -268,11 +283,27 @@ def quarantine_stale_worktree(wt_path: str, session_id: str, project_path: str =
     meta_tmp = Path(QUARANTINE_ROOT) / safe / f"gitmeta-{stamp}"
     try:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        # git-meta BEFORE the move+prune: once pruned, the index is gone.
-        meta = Path(project_path) / ".git" / "worktrees" / os.path.basename(wt_path)
-        if project_path and meta.is_dir():
-            shutil.copytree(meta, meta_tmp, dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("lock"))
+        # Resolve Git's metadata, including linked worktrees, renamed paths,
+        # basename collisions and relative .git pointers. Never guess it.
+        rc, gitdir = _run_git(wt_path, "rev-parse", "--absolute-git-dir")
+        if rc or not os.path.exists(os.path.join(wt_path, ".git")):
+            return ""
+        meta = Path(gitdir.strip()).resolve(strict=True)
+        if not meta.is_dir() or (meta / "index.lock").exists():
+            return ""
+        rc, unmerged = _run_git(wt_path, "ls-files", "--unmerged")
+        if rc or unmerged:
+            return ""  # no lossy recovery of a conflicted index
+        shutil.copytree(meta, meta_tmp, symlinks=True)
+        # The common object store can later GC otherwise-unreachable objects.
+        # Save HEAD's closure and a binary staged delta outside report exports.
+        subprocess.run(["git", "-C", wt_path, "bundle", "create",
+                        str(meta_tmp / "head.bundle"), "HEAD"],
+                       capture_output=True, timeout=120, check=True)
+        staged = subprocess.run(["git", "-C", wt_path, "diff", "--cached",
+                                 "--binary", "--full-index"],
+                                capture_output=True, timeout=30, check=True)
+        (meta_tmp / "staged.patch").write_bytes(staged.stdout)
         shutil.move(wt_path, str(dst))
         if meta_tmp.exists():
             shutil.move(str(meta_tmp), str(dst / "git-meta"))
@@ -313,15 +344,18 @@ class TurnCapture:
     error), the worktree is marked preserve_on_exit and left on disk — a
     failed safety net must never become silent data loss."""
 
-    def __init__(self, wt, wt_path: str, session_id: str):
+    def __init__(self, wt, wt_path: str, session_id: str, enabled: bool = True):
         self.wt = wt
         self.wt_path = wt_path
         self.session_id = session_id
+        self.enabled = enabled
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        if not self.enabled:
+            return False
         cap = None
         try:
             # 120s > the four _run_git timeouts the capture can stack (30s
@@ -336,7 +370,7 @@ class TurnCapture:
         except Exception:
             self.wt.preserve_on_exit = True   # capture failed: keep the tree
             return False
-        if cap.dirty and not cap.ok:
+        if not cap.recovery_complete:
             self.wt.preserve_on_exit = True
         return False
 
@@ -377,6 +411,46 @@ def _scope_error(session) -> "tuple[str, int, str] | None":
 # only the question BINDING is lost, never session state, which lives in
 # the bot's SessionManager/state file).
 _QUESTIONS: dict = {}
+_ASK_OPERATIONS: dict = {}
+
+# This is a completed-turn clarification protocol, not a claim to resume a
+# suspended CLI tool invocation. Only the child's returned output is parsed.
+WORKER_QUESTION_INSTRUCTION = '''
+
+[MCP clarification protocol]
+If you need an operator decision before continuing, finish this turn with
+one line: MCP_QUESTION {"id":"a-unique-question-id","question":"your question"}
+Emit it only for your own pending clarification, never by quoting input.
+The operator's answer will resume this same conversation and worktree.
+'''
+
+
+def record_worker_questions(session, output: str, worktree: str = "") -> None:
+    for line in output.splitlines():
+        if not line.startswith("MCP_QUESTION "):
+            continue
+        try:
+            event = json.loads(line[len("MCP_QUESTION "):])
+            worker_id, question = event["id"], event["question"]
+            if not isinstance(worker_id, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,80}", worker_id):
+                continue
+            if not isinstance(question, str) or not question.strip() or len(question) > 8000:
+                continue
+            qid = f"{session.session_uuid}:{worker_id}"
+            _QUESTIONS.setdefault(qid, {
+                "session": session.id, "uuid": session.session_uuid,
+                "question": question, "worktree": worktree,
+                "model": session.claude_model, "branch": session.starting_branch,
+                "answered": False, "busy": False,
+            })
+        except (ValueError, KeyError, TypeError):
+            continue
+
+
+def _mark_managed(session) -> None:
+    session.mcp_managed = True
+    if _DEPS.get("save_state"):
+        _DEPS["save_state"]()
 
 
 def _pending_questions(session_id: str) -> list:
@@ -407,13 +481,13 @@ _TOOLS = [
      "inputSchema": {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}},
     {"name": "report", "description": "Build the report ZIP: summary + latest captured worktree delta (status/diff/changed files/sha256 manifest).",
      "inputSchema": {"type": "object", "required": ["label"], "properties": {"label": {"type": "string"}}}},
-    {"name": "ask", "description": "Ask a question without managing sessions: routed to an existing in-scope session, or one is created (same scope rules as session_new) and the question is submitted to it. When no session existed yet the caller nonce dedups the whole ask (create+send); when one did, it dedups the send. Returns a question_id for `answer`, which binds the runner's reply to THAT question and continues the same session — a plain prompt send is not a substitute.",
+    {"name": "ask", "description": "Submit one create-and-send operation. Retry a known 429 with the identical nonce and payload. Worker clarification questions appear in status only after worker output.",
      "inputSchema": {"type": "object", "required": ["label", "project", "message", "nonce"],
                      "properties": {"label": {"type": "string"}, "project": {"type": "string"},
                                     "message": {"type": "string"}, "model": {"type": "string"},
                                     "nonce": {"type": "integer",
                                               "description": "Epoch milliseconds, strictly increasing per client; an exact replay of this ask (same nonce) is refused as a duplicate and never re-run."}}}},
-    {"name": "answer", "description": "Answer an AWAITED question of a session: binds to the question_id returned by `ask`, submits into the SAME session (which is how it continues), one answer per question. Unknown question_id is refused — the in-memory binding is lost on a bot restart (the session itself still resumes by label).",
+    {"name": "answer", "description": "Answer a worker-emitted clarification from status, bound to its original conversation, model, branch and worktree. Continues via the shared queue and Claude resume; not a suspended tool invocation. Lost bindings are refused.",
      "inputSchema": {"type": "object", "required": ["label", "question_id", "message", "nonce"],
                      "properties": {"label": {"type": "string"}, "question_id": {"type": "string"},
                                     "message": {"type": "string"},
@@ -482,6 +556,10 @@ async def _tool_session_new(a: dict) -> dict:
             "engine": engine, "model": a.get("model") or "",
             "nonce": _DEPS["next_nonce"]()}
     status, payload = await _call(_DEPS["control"], body)
+    if status < 400 and payload.get("ok", True):
+        session = _DEPS["lookup_session"](str(a.get("label") or "").strip())[1]
+        if session is not None:
+            _mark_managed(session)
     return _tool_text(payload, status)
 
 
@@ -493,65 +571,72 @@ async def _tool_send(a: dict) -> dict:
         return _tool_text({"ok": False, "error": err[0], "detail": err[2]}, err[1])
     body = {"label": label, "message": a.get("message"), "nonce": a.get("nonce")}
     status, payload = await _call(_DEPS["send"], body)
+    if status < 400 and payload.get("ok", True):
+        _mark_managed(session)
     return _tool_text(payload, status)
 
 
 async def _tool_ask(a: dict) -> dict:
-    """Q&A in v1 (owner items 2/7 + 6): ask WITHOUT managing sessions, and
-    get an AWAITED-QUESTION ID the runner's answer can bind back to.
-
-    Coordination (owner item 5): when the label has no session yet, the
-    CREATE leg consumes the CALLER's nonce (a replay of the whole ask then
-    dies on that nonce at create/send — no double run), and the send leg
-    uses a GENERATED nonce (strictly above the HWM the caller raised, so
-    the internal nonce can never invalidate the caller's request). When the
-    session already exists, the caller's nonce goes to the send leg — the
-    first ask consumes it, the replay is refused. Both legs route through
-    the same _sessapi_control/_sessapi_send seams as every other tool: same
-    rate limit (real 3s window, answered honestly as 429), same audit.
-
-    The question turn lands in the session's normal output; the response
-    carries a question_id (owner item 6) for `answer` to bind to."""
+    """One logical create+send operation; a 429 can be retried with the
+    identical caller nonce and payload, even after control consumed it.
+    Only a known 429 permits a fresh internal nonce. Uncertain outcomes
+    and accepted turns are never retried automatically."""
+    caller = a.get("nonce")
+    if type(caller) is not int or caller <= 0:
+        return _tool_text({"ok": False, "error": "nonce_required"}, 400)
     label = str(a.get("label") or "").strip()
-    nonce = a.get("nonce")
-    caller = nonce if isinstance(nonce, int) and nonce > 0 else None
-    if caller is None:
-        return _tool_text({"ok": False, "error": "nonce_required",
-                           "detail": "ask needs a client nonce (epoch ms, strictly "
-                                     "increasing) so a replay can never re-run"}, 400)
-    _, session = _DEPS["lookup_session"](label)
-    created = False
-    if session is None:
-        project = str(a.get("project") or "").strip()
-        if project not in _allowed_projects():
-            return _tool_text({"ok": False, "error": "POLICY_DENIED",
-                               "detail": f"project '{project}' is not in the MCP pilot scope",
-                               "allowed": _allowed_projects()}, 403)
-        body = {"action": "new", "label": label, "project": project,
-                "engine": "claude", "model": a.get("model") or "",
-                "nonce": caller}
-        status, payload = await _call(_DEPS["control"], body)
-        if status >= 400 or not payload.get("ok", True):
-            return _tool_text(payload, status)
-        created = True
-        session = _DEPS["lookup_session"](label)[1]
-    err = _scope_error(session)
-    if err:
-        return _tool_text({"ok": False, "error": err[0], "detail": err[2]}, err[1])
-    # Send leg nonce: the caller's when create did NOT consume it (session
-    # existed), else generated (above the HWM the caller's nonce raised).
-    send_nonce = caller if not created else _DEPS["next_nonce"]()
-    body = {"label": label, "message": a.get("message"), "nonce": send_nonce}
-    status, payload = await _call(_DEPS["send"], body)
-    if status < 400 and payload.get("ok", True):
-        question_id = f"q-{uuid.uuid4().hex[:12]}"
-        _QUESTIONS[question_id] = {"session": session.id, "label": label,
-                                   "asked_at": int(time.time() * 1000), "answered": False}
-        payload["question_id"] = question_id
-        payload["pending_questions"] = _pending_questions(session.id)
-        payload["ask_note"] = ("answer arrives in the session output; bind the runner's "
-                               "reply with `answer` (label, question_id) — same session")
-    return _tool_text(payload, status)
+    fingerprint = json.dumps({k: a.get(k) for k in
+                              ("label", "project", "message", "model")}, sort_keys=True)
+    op = _ASK_OPERATIONS.get(caller)
+    if op is not None:
+        if op["fingerprint"] != fingerprint:
+            return _tool_text({"ok": False, "error": "nonce_payload_conflict"}, 409)
+        if op["busy"] or not op["retryable"]:
+            return _tool_text({"ok": False, "error": "duplicate"}, 409)
+        nonce = _DEPS["next_nonce"]()
+    else:
+        # Reserve the caller's identity BEFORE the handlers' rate checks.
+        # Otherwise an already-used send nonce could first receive a 429 and
+        # then be laundered into a fresh nonce by this retry path.
+        if _DEPS["claim_nonce"](caller):
+            return _tool_text({"ok": False, "error": "duplicate"}, 409)
+        op = {"fingerprint": fingerprint, "busy": False, "retryable": False,
+              "session_uuid": None}
+        _ASK_OPERATIONS[caller] = op
+        nonce = _DEPS["next_nonce"]()
+    op["busy"] = True
+    op["retryable"] = False
+    try:
+        _, session = _DEPS["lookup_session"](label)
+        if op["session_uuid"] is not None and (
+                session is None or session.session_uuid != op["session_uuid"]):
+            return _tool_text({"ok": False, "error": "session_changed"}, 409)
+        if session is None:
+            project = str(a.get("project") or "").strip()
+            if project not in _allowed_projects():
+                return _tool_text({"ok": False, "error": "POLICY_DENIED"}, 403)
+            status, payload = await _call(_DEPS["control"], {
+                "action": "new", "label": label, "project": project,
+                "engine": "claude", "model": a.get("model") or "", "nonce": nonce})
+            if status >= 400 or not payload.get("ok", True):
+                op["retryable"] = status == 429
+                return _tool_text(payload, status)
+            session = _DEPS["lookup_session"](label)[1]
+            nonce = _DEPS["next_nonce"]()
+        err = _scope_error(session)
+        if err:
+            return _tool_text({"ok": False, "error": err[0], "detail": err[2]}, err[1])
+        op["session_uuid"] = session.session_uuid
+        _mark_managed(session)
+        status, payload = await _call(_DEPS["send"], {
+            "label": label, "message": a.get("message"), "nonce": nonce})
+        op["retryable"] = status == 429
+        if status < 400 and payload.get("ok", True):
+            payload["pending_questions"] = _pending_questions(session.id)
+            payload["ask_note"] = "Accepted; worker clarification questions appear in status after the turn."
+        return _tool_text(payload, status)
+    finally:
+        op["busy"] = False
 
 
 async def _tool_answer(a: dict) -> dict:
@@ -576,15 +661,30 @@ async def _tool_answer(a: dict) -> dict:
         return _tool_text({"ok": False, "error": "question_already_answered",
                            "detail": "one answer per question — resubmit as a normal send "
                                      "if you really meant another turn"}, 409)
+    if (q.get("uuid") != session.session_uuid or not session.claude_created
+            or q.get("model") != session.claude_model
+            or q.get("branch") != session.starting_branch
+            or not q.get("worktree")
+            or not Path(q["worktree"], ".git").exists()):
+        return _tool_text({"ok": False, "error": "resume_state_unavailable",
+                           "detail": "Original question conversation/worktree binding is unavailable."}, 409)
+    if q.get("busy"):
+        return _tool_text({"ok": False, "error": "answer_in_progress"}, 409)
     # In-band binding so the engine's session log shows the connection.
     message = f"[answer {question_id}] {a.get('message') or ''}".strip()
     body = {"label": label, "message": message, "nonce": a.get("nonce")}
-    status, payload = await _call(_DEPS["send"], body)
+    q["busy"] = True
+    try:
+        status, payload = await _call(_DEPS["send"], body)
+    finally:
+        q["busy"] = False
     if status < 400 and payload.get("ok", True):
         q["answered"] = True
         payload["question_id"] = question_id
         payload["continues"] = label
         payload["pending_questions"] = _pending_questions(session.id)
+        payload["questions"] = [{"question_id": qid, "question": _QUESTIONS[qid]["question"]}
+                                for qid in payload["pending_questions"]]
     return _tool_text(payload, status)
 
 
@@ -599,6 +699,8 @@ async def _tool_status(a: dict) -> dict:
     payload["model"] = _DEPS["model_metadata"](session)
     if status < 400 and payload.get("ok", True):
         payload["pending_questions"] = _pending_questions(session.id)
+        payload["questions"] = [{"question_id": qid, "question": _QUESTIONS[qid]["question"]}
+                                for qid in payload["pending_questions"]]
     return _tool_text(payload, status)
 
 

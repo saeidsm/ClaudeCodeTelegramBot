@@ -101,17 +101,17 @@ def _quarantine_dirty(path: str, owner: str) -> str:
         return ""
 
 
-def _is_dirty(path: str) -> bool:
+def _is_dirty(path: str):
     """True when the tree has uncommitted/untracked work (or is not a
     regular git worktree at all — treat as untouchable, not as clean)."""
     if not os.path.isfile(os.path.join(path, ".git")):
-        return True
+        return None
     try:
-        r = subprocess.run(["git", "-C", path, "status", "--porcelain=v1", "-z"],
+        r = subprocess.run(["git", "-C", path, "status", "--porcelain=v1", "--ignored=matching", "-z"],
                            capture_output=True, timeout=30)
-        return bool(r.stdout.strip())
+        return bool(r.stdout.strip()) if r.returncode == 0 else None
     except Exception:
-        return True
+        return None
 
 
 for path in glob.glob(f"{WORKTREE_ROOT}/*"):
@@ -132,15 +132,15 @@ for path in glob.glob(f"{WORKTREE_ROOT}/*"):
     if os.path.isdir(REPOS):
         for repo in os.listdir(REPOS):
             repo_path = f"{REPOS}/{repo}"
-            if not os.path.isdir(f"{repo_path}/.git"):
+            if not os.path.exists(f"{repo_path}/.git"):
                 continue
             try:
                 r = subprocess.run(
-                    ["git", "-C", repo_path, "worktree", "list"],
+                    ["git", "-C", repo_path, "worktree", "list", "--porcelain"],
                     capture_output=True, text=True, timeout=10)
             except Exception:
                 continue
-            if path in r.stdout:
+            if r.returncode == 0 and f"worktree {path}" in r.stdout.splitlines():
                 owner = repo_path
                 break
 
@@ -148,7 +148,12 @@ for path in glob.glob(f"{WORKTREE_ROOT}/*"):
     # not proven clean — quarantine it (files + git index) instead. This
     # does NOT depend on finding the owner repo: quarantine needs only the
     # path. A quarantine failure skips the tree (never deletes it).
-    if _is_dirty(path):
+    dirty = _is_dirty(path)
+    if dirty is None:
+        print(f"worktree-gc: {path} status unknown — skipped (NOT removed)")
+        failed += 1
+        continue
+    if dirty:
         q = _quarantine_dirty(path, owner or "")
         if q:
             print(f"worktree-gc: quarantined dirty tree {path} -> {q}")
@@ -163,13 +168,13 @@ for path in glob.glob(f"{WORKTREE_ROOT}/*"):
         continue
 
     if owner:
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", owner, "worktree", "remove", "--force", path],
             capture_output=True, timeout=30)
-
-    result = subprocess.run(["rm", "-rf", path], capture_output=True)
-    if result.returncode == 0:
-        cleaned += 1
+        if result.returncode == 0:
+            cleaned += 1
+        else:
+            failed += 1
     else:
         failed += 1
 
