@@ -231,6 +231,8 @@ MANIFEST=""; BACKUP=""; OLD_PID=""; NEW_PID=""; RESTART_CURSOR=""
 TIMER_WAS_ENABLED=""; TIMER_WAS_ACTIVE=""
 ROLLBACK_ERRORS=""
 GC_TOUCHED=0; GC_WAS_ACTIVE=""
+PUBLISHER_CONFIG=""
+PUBLISHER_PLAN="$SCRATCH/publisher-plan.json"
 SVC_UID=""; SVC_GID=""
 R_STATE=""; R_CHAT=""; R_COORD=""; R_COORDLOCK=""; R_CACHE=""; R_TOKEN=""; R_RETENTION_ENV=""
 NW_ENABLED=""; NW_BIND=""; NW_BIND2=""; NW_PORT=""
@@ -349,6 +351,7 @@ artifacts() {
   echo "$SYSTEMD_DIR/reports-cleanup.timer|$SOURCE/systemd/reports-cleanup.timer|file"
 }
 backup_only() {
+  [ -z "$PUBLISHER_CONFIG" ] || echo "$PUBLISHER_CONFIG"
   echo "$ENV_FILE"; echo "$R_STATE"; echo "$R_COORD"; echo "$R_COORDLOCK"
   echo "$R_CACHE"; echo "$R_CHAT"; echo "$R_RETENTION_ENV"
   echo "$CRON_DIR/cleanup-reports"; echo "$CRON_DIR/nightwatch-reports-cleanup"; echo "$NIGHTLY"
@@ -460,6 +463,10 @@ rollback() {
   else
     $SYSTEMCTL stop reports-cleanup.timer >/dev/null 2>&1 || rb_err "re-stop timer"
   fi
+  if [ -n "$PUBLISHER_CONFIG" ]; then
+    "$PYTHON" "$SOURCE/scripts/publisher-deploy.py" rollback-smoke "$PUBLISHER_PLAN" \
+      || rb_err "restored publisher loader/pin verification failed"
+  fi
   # 5) restart the OLD bot and verify it is genuinely back
   $SYSTEMCTL restart "$SERVICE" >/dev/null 2>&1 || rb_err "restart old bot"
   $SYSTEMCTL is-active --quiet "$SERVICE" || rb_err "old bot not active after restore"
@@ -493,13 +500,17 @@ restore_gc() {
   fi
   GC_TOUCHED=0
 }
-# The active publisher pins the application digest. The generic installer must
-# not replace that application until a reviewed publisher transaction exists.
+# The active publisher pins the application digest. Prepare a source-pinned
+# transaction before any mutation; unknown bootstrap versions remain refused.
 gate_bootstrap() {
   local command
   command="$($SYSTEMCTL show "$SERVICE" -p ExecStart --value)" || die "startup command unavailable"
   case "$command" in
-    *publisher-bootstrap.py*) die "publisher bootstrap pins application_sha256; coordinated publisher configuration backup/update/import verification required" ;;
+    *publisher-bootstrap.py*)
+      PUBLISHER_CONFIG="$("$PYTHON" "$SOURCE/scripts/publisher-deploy.py" prepare "$command" "$SOURCE/bot.py" "$PUBLISHER_PLAN")" \
+        || die "publisher bootstrap pins application_sha256; source-pinned preparation failed"
+      [ -n "$PUBLISHER_CONFIG" ] && [ -s "$PUBLISHER_PLAN" ] || die "publisher plan missing"
+      ;;
   esac
 }
 
@@ -576,7 +587,7 @@ gate_suite() {
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m py_compile \
      "$SOURCE/bot.py" "$SOURCE/mcp_bridge.py" "$SOURCE/scripts/worktree-gc.py" "$SOURCE/coordination.py" "$SOURCE/resource_footer.py" \
      "$SOURCE/log_filters.py" "$SOURCE"/engines/*.py "$SOURCE"/video_module/*.py \
-     "$SOURCE/scripts/coord_publish.py" || die "py_compile failed on source"
+     "$SOURCE/scripts/coord_publish.py" "$SOURCE/scripts/publisher-deploy.py" || die "py_compile failed on source"
   for s in "$SOURCE"/scripts/*.sh; do bash -n "$s" || die "bash -n failed: $s"; done
   local out passed
   out="$( cd "$SOURCE" && PYTHONDONTWRITEBYTECODE=1 \
@@ -1073,6 +1084,10 @@ PY
 
 verify_install() {
   fail_at verify_install && die "forced: verify_install"
+  if [ -n "$PUBLISHER_CONFIG" ]; then
+    "$PYTHON" "$SOURCE/scripts/publisher-deploy.py" smoke "$PUBLISHER_PLAN" \
+      || die "publisher loader/construction smoke failed"
+  fi
   PYTHONPATH="$LIVE_SCRIPTS" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY' || die "live-dir import/construction smoke failed"
 import importlib.util, os, sys
 d=os.environ["PYTHONPATH"]
@@ -1332,6 +1347,9 @@ build_manifest       # backup captures the AUTHORITATIVE post-quiesce state
 ARMED=1
 
 install_artifacts
+if [ -n "$PUBLISHER_CONFIG" ]; then
+  "$PYTHON" "$SOURCE/scripts/publisher-deploy.py" update "$PUBLISHER_PLAN" || die "publisher pin update failed"
+fi
 edit_env
 migrate_retention
 verify_install

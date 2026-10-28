@@ -64,6 +64,10 @@ def _events(path: Path):
 @pytest.fixture
 def audit(tmp_path, monkeypatch):
     """Point the audit log at a temp file so the real one is untouched."""
+    monkeypatch.setattr(bot, "ALLOWED_IDS", [106021080])
+    monkeypatch.setattr(bot, "BOT_SESSION_API_TOKEN", "synthetic-audit-token")
+    monkeypatch.setattr(bot, "SM", bot.SessionManager())
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.json"))
     p = tmp_path / "console-audit.log"
     monkeypatch.setattr(bot, "CONSOLE_AUDIT_LOG", str(p))
     return p

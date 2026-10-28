@@ -88,15 +88,22 @@ clean detached source independently; migrate the unit through this transaction
 before updating that checkout. Preserve all existing untracked files and
 quarantine directories.
 
-The current production service uses publisher-bootstrap.py and a private
-application_sha256 pin. This installer intentionally refuses that startup path
-BEFORE stopping the bot or GC timer. Replacing the application without updating
-that pin would prevent startup. A reviewed follow-up must transactionally cover
-the publisher configuration, preserve its ownership/permissions/private fields,
-verify import precedence and the pinned loader using offline construction, and
-restore the original pin and application together on rollback. Do not replace
-the bootstrap, remove its integrity check, or fabricate a reviewed PR identity.
+The current production service uses a reviewed publisher-bootstrap.py and a
+private application_sha256 pin. scripts/publisher-deploy.py accepts only the
+inspected bootstrap digest, verifies trusted file ownership/modes and the old
+application pin, and snapshots release-source identity. Unknown bootstrap
+versions, configuration races and changed release/application bytes refuse.
 
-GitHub API authentication and the reviewed PR/head/tree gate also remain release
-prerequisites. These installer changes do not activate the bridge or authorize
-a partial production deployment.
+The private publisher configuration joins the installer's backup manifest.
+After installing the new application, only the digest field is atomically
+replaced; all other bytes, ownership and mode are preserved. Before starting
+the service, the actual publisher loader verifies the new bytes and constructs
+the bot offline. The existing Codex-quiescence setting is preserved. Rollback
+restores the old application and original configuration together, then verifies
+them through the same loader before checking old-service health. The helper
+never starts polling, IPC, lifecycle hooks or model calls during smoke checks.
+
+The real-loader regression tests run in private mount/network namespaces with
+synthetic files at the expected paths; they do not weaken the loader's trust
+checks or touch live configuration. Production still requires valid GitHub PR
+identity and the reviewed head/tree gates. No test result activates the bridge.

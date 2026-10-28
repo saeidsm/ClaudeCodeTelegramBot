@@ -93,11 +93,12 @@ def diverged(tmp_path):
     return clone
 
 
-def test_divergence_reports_and_names_the_file(diverged):
+def test_divergence_reports_shared_clone_stranded_commit(diverged):
     line = bot._divergence_line(str(diverged))
     assert line, "expected a divergence line"
-    assert "1 commit(s) ahead" in line
-    assert "shared.py" in line, f"should name the contended file: {line}"
+    assert "1 local commit(s)" in line
+    assert str(diverged) in line and "origin does not have" in line
+    assert "NOT about your worktree" in line
 
 
 def test_divergence_silent_when_in_sync(tmp_path):
@@ -176,7 +177,7 @@ async def test_note_carries_both_lines(diverged, monkeypatch):
     note = await bot._session_context_note(a, "P", str(diverged))
     assert note.startswith("[SESSION CONTEXT]")
     assert '"RAgg"' in note
-    assert "ahead" in note
+    assert "local commit(s)" in note and "stranded work" in note
     assert note.endswith("\n\n"), "must be separated from the user's prompt"
 
 

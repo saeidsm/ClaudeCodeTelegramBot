@@ -24,6 +24,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bot  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_console(tmp_path, monkeypatch):
+    # No live owner identity, credential or state is needed by these tests.
+    monkeypatch.setattr(bot, "ALLOWED_IDS", [106021080])
+    monkeypatch.setattr(bot, "BOT_SESSION_API_TOKEN", "synthetic-model-test-token")
+    monkeypatch.setenv("BOT_SESSION_API_TOKEN", "synthetic-model-test-token")
+    monkeypatch.setattr(bot, "SM", bot.SessionManager())
+    monkeypatch.setattr(bot, "STATE_FILE", str(tmp_path / "state.json"))
+    monkeypatch.setattr(bot, "CONSOLE_AUDIT_LOG", str(tmp_path / "audit.log"))
+
+
 # ── 1. no pinned versions on the selection path ─────────────────────────────
 
 def test_no_version_string_is_used_to_choose_a_model():
@@ -81,7 +92,7 @@ def test_persisted_fields_include_the_reason():
 
 # ── 3. scrubbing ────────────────────────────────────────────────────────────
 
-def test_scrub_removes_live_secrets():
+def test_scrub_removes_configured_synthetic_secret():
     tok = bot.BOT_SESSION_API_TOKEN
     assert tok, "test needs the session api token set"
     out = bot._scrub_secrets(f"cmd --header 'X-Session-API-Token: {tok}' end")

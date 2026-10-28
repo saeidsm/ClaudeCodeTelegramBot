@@ -119,7 +119,7 @@ case "$1" in
       *MainPID*)      _mainpid ;;
       *"-p User"*)    echo "${SVC_USER:-root}" ;;
       *ControlGroup*) echo "${SC_CGROUP:-}" ;;
-      *ExecStart*)    echo "${SC_EXECSTART:-}" ;;
+      *ExecStart*)    if [[ "$*" = *claude-telegram-bot* ]]; then echo "${SC_BOT_EXECSTART:-${SC_EXECSTART:-}}"; else echo "${SC_EXECSTART:-}"; fi ;;
     esac; exit 0 ;;
   restart)  echo $(( $(cat "$S/pid") + 1000 )) > "$S/pid"; echo 0 > "$S/pidreads"; rm -f "$S/svc_down"; exit 0 ;;
   enable)   [ "$2" = "reports-cleanup.timer" ] && touch "$S/timer_enabled"; exit 0 ;;
@@ -1275,3 +1275,42 @@ def test_failed_rollback_does_not_restart_gc(fs):
     assert r.returncode != 0
     assert _status(fs) == "ROLLBACK_FAILED", r.stderr[-2000:]
     assert not (fs["sc"] / "gc_active").exists()
+
+@pytest.mark.parametrize('fail', [False, True])
+def test_publisher_config_participates_in_real_installer_manifest(fs, fail):
+    # Exercise the installer plumbing with a synthetic publisher helper. The
+    # separate namespace suite exercises the actual helper and actual loader.
+    source = fs['tmp'] / 'publisher-source'
+    shutil.copytree(_REPO, source, ignore=shutil.ignore_patterns('.git','__pycache__','.pytest_cache'))
+    config = fs['live'] / 'configs/publisher.json'
+    original = '{"application_sha256":"old", "private_root":"unchanged"}\n'
+    config.write_text(original); config.chmod(0o600)
+    helper = source / 'scripts/publisher-deploy.py'
+    helper.write_text('''import json, os, sys
+from pathlib import Path
+config=Path(os.environ['SYNTHETIC_PUBLISHER_CONFIG'])
+action=sys.argv[1]
+if action=='prepare':
+ Path(sys.argv[-1]).write_text('{}')
+ print(config)
+elif action=='update':
+ config.write_text(config.read_text().replace('"old"','"new"'))
+elif action=='smoke':
+ assert json.loads(config.read_text())['application_sha256']=='new'
+elif action=='rollback-smoke':
+ assert json.loads(config.read_text())['application_sha256']=='old'
+''')
+    env = {'DEPLOY_SOURCE':str(source), 'SC_BOT_EXECSTART':'/synthetic/publisher-bootstrap.py',
+           'SYNTHETIC_PUBLISHER_CONFIG':str(config)}
+    if fail:
+        env['DEPLOY_FAIL_AT']='verify_install'
+    r = _execute(fs, env_extra=env)
+    if fail:
+        assert _status(fs)=='ROLLED_BACK', r.stderr[-3000:]
+        assert config.read_text()==original
+    else:
+        assert r.returncode==0, r.stderr[-3000:]
+        assert config.read_text()==original.replace('"old"','"new"')
+    assert config.stat().st_mode & 0o777 == 0o600
+    manifests=list((fs['tmp']/'backups').glob('*/MANIFEST.tsv'))
+    assert manifests and str(config) in manifests[0].read_text()
