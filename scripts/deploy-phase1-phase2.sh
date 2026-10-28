@@ -587,7 +587,7 @@ gate_suite() {
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m py_compile \
      "$SOURCE/bot.py" "$SOURCE/mcp_bridge.py" "$SOURCE/scripts/worktree-gc.py" "$SOURCE/coordination.py" "$SOURCE/resource_footer.py" \
      "$SOURCE/log_filters.py" "$SOURCE"/engines/*.py "$SOURCE"/video_module/*.py \
-     "$SOURCE/scripts/coord_publish.py" "$SOURCE/scripts/publisher-deploy.py" || die "py_compile failed on source"
+     "$SOURCE/scripts/coord_publish.py" "$SOURCE/scripts/publisher-deploy.py" "$SOURCE/scripts/claude-readiness.py" || die "py_compile failed on source"
   for s in "$SOURCE"/scripts/*.sh; do bash -n "$s" || die "bash -n failed: $s"; done
   local out passed
   out="$( cd "$SOURCE" && PYTHONDONTWRITEBYTECODE=1 \
@@ -757,6 +757,14 @@ _codex_expected_ids() {
 check_service_cli() {
   local claude_bin codex_bin out id
   claude_bin="${DEPLOY_CLAUDE_CMD:-claude}"; codex_bin="${DEPLOY_CODEX_CMD:-codex}"
+  if [ -z "${DEPLOY_CLAUDE_CMD:-}" ]; then
+    local service_path service_environment
+    service_environment="$($SYSTEMCTL show "$SERVICE" -p Environment --value)" || return 1
+    service_path="$(printf '%s' "$service_environment" | "$PYTHON" -c 'import shlex,sys; v=[x[5:] for x in shlex.split(sys.stdin.read()) if x.startswith("PATH=")]; print(v[0] if len(v)==1 else "")')" || return 1
+    [ -n "$service_path" ] || { log "service PATH unavailable or ambiguous"; return 1; }
+    claude_bin="$(run_as_svc "$PYTHON" "$SOURCE/scripts/claude-readiness.py" "$CONFIGS" "$service_path")" \
+      || { log "configured Claude readiness failed"; return 1; }
+  fi
   # ── Claude: DETERMINISTIC, read-only CLI contracts ONLY.
   # `claude models` is NOT a real subcommand — Claude Code interprets it as a
   # PROMPT and returns nondeterministic LLM-generated text (and consumes a model

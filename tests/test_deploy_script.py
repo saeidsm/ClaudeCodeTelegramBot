@@ -116,6 +116,7 @@ case "$1" in
     fi; exit 0 ;;
   show)
     case "$*" in
+      *"-p Environment"*) printf 'PATH=%s\\n' "${SC_SERVICE_PATH-$PATH}" ;;
       *MainPID*)      _mainpid ;;
       *"-p User"*)    echo "${SVC_USER:-root}" ;;
       *ControlGroup*) echo "${SC_CGROUP:-}" ;;
@@ -1314,3 +1315,11 @@ elif action=='rollback-smoke':
     assert config.stat().st_mode & 0o777 == 0o600
     manifests=list((fs['tmp']/'backups').glob('*/MANIFEST.tsv'))
     assert manifests and str(config) in manifests[0].read_text()
+
+
+def test_missing_service_path_refuses_before_mutation(fs):
+    r = _execute(fs, env_extra={'SC_SERVICE_PATH': ''})
+    assert r.returncode != 0
+    assert 'service PATH unavailable or ambiguous' in r.stderr
+    assert _status(fs) == 'STOPPED_BEFORE_MUTATION'
+    assert _field(fs, 'QUIESCE_STOPS') == '0'
