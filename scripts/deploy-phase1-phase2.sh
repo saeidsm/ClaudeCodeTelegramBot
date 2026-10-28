@@ -230,6 +230,7 @@ ARMED=0; RESTARTED_FWD=0; TIMER_ACTIVATED=0
 MANIFEST=""; BACKUP=""; OLD_PID=""; NEW_PID=""; RESTART_CURSOR=""
 TIMER_WAS_ENABLED=""; TIMER_WAS_ACTIVE=""
 ROLLBACK_ERRORS=""
+GC_TOUCHED=0; GC_WAS_ACTIVE=""
 SVC_UID=""; SVC_GID=""
 R_STATE=""; R_CHAT=""; R_COORD=""; R_COORDLOCK=""; R_CACHE=""; R_TOKEN=""; R_RETENTION_ENV=""
 NW_ENABLED=""; NW_BIND=""; NW_BIND2=""; NW_PORT=""
@@ -334,6 +335,9 @@ resolve_paths() {
 # ── artifact table ──────────────────────────────────────────────────────────
 artifacts() {
   echo "$LIVE_SCRIPTS/claude-telegram-bot.py|$SOURCE/bot.py|file"
+  echo "$LIVE_SCRIPTS/mcp_bridge.py|$SOURCE/mcp_bridge.py|file"
+  echo "$LIVE_SCRIPTS/worktree-gc.py|$SOURCE/scripts/worktree-gc.py|file"
+  echo "$SYSTEMD_DIR/claude-worktree-gc.service|$SOURCE/systemd/claude-worktree-gc.service|gc-render"
   echo "$LIVE_SCRIPTS/coordination.py|$SOURCE/coordination.py|file"
   echo "$LIVE_SCRIPTS/resource_footer.py|$SOURCE/resource_footer.py|file"
   echo "$LIVE_SCRIPTS/log_filters.py|$SOURCE/log_filters.py|file"
@@ -466,6 +470,39 @@ rollback() {
   check_listeners "$rbpid" original || rb_err "listeners unhealthy after restore (original profile)"
 }
 
+# GC must not observe a partially installed module/unit. Never kill a live sweep.
+quiesce_gc() {
+  [ -f "$SYSTEMD_DIR/claude-worktree-gc.service" ] || return 0
+  GC_WAS_ACTIVE="$($SYSTEMCTL show claude-worktree-gc.timer -p ActiveState --value)" || die "GC timer state unavailable"
+  case "$GC_WAS_ACTIVE" in active|inactive) ;; *) die "GC timer state unknown";; esac
+  GC_TOUCHED=1
+  $SYSTEMCTL stop claude-worktree-gc.timer || die "GC timer stop failed"
+  $SYSTEMCTL is-active --quiet claude-worktree-gc.timer && die "GC timer still active"
+  local state
+  state="$($SYSTEMCTL show claude-worktree-gc.service -p ActiveState --value)" || die "GC service state unavailable"
+  [ "$state" = inactive ] || die "GC sweep active or unknown; refusing mutation"
+}
+restore_gc() {
+  [ "$GC_TOUCHED" -eq 1 ] || return 0
+  if [ "$GC_WAS_ACTIVE" = active ]; then
+    $SYSTEMCTL start claude-worktree-gc.timer || return 1
+    $SYSTEMCTL is-active --quiet claude-worktree-gc.timer || return 1
+  else
+    $SYSTEMCTL stop claude-worktree-gc.timer || return 1
+    if $SYSTEMCTL is-active --quiet claude-worktree-gc.timer; then return 1; fi
+  fi
+  GC_TOUCHED=0
+}
+# The active publisher pins the application digest. The generic installer must
+# not replace that application until a reviewed publisher transaction exists.
+gate_bootstrap() {
+  local command
+  command="$($SYSTEMCTL show "$SERVICE" -p ExecStart --value)" || die "startup command unavailable"
+  case "$command" in
+    *publisher-bootstrap.py*) die "publisher bootstrap pins application_sha256; coordinated publisher configuration backup/update/import verification required" ;;
+  esac
+}
+
 on_exit() {
   local rc=$?
   set +e
@@ -480,7 +517,14 @@ on_exit() {
     $SYSTEMCTL start "$SERVICE" >/dev/null 2>&1
     if $SYSTEMCTL is-active --quiet "$SERVICE"; then QUIESCE_RESTORE="ok"; else QUIESCE_RESTORE="FAILED"; fi
   fi
+  if [ "$GC_TOUCHED" -eq 1 ] && [ "$STATUS" != ROLLBACK_FAILED ]; then
+    if ! restore_gc; then
+      STATUS="ROLLBACK_FAILED"; rc=1
+      rb_err "GC timer state restore failed"
+    fi
+  fi
   {
+    echo "GC_TIMER_WAS: ${GC_WAS_ACTIVE:-not-managed}"
     echo "# Deploy transaction report"
     echo "STATUS: $STATUS"
     echo "MODE: $MODE"
@@ -530,7 +574,7 @@ gate_source() {
 gate_suite() {
   fail_at gate_suite && die "forced: gate_suite"
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON" -m py_compile \
-     "$SOURCE/bot.py" "$SOURCE/coordination.py" "$SOURCE/resource_footer.py" \
+     "$SOURCE/bot.py" "$SOURCE/mcp_bridge.py" "$SOURCE/scripts/worktree-gc.py" "$SOURCE/coordination.py" "$SOURCE/resource_footer.py" \
      "$SOURCE/log_filters.py" "$SOURCE"/engines/*.py "$SOURCE"/video_module/*.py \
      "$SOURCE/scripts/coord_publish.py" || die "py_compile failed on source"
   for s in "$SOURCE"/scripts/*.sh; do bash -n "$s" || die "bash -n failed: $s"; done
@@ -899,6 +943,10 @@ install_artifacts() {
         rm -rf -- "$dest"; cp -a "$src" "$dest"
         [ "$(tree_hash "$src")" = "$(tree_hash "$dest")" ] || die "tree manifest mismatch after install: $dest"
         ;;
+      gc-render)
+        sed "s|^ExecStart=.*$|ExecStart=$PYTHON $LIVE_SCRIPTS/worktree-gc.py|" "$src" > "$SCRATCH/gc-unit"
+        install -D -m 0644 "$SCRATCH/gc-unit" "$dest"
+        ;;
       render)
         [ -f "$src" ] || die "source unit missing: $src"
         # render the service unit to the RESOLVED retention config/script/guard
@@ -1026,10 +1074,13 @@ PY
 verify_install() {
   fail_at verify_install && die "forced: verify_install"
   PYTHONPATH="$LIVE_SCRIPTS" PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - <<'PY' || die "live-dir import/construction smoke failed"
-import importlib.util, os
+import importlib.util, os, sys
 d=os.environ["PYTHONPATH"]
+sys.path.insert(0, d)
+import mcp_bridge
 spec=importlib.util.spec_from_file_location("livebot", os.path.join(d,"claude-telegram-bot.py"))
-m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+m=importlib.util.module_from_spec(spec); sys.modules[spec.name]=m; spec.loader.exec_module(m)
+assert os.path.realpath(mcp_bridge.__file__) == os.path.realpath(os.path.join(d,"mcp_bridge.py"))
 from telegram.ext import Application, ExtBot
 from telegram.request import HTTPXRequest
 b=m.FooterBot("123456:AAHfake-offline-token_xxxxxxxxxxxxxxxxxx",
@@ -1272,8 +1323,10 @@ gate_reviewed_identity() {
 }
 
 gate_reviewed_identity
+gate_bootstrap
 exec 9>"$LOCK"; flock -n 9 || die "another deploy holds the lock"
 
+quiesce_gc
 quiesce_service      # Gap 2: quiescence boundary BEFORE any file mutation
 build_manifest       # backup captures the AUTHORITATIVE post-quiesce state
 ARMED=1

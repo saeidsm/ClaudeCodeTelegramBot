@@ -72,3 +72,31 @@ registered project outside pilot scope. Tested selection:
     python3 -m pytest -p no:cacheprovider tests/test_mcp_bridge.py tests/test_mcp_recovery.py tests/test_worktree*.py -q
 
 67 tests passed offline. No real-model or live-service validation was performed.
+
+## Transactional installer and outstanding publisher integration
+
+The installer now includes mcp_bridge.py, worktree-gc.py and the GC service
+unit in its verified backup/restore manifest. The installed GC service runs
+from the stable scripts directory, not the mutable Git checkout. It stops
+the existing GC timer before bot quiescence, refuses an active or unknown GC
+service, and restores the original timer activity after success or verified
+rollback. Failed rollback leaves the timer stopped for investigation.
+
+Do not update the current main checkout as a merge side effect: the currently
+installed GC unit still points into it. Merge remotely and prepare the required
+clean detached source independently; migrate the unit through this transaction
+before updating that checkout. Preserve all existing untracked files and
+quarantine directories.
+
+The current production service uses publisher-bootstrap.py and a private
+application_sha256 pin. This installer intentionally refuses that startup path
+BEFORE stopping the bot or GC timer. Replacing the application without updating
+that pin would prevent startup. A reviewed follow-up must transactionally cover
+the publisher configuration, preserve its ownership/permissions/private fields,
+verify import precedence and the pinned loader using offline construction, and
+restore the original pin and application together on rollback. Do not replace
+the bootstrap, remove its integrity check, or fabricate a reviewed PR identity.
+
+GitHub API authentication and the reviewed PR/head/tree gate also remain release
+prerequisites. These installer changes do not activate the bridge or authorize
+a partial production deployment.

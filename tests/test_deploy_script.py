@@ -89,6 +89,19 @@ _mainpid() {
   fi
   cat "$S/pid"
 }
+for arg in "$@"; do
+ case "$arg" in claude-worktree-gc.*) tgt="$arg";; esac
+done
+if [[ "$tgt" = claude-worktree-gc.* ]]; then
+ case "$1:$tgt" in
+  show:claude-worktree-gc.timer) [ -f "$S/gc_active" ] && echo active || echo inactive ;;
+  show:claude-worktree-gc.service) echo "${GC_SERVICE_STATE:-inactive}" ;;
+  stop:claude-worktree-gc.timer) [ "${GC_STOP_FAIL:-0}" = 1 ] && exit 1; rm -f "$S/gc_active" ;;
+  start:claude-worktree-gc.timer) touch "$S/gc_active" ;;
+  is-active:claude-worktree-gc.timer) [ -f "$S/gc_active" ]; exit $? ;;
+ esac
+ exit 0
+fi
 case "$1" in
   is-active)
     if [ "$tgt" = "reports-cleanup.timer" ]; then
@@ -1191,3 +1204,74 @@ def test_bot_claude_models_override_validated(fs):
     r = _execute(fs)
     assert r.returncode != 0 and _status(fs) == "STOPPED_BEFORE_MUTATION"
     assert "catalog validation failed" in r.stderr
+
+# MCP release coverage: the real installer, fake services and isolated roots.
+@pytest.mark.parametrize("active", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_mcp_gc_transaction_restores_timer_and_files(fs, active, fail):
+    unit = fs["systemd"] / "claude-worktree-gc.service"
+    unit.write_text("old-gc-unit\n")
+    module = fs["live"] / "scripts/mcp_bridge.py"
+    module.write_text("# original MCP\n")
+    gc = fs["live"] / "scripts/worktree-gc.py"
+    gc.write_text("# original GC\n")
+    if active:
+        (fs["sc"] / "gc_active").touch()
+    r = _execute(fs, env_extra={"DEPLOY_FAIL_AT": "verify_install"} if fail else {})
+    assert (fs["sc"] / "gc_active").exists() == active
+    if fail:
+        assert _status(fs) == "ROLLED_BACK", r.stderr[-3000:]
+        assert module.read_text() == "# original MCP\n"
+        assert gc.read_text() == "# original GC\n"
+        assert unit.read_text() == "old-gc-unit\n"
+    else:
+        assert r.returncode == 0, r.stderr[-3000:]
+        assert module.read_bytes() == (_REPO / "mcp_bridge.py").read_bytes()
+        assert gc.read_bytes() == (_REPO / "scripts/worktree-gc.py").read_bytes()
+        assert str(gc) in unit.read_text()
+    log = fs["log"].read_text().splitlines()
+    assert log.index("stop claude-worktree-gc.timer") < log.index("stop claude-telegram-bot")
+
+
+def test_gc_busy_refuses_before_bot_stop_and_restores_timer(fs):
+    (fs["systemd"] / "claude-worktree-gc.service").write_text("old-unit")
+    (fs["sc"] / "gc_active").touch()
+    r = _execute(fs, env_extra={"GC_SERVICE_STATE": "active"})
+    assert r.returncode != 0
+    assert "GC sweep active" in r.stderr
+    assert "stop claude-telegram-bot\n" not in fs["log"].read_text()
+    assert (fs["sc"] / "gc_active").exists()
+
+
+def test_pinned_publisher_bootstrap_refuses_before_mutation(fs):
+    before = _digest(fs["live"])
+    r = _execute(fs, env_extra={"SC_EXECSTART": "/private/publisher-bootstrap.py"})
+    assert r.returncode != 0
+    assert "pins application_sha256" in r.stderr
+    assert _digest(fs["live"]) == before
+    assert "stop claude-telegram-bot\n" not in fs["log"].read_text()
+
+
+def test_gc_stop_failure_preserves_active_timer_and_bot(fs):
+    (fs["systemd"] / "claude-worktree-gc.service").write_text("old-unit")
+    (fs["sc"] / "gc_active").touch()
+    before = _digest(fs["live"])
+    r = _execute(fs, env_extra={"GC_STOP_FAIL": "1"})
+    assert r.returncode != 0
+    assert "GC timer stop failed" in r.stderr
+    assert (fs["sc"] / "gc_active").exists()
+    assert _digest(fs["live"]) == before
+    assert "stop claude-telegram-bot\n" not in fs["log"].read_text()
+
+
+def test_failed_rollback_does_not_restart_gc(fs):
+    (fs["systemd"] / "claude-worktree-gc.service").write_text("old-unit")
+    (fs["sc"] / "gc_active").touch()
+    module = fs["live"] / "scripts/mcp_bridge.py"
+    module.write_text("# original\n")
+    r = _execute(fs, env_extra={"DEPLOY_FAIL_AT": "verify_install",
+        "DEPLOY_RB_CORRUPT_CMD": str(fs["binp"] / "rbcorrupt"),
+        "RB_CORRUPT_MODE": "content", "RB_TARGET": str(module)})
+    assert r.returncode != 0
+    assert _status(fs) == "ROLLBACK_FAILED", r.stderr[-2000:]
+    assert not (fs["sc"] / "gc_active").exists()
