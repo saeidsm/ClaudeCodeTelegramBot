@@ -107,3 +107,16 @@ The real-loader regression tests run in private mount/network namespaces with
 synthetic files at the expected paths; they do not weaken the loader's trust
 checks or touch live configuration. Production still requires valid GitHub PR
 identity and the reviewed head/tree gates. No test result activates the bridge.
+
+## Configured Claude readiness
+
+The installer resolves the service PATH and uses the configured Claude executable.
+Without gateway configuration it requires the existing subscription CLI's strict
+loggedIn=true contract. A configured OpenRouter gateway must match the reviewed
+wrapper digest and configuration paths; ownership/modes, endpoint, token routing
+and models are checked before the same wrapper's version/help/auth probes.
+GET /api/v1/key validates the existing gateway token without inference, rejects
+redirects and exhausted explicit budgets, and never logs credentials or response
+bodies. Only literal values and references to preceding literal variables are
+accepted; shell commands and unresolved references refuse. Authentication failure
+never triggers a subscription-to-gateway or gateway-to-subscription fallback.
