@@ -1,7 +1,10 @@
 """Engine registry + capabilities + cross-engine model validation (§B/§D)."""
 from __future__ import annotations
 
+import json
 import sys
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -10,6 +13,18 @@ import engines.base as eb
 from engines.claude_adapter import ClaudeAdapter
 from engines.codex_adapter import CodexAdapter
 from engines.openrouter_chat import ChatAdapter, ChatCatalog, OpenRouterClient
+
+
+
+@pytest.fixture(autouse=True)
+def isolated_codex_catalog(tmp_path, monkeypatch):
+    """Exercise catalog precedence without the operator's account cache."""
+    monkeypatch.setenv("BOT_CONFIGS_DIR", str(tmp_path / "configs"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("BOT_CODEX_MODELS", raising=False)
+    monkeypatch.delenv("BOT_CODEX_DEFAULT_MODEL", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    return tmp_path / ".codex" / "models_cache.json"
 
 
 def _fresh_registry():
@@ -84,3 +99,30 @@ def test_env_catalog_override(monkeypatch):
     assert ids == ["x-model", "y-model"]
     assert a.validate_model("x-model")
     assert not a.validate_model("gpt-5.6-sol")
+
+
+def test_codex_cached_catalog_labels_and_precedence(isolated_codex_catalog, monkeypatch):
+    cache = isolated_codex_catalog
+    cache.parent.mkdir()
+    cache.write_text(json.dumps({"models": [
+        {"slug": "synthetic-visible", "display_name": "Synthetic Account Label",
+         "visibility": "list", "supported_in_api": True},
+        {"slug": "synthetic-hidden", "display_name": "Hidden", "visibility": "hide"},
+    ]}))
+    a = CodexAdapter()
+    assert [(m.id, m.label) for m in a.list_models()] == [
+        ("synthetic-visible", "Synthetic Account Label")]
+    assert a.validate_model("synthetic-visible")
+    assert not a.validate_model("synthetic-hidden")
+    monkeypatch.setenv("BOT_CODEX_MODELS", "override-model:Override Label")
+    assert [(m.id, m.label) for m in a.list_models()] == [
+        ("override-model", "Override Label")]
+
+
+def test_codex_invalid_cache_uses_static_labels(isolated_codex_catalog):
+    cache = isolated_codex_catalog
+    cache.parent.mkdir()
+    cache.write_text("invalid json")
+    labels = {m.id: m.label for m in CodexAdapter().list_models()}
+    assert {k: labels[k] for k in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")} == {
+        "gpt-5.6-sol": "Sol", "gpt-5.6-terra": "Terra", "gpt-5.6-luna": "Luna"}
