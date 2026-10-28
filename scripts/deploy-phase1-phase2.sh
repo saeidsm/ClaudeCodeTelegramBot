@@ -717,15 +717,30 @@ check_openrouter() {
   key="$(env_get OPENROUTER_API_KEY)"
   [ -n "$key" ] || { log "OpenRouter key empty"; return 1; }
   bodyf="$SCRATCH/or_body.json"
-  code="$(curl -s -o "$bodyf" -w '%{http_code}' --max-time 15 \
-          -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/models 2>/dev/null || echo 000)"
+  if code="$(curl -s --http1.1 --compressed --connect-timeout 10 --max-time 90 \
+          --max-filesize 20971520 -o "$bodyf" -w '%{http_code}' \
+          -H "Authorization: Bearer $key" https://openrouter.ai/api/v1/models 2>/dev/null)"; then
+    :
+  else
+    local transfer_rc=$?
+    log "OpenRouter catalog transfer failed rc=$transfer_rc http=$code"
+    return 1
+  fi
   [ "$code" = "200" ] || { log "OpenRouter authenticated check http=$code"; return 1; }
   "$PYTHON" - "$bodyf" <<'PY' || { log "OpenRouter catalog payload invalid/empty"; return 1; }
 import json,sys
-try: d=json.load(open(sys.argv[1]))
-except Exception: sys.exit(1)
-data=d.get("data")
-sys.exit(0 if isinstance(data,list) and len(data)>0 else 1)
+try:
+    with open(sys.argv[1], 'rb') as stream:
+        raw=stream.read(20971521)
+    if len(raw)>20971520:
+        raise ValueError('oversized')
+    d=json.loads(raw)
+    data=d.get('data')
+    valid=(isinstance(data,list) and bool(data) and
+           all(isinstance(m,dict) and isinstance(m.get('id'),str) and m['id'].strip() for m in data))
+except Exception:
+    sys.exit(1)
+sys.exit(0 if valid else 1)
 PY
   rm -f "$bodyf"
   return 0
