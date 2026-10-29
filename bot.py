@@ -655,6 +655,7 @@ class Session:
     paused: bool = False
     voice_text: str = ""
     claude_created: bool = False     # True once Claude has persisted this session_uuid to disk
+    claude_provider: str = ""        # explicit backend binding; never silently migrate resume
     claude_model: str = ""           # "" = inherit BOT_DEFAULT_CLAUDE_MODEL; otherwise alias/full model name
     # Branch the session's worktrees spawn from. Persisted (additive, v1
     # state schema) so a restart cannot silently re-bind a resumed session
@@ -2117,6 +2118,7 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                     full_prompt += mcp_bridge.WORKER_QUESTION_INSTRUCTION
 
                 gateway_config = claude_gateway.settings()
+                chosen_provider = claude_gateway.bind_provider(session, gateway_config)
                 executable, chosen_model = claude_gateway.launch(
                     session.claude_model if gateway_config else session.claude_model or BOT_DEFAULT_CLAUDE_MODEL)
                 def build_cmd(mode, uuid_str):
@@ -2145,7 +2147,7 @@ async def run_claude(prompt, project, session, files=None, _rl_mode="flow"):
                 mode = "resume" if session.claude_created else "create"
                 cmd = build_cmd(mode, session.session_uuid)
                 log.info(f"spawn.session sid={session.id} project={project} mode={mode} "
-                         f"model={chosen_model or 'default'} provider={'openrouter' if gateway_config else 'anthropic'} "
+                         f"model={chosen_model or 'default'} provider={chosen_provider} "
                          f"perms={BOT_TOOL_PERMISSION_MODE} worktree={wt_path}")
 
                 proc, r, e = await _spawn_claude_in(cmd, wt_path, session.id, extra_env=_coord_env(session))
@@ -5254,7 +5256,7 @@ async def _flush_buffer(cid: int, context):
 _PERSISTED_SESSION_FIELDS = (
     "id", "label", "color_emoji", "session_uuid", "project", "status",
     "started_at", "last_active", "message_ids", "anchor_message_id",
-    "tasks", "claude_created", "claude_model", "starting_branch",
+    "tasks", "claude_created", "claude_model", "claude_provider", "starting_branch",
     "mcp_managed", "mcp_worktree_created",
     # Phase 2 multi-engine fields (absent in old state → safe defaults)
     "engine", "model", "provider_session_id", "chat_history_ref",
@@ -5362,6 +5364,7 @@ def load_state():
                 tasks=s.get("tasks", 0),
                 claude_created=s.get("claude_created", False),
                 claude_model=s.get("claude_model", ""),
+                claude_provider=s.get("claude_provider", ""),
                 # Phase 2 migration: old sessions lack these → engine=claude,
                 # empty model/thread. Claude UUID/resume + legacy claude_model
                 # are preserved untouched above.

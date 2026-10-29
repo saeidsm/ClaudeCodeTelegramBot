@@ -69,7 +69,8 @@ class ClaudeAdapter(EngineAdapter):
     def list_models(self, *, refresh: bool = False) -> list[ModelInfo]:
         if claude_gateway.settings():
             models = claude_gateway.configured_models()
-            result = [ModelInfo(alias, f'{alias or "Default"} → {model} (OpenRouter)') for alias, model in models.items()]
+            label = 'ChatGPT local' if claude_gateway.settings()['provider'] == 'chatgpt-local' else 'OpenRouter'
+            result = [ModelInfo(alias, f'{alias or "Default"} → {model} ({label})') for alias, model in models.items()]
             result.extend(ModelInfo(model, model) for model in dict.fromkeys(models.values()))
             return result
         return _parse_env_catalog() or list(_DEFAULT_CATALOG)
