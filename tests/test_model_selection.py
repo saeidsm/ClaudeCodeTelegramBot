@@ -13,6 +13,14 @@ import bot
 import engines.base as eb
 
 
+@pytest.fixture(autouse=True)
+def _isolated_claude_catalog(tmp_path, monkeypatch):
+    # These tests exercise the built-in Claude catalog and callback bindings.
+    # Never inherit the operator's production gateway/model configuration.
+    monkeypatch.setenv("BOT_CONFIGS_DIR", str(tmp_path))
+    monkeypatch.delenv("BOT_CLAUDE_MODELS", raising=False)
+
+
 class FakeQuery:
     def __init__(self, chat_id):
         self.message = type("M", (), {"chat": type("C", (), {"id": chat_id})(),

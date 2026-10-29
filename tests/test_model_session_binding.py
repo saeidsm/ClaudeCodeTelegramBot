@@ -18,6 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bot
 
 
+@pytest.fixture(autouse=True)
+def _isolated_claude_catalog(tmp_path, monkeypatch):
+    # These tests exercise the built-in Claude catalog and callback bindings.
+    # Never inherit the operator's production gateway/model configuration.
+    monkeypatch.setenv("BOT_CONFIGS_DIR", str(tmp_path))
+    monkeypatch.delenv("BOT_CLAUDE_MODELS", raising=False)
+
+
 class FakeMsg:
     def __init__(self, chat_id, mid=1):
         self.chat = type("C", (), {"id": chat_id})()
