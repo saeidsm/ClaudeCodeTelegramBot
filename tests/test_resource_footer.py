@@ -70,3 +70,14 @@ def test_human_units():
     assert rf._human(0) == "0B"
     assert rf._human(1500).endswith("K")
     assert rf._human(2 * 1024 * 1024 * 1024).endswith("G")
+
+
+def test_every_figure_says_free_so_it_is_not_read_as_used(monkeypatch):
+    """2026-09-29: "Swap 6.5G/8.0G" was read as 6.5 GB of swap USED; it was 6.5 GB free."""
+    import io
+    meminfo = ("MemTotal: 16000000 kB\nMemAvailable: 12000000 kB\n"
+               "SwapTotal: 8000000 kB\nSwapFree: 6500000 kB\n")
+    monkeypatch.setattr(rf, "open", lambda *a, **k: io.StringIO(meminfo), raising=False)
+    monkeypatch.setattr(rf, "_disk", lambda _p: (20 * 1024**3, 80 * 1024**3))
+    out = rf._compute()
+    assert "RAM 11.4G free/15.3G" in out and "Swap 6.2G free/7.6G" in out and "Disk 20.0G free/80.0G" in out
